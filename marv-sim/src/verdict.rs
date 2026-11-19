@@ -28,6 +28,7 @@ pub struct Sample {
     pub truth_pos: [f64; 3],
     pub truth_vel: [f64; 3],
     pub on_ground: bool,
+    pub settling: bool,
     pub reaction: Reaction,
 }
 
@@ -297,10 +298,13 @@ fn takeoff_land(verdict: &Verdict, trace: &Trace) -> (Vec<Check>, Vec<String>) {
 
     // stance_margin: armed, in contact, N >= the floor.
     let floor = stance_floor_weight * trace.weight_n;
-    let stance = largest(trace.steps.iter().filter(|s| s.armed && s.on_ground && s.reaction.normal_n >= floor).map(|s| {
+    let ratio = |s: &Sample| {
         let [tx, ty] = s.reaction.torque_xy_nm;
         (tx * tx + ty * ty).sqrt() / (s.reaction.normal_n * r_stance_m)
-    }));
+    };
+    let loaded = |s: &&Sample| s.armed && s.on_ground && s.reaction.normal_n >= floor;
+    let stance = largest(trace.steps.iter().filter(loaded).filter(|s| !s.settling).map(ratio));
+    let in_settle = largest(trace.steps.iter().filter(loaded).filter(|s| s.settling).map(ratio));
     checks.push(at_most("stance_margin", stance, max_stance_ratio));
 
     // liftoff_tilt over [lift-off, + window).
@@ -424,6 +428,7 @@ fn takeoff_land(verdict: &Verdict, trace: &Trace) -> (Vec<Check>, Vec<String>) {
         largest(held.iter().map(xy)), mean(held.iter().map(xy))));
     notes.push(format!("INFO pilot xy integral term: largest {:.4} of stick (before the cap)",
         largest(trace.pilot.iter().map(|r| r.xy_trim[0].hypot(r.xy_trim[1])))));
+    notes.push(format!("INFO stance_in_settle {in_settle:.4} (largest stance ratio skipped while the ground settle runs)"));
     notes.push(format!("INFO lift-off {:.4} s, touchdown {:.4} s, backend touchdowns {}",
         t_lo.map_or(f64::NAN, secs), t_td.map_or(f64::NAN, secs), trace.touchdowns.len()));
     (checks, notes)

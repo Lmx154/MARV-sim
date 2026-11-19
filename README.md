@@ -131,7 +131,7 @@ reached (Amendment B2). Every stick moves at most
 `stick_rate_per_s` and stays in its range.
 
 `check = "takeoff_land"` judges the table of the decision's section 3: Stop before switch-on, armed within 6.5 ms, idle
-level exactly through "idle", the stance margin `tau_xy / (N r_stance)` while armed in contact with N above the floor,
+level exactly through "idle", the stance margin `tau_xy / (N r_stance)` while armed in contact with N above the floor, not judged on samples taken while the ground settle runs (the largest ratio skipped is printed as `INFO stance_in_settle`),
 the tilt for 1 s after lift-off (first tick off the ground), no contact between lift-off and the first rise through
 `airborne_m` (`liftoff_recontacts`), a single flight (one rise, never above `airborne_m` after the touchdown; backend
 touchdowns, hops below `airborne_m` included, are printed), the peak height and climb speed from lift-off to touchdown,
@@ -170,7 +170,7 @@ Axis values change only the plant, the environment and the sensors, never the fl
 
 A cell is named `p<point>-map<letter>-air<n>-gnd<n>-seed<s>` (letter and numbers by position in the file, the seed by
 value), with `<scenario>-` in front when the file has more than one scenario: `p2-mapB-air3-gnd2-seed1`. One line per
-cell (name, PASS or FAIL, the failing checks), then the failures per check, `PASS cells n of N`, the wall time (about
+cell (name, PASS or FAIL, the failing checks), then the failures per check, `PASS cells n of N`, the PASS count per ground case and per air case with the ground x air table of passing cells, the wall time (about
 20 s for the 270 cells) and `RESULT`: PASS only if every cell passes. Exit 0 pass, 3 a check failed, 1 an error, 2 usage.
 
 - `--only <cell>` runs that cell alone, prints its summary and checks, and writes its log. A rerun gives a

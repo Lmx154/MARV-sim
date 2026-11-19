@@ -182,6 +182,7 @@ fn sample(truth: &Truth, out: &StepOut) -> Sample {
         truth_pos: truth.position_m,
         truth_vel: truth.velocity_ms,
         on_ground: truth.on_ground,
+        settling: truth.settling,
         reaction: truth.reaction,
     }
 }
@@ -323,6 +324,7 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
         accel_ms2: [0.0; 3],
         ang_accel_rads2: [0.0; 3],
         on_ground: false,
+        settling: false,
         reaction: Reaction::default(),
     };
     let backend = NativeBackend::with_start(&plant_card, initial, scenario.start)?.with_settle(scenario.settle_s);
@@ -535,6 +537,7 @@ fn go(args: &Args) -> Result<bool, Failure> {
             // (check name, cells where it failed, cells where it was judged), in order of first appearance.
             let mut counts: Vec<(String, usize, usize)> = Vec::new();
             let mut passed = 0;
+            let mut cell_pass: Vec<bool> = Vec::new();
             for cell in &cells {
                 let run = Run {
                     cell,
@@ -567,6 +570,7 @@ fn go(args: &Args) -> Result<bool, Failure> {
                     }
                 }
                 passed += usize::from(failing.is_empty());
+                cell_pass.push(failing.is_empty());
                 println!("{:<width$}  {}  {}", cell.name, if failing.is_empty() { "PASS" } else { "FAIL" }, failing.join(", "));
                 let _ = std::io::stdout().flush();
             }
@@ -575,6 +579,25 @@ fn go(args: &Args) -> Result<bool, Failure> {
                 println!("  {name:<22} {failed:>4} / {judged}");
             }
             println!("PASS cells {passed} of {}", cells.len());
+            let mut grid = vec![vec![(0usize, 0usize); spread.air.len()]; spread.ground.len()];
+            for (cell, ok) in cells.iter().zip(&cell_pass) {
+                let g = &mut grid[cell.ground][cell.air];
+                g.0 += usize::from(*ok);
+                g.1 += 1;
+            }
+            for g in 0..spread.ground.len() {
+                let (p, n) = grid[g].iter().fold((0, 0), |a, c| (a.0 + c.0, a.1 + c.1));
+                println!("PASS gnd{} {p} of {n}", g + 1);
+            }
+            for a in 0..spread.air.len() {
+                let (p, n) = grid.iter().fold((0, 0), |s, row| (s.0 + row[a].0, s.1 + row[a].1));
+                println!("PASS air{} {p} of {n}", a + 1);
+            }
+            println!("PASS by ground (rows) x air (columns), cells passing / cells run:");
+            for (g, row) in grid.iter().enumerate() {
+                let cols: Vec<String> = row.iter().map(|(p, n)| format!("{p:>3} / {n:<3}")).collect();
+                println!("  gnd{}  {}", g + 1, cols.join("  "));
+            }
             println!("wall time {:.1} s", started.elapsed().as_secs_f64());
             let all = passed == cells.len();
             println!("RESULT: {}", if all { "PASS" } else { "FAIL" });

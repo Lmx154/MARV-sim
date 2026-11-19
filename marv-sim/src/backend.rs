@@ -22,6 +22,9 @@ pub struct Truth {
     pub ang_accel_rads2: [f64; 3],
     /// True while the ground holds the vehicle (state GROUND). Always false without a ground plane.
     pub on_ground: bool,
+    /// True while the ground model turns the vehicle onto the ground plane after a touchdown (the settle); false in the
+    /// air and with a settle time of 0.
+    pub settling: bool,
     /// What the ground supplies in the last step; zero in the air.
     pub reaction: Reaction,
 }
@@ -133,6 +136,7 @@ impl NativeBackend {
             initial.accel_ms2 = [0.0; 3];
             initial.ang_accel_rads2 = [0.0; 3];
             initial.on_ground = true;
+            initial.settling = false;
         }
         let mass = card.mass.mass.v.ok_or("mass.mass is \"ask\", the backend needs a value")?;
         let inertia = card.mass.inertia.v.ok_or("mass.inertia is \"ask\", the backend needs a value")?;
@@ -262,6 +266,7 @@ impl Backend for NativeBackend {
                         self.settle = None;
                     }
                 }
+                self.truth.settling = self.settle.is_some();
                 return &self.truth;
             }
             // AIR again: this tick integrates normally, from the state shown (a settle stops where it is).
@@ -305,6 +310,7 @@ impl Backend for NativeBackend {
             });
             let force_ned = mat_vec(&rot, wrench.force_n);
             self.settle = self.settle_from(q);
+            let settling = self.settle.is_some();
             self.truth = Truth {
                 t_us: self.truth.t_us + dt_us,
                 position_m: [n[0], n[1], 0.0],
@@ -314,6 +320,7 @@ impl Backend for NativeBackend {
                 accel_ms2: [0.0; 3],
                 ang_accel_rads2: [0.0; 3],
                 on_ground: true,
+                settling,
                 reaction: if force_ned[2] >= 0.0 { hold_reaction(force_ned, wrench) } else { Reaction::default() },
             };
             return &self.truth;
@@ -330,6 +337,7 @@ impl Backend for NativeBackend {
             accel_ms2,
             ang_accel_rads2,
             on_ground: false,
+            settling: false,
             reaction: Reaction::default(),
         };
         &self.truth

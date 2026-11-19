@@ -27,6 +27,7 @@ fn at_rest() -> Truth {
         accel_ms2: [0.0; 3],
         ang_accel_rads2: [0.0; 3],
         on_ground: false,
+        settling: false,
         reaction: Reaction::default(),
     }
 }
