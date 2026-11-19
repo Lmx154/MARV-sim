@@ -2,6 +2,7 @@
 
 use crate::backend::Start;
 use crate::math::{Quat, quat_mul};
+use marv_card::{Card, Env, Range};
 use std::path::{Path, PathBuf};
 use toml::{Table, Value};
 
@@ -198,11 +199,52 @@ pub struct Point {
     pub lag_s: Option<f64>,
 }
 
-/// The spread file: the scenario files (relative to the spread file) and the points.
+/// One value of the matrix axis "map shape": the plant's level-to-speed map. `None` keeps the card's number.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Map {
+    pub speed_at_level_min: Option<f64>,
+}
+
+/// One value of the axis "air": the plant's linear rotor drag and the wind. `None` keeps the card's or the
+/// environment's number.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Air {
+    pub drag_rotor_linear: Option<f64>,
+    pub wind_ned_ms: Option<[f64; 3]>,
+}
+
+/// One value of the axis "ground": a fixed IMU1 bias (replaces the card's vector) and the ground's roll and pitch
+/// (replaces the scenario's; a ground-start scenario only). `None` keeps the card's or the scenario's.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Ground {
+    pub imu1_gyro_bias_rads: Option<[f64; 3]>,
+    pub imu1_accel_bias_ms2: Option<[f64; 3]>,
+    pub roll_pitch_deg: Option<[f64; 2]>,
+}
+
+/// The spread or matrix file: the scenario files (relative to the file) and the axes. A missing axis has one default
+/// value, which changes nothing; `seeds` missing means the runner's `--seed` is the one value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Spread {
     pub scenarios: Vec<PathBuf>,
     pub points: Vec<Point>,
+    pub maps: Vec<Map>,
+    pub air: Vec<Air>,
+    pub ground: Vec<Ground>,
+    pub seeds: Option<Vec<u64>>,
+}
+
+/// One run of the matrix: an index into each axis and the seed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cell {
+    /// `[<scenario>-]p<point>-map<A..>-air<n>-gnd<n>-seed<s>`; the scenario only when the file has more than one.
+    pub name: String,
+    pub scenario: usize,
+    pub point: usize,
+    pub map: usize,
+    pub air: usize,
+    pub ground: usize,
+    pub seed: u64,
 }
 
 /// The longest name that still fits, with its prefix, in the log's MSG text (64 bytes).
@@ -649,13 +691,90 @@ impl Point {
     }
 }
 
+impl Map {
+    /// For the log and the table.
+    pub fn text(&self) -> String {
+        self.speed_at_level_min.map_or("card".to_string(), |w| format!("speed_at_level_min {w} rad/s"))
+    }
+}
+
+impl Air {
+    pub fn text(&self) -> String {
+        let drag = self.drag_rotor_linear.map_or("card".to_string(), |d| format!("{d}"));
+        let wind = self.wind_ned_ms.map_or("env".to_string(), |w| format!("{w:?}"));
+        format!("drag {drag} wind_ned {wind}")
+    }
+}
+
+impl Ground {
+    /// One piece of text per thing it changes; none when it changes nothing.
+    pub fn parts(&self) -> Vec<String> {
+        let mut parts = Vec::new();
+        if let Some(b) = self.imu1_gyro_bias_rads {
+            parts.push(format!("imu1 gyro_bias {b:?} rad/s"));
+        }
+        if let Some(b) = self.imu1_accel_bias_ms2 {
+            parts.push(format!("imu1 accel_bias {b:?} m/s^2"));
+        }
+        if let Some([r, p]) = self.roll_pitch_deg {
+            parts.push(format!("slope roll {r} pitch {p} deg"));
+        }
+        parts
+    }
+}
+
+/// Relative slack for a value that sits on the edge of a range (0.7 against 1 - 30 / 100).
+const EDGE: f64 = 1e-9;
+
+/// The numeric interval of a record's range. `range = "ask"` and no range have none: there is nothing to leave.
+fn interval(v: Option<f64>, range: &Option<Range>) -> Option<(f64, f64)> {
+    match *range {
+        Some(Range::Abs(lo, hi)) => Some((lo, hi)),
+        Some(Range::Pct(lo, hi)) => {
+            let v = v?;
+            let (a, b) = (v * (1.0 + lo / 100.0), v * (1.0 + hi / 100.0));
+            Some((a.min(b), a.max(b)))
+        }
+        _ => None,
+    }
+}
+
+/// `Some(text)` when `x` lies outside the numeric range of the card number `key`.
+fn outside(key: &str, unit: &str, x: f64, v: Option<f64>, range: &Option<Range>) -> Option<String> {
+    let (lo, hi) = interval(v, range)?;
+    let slack = EDGE * lo.abs().max(hi.abs());
+    (!(x >= lo - slack && x <= hi + slack))
+        .then(|| format!("{key} = {x} {unit} is outside its card range [{lo}, {hi}] {unit}"))
+}
+
+fn optional_scalar(t: &Table, table: &str, key: &str) -> Result<Option<f64>, String> {
+    if t.contains_key(key) { scalar(t, table, key).map(Some) } else { Ok(None) }
+}
+
+fn optional_vec3(t: &Table, table: &str, key: &str) -> Result<Option<[f64; 3]>, String> {
+    if t.contains_key(key) { vec3(t, table, key).map(Some) } else { Ok(None) }
+}
+
+impl Scenario {
+    /// The same scenario on a ground of this roll and pitch (deg); an error unless it starts held on the ground.
+    pub fn on_slope(mut self, roll_pitch_deg: [f64; 2]) -> Result<Scenario, String> {
+        let Start::Ground { yaw_rad, .. } = self.start else {
+            return Err(format!("scenario {}: a ground slope needs [initial] contact = \"ground\"", self.name));
+        };
+        let [r, p] = roll_pitch_deg;
+        self.start = Start::Ground { roll_pitch_rad: [r.to_radians(), p.to_radians()], yaw_rad };
+        self.attitude = quat_from_euler_deg([r, p, yaw_rad.to_degrees()]);
+        Ok(self)
+    }
+}
+
 impl Spread {
     pub fn load(path: impl AsRef<Path>) -> Result<Spread, String> {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: cannot read: {e}", path.display()))?;
         let at = |e: String| format!("{}: {e}", path.display());
         let root: Table = text.parse().map_err(|e: toml::de::Error| at(format!("toml: {}", e.to_string().trim_end())))?;
-        known_keys(&root, "spread", &["scenarios", "points"]).map_err(at)?;
+        known_keys(&root, "spread", &["scenarios", "points", "maps", "air", "ground", "seeds"]).map_err(at)?;
         let dir = path.parent().unwrap_or(Path::new(""));
         let names = get(&root, "spread", "scenarios").map_err(at)?.as_array().ok_or(at("scenarios: must be a list".into()))?;
         let mut scenarios = Vec::new();
@@ -675,6 +794,154 @@ impl Spread {
         if scenarios.is_empty() || points.is_empty() {
             return Err(at("needs at least one scenario and one point".into()));
         }
-        Ok(Spread { scenarios, points })
+
+        let mut maps = Vec::new();
+        for (i, row) in rows(&root, "spread", "maps", &["speed_at_level_min"]).map_err(at)?.into_iter().enumerate() {
+            let name = format!("maps[{i}]");
+            maps.push(Map { speed_at_level_min: optional_scalar(row, &name, "speed_at_level_min").map_err(at)? });
+        }
+        let mut air = Vec::new();
+        for (i, row) in rows(&root, "spread", "air", &["drag", "wind_ned"]).map_err(at)?.into_iter().enumerate() {
+            let name = format!("air[{i}]");
+            air.push(Air {
+                drag_rotor_linear: optional_scalar(row, &name, "drag").map_err(at)?,
+                wind_ned_ms: optional_vec3(row, &name, "wind_ned").map_err(at)?,
+            });
+        }
+        let mut ground = Vec::new();
+        let ground_keys = ["imu1_gyro_bias_rads", "imu1_accel_bias_ms2", "roll_pitch_deg"];
+        for (i, row) in rows(&root, "spread", "ground", &ground_keys).map_err(at)?.into_iter().enumerate() {
+            let name = format!("ground[{i}]");
+            let roll_pitch_deg = match row.get("roll_pitch_deg") {
+                None => None,
+                Some(v) => match v.as_array().map(Vec::as_slice) {
+                    Some([r, p]) => match (number(r), number(p)) {
+                        (Some(r), Some(p)) => Some([r, p]),
+                        _ => return Err(at(format!("{name}.roll_pitch_deg: must be two numbers"))),
+                    },
+                    _ => return Err(at(format!("{name}.roll_pitch_deg: must be two numbers"))),
+                },
+            };
+            ground.push(Ground {
+                imu1_gyro_bias_rads: optional_vec3(row, &name, "imu1_gyro_bias_rads").map_err(at)?,
+                imu1_accel_bias_ms2: optional_vec3(row, &name, "imu1_accel_bias_ms2").map_err(at)?,
+                roll_pitch_deg,
+            });
+        }
+        let seeds = match root.get("seeds") {
+            None => None,
+            Some(v) => {
+                let bad = || at("seeds: must be a non-empty list of distinct integers >= 0".to_string());
+                let list: Vec<u64> = v
+                    .as_array()
+                    .ok_or_else(bad)?
+                    .iter()
+                    .map(|x| x.as_integer().and_then(|i| u64::try_from(i).ok()).ok_or_else(bad))
+                    .collect::<Result<_, _>>()?;
+                if list.is_empty() || list.iter().enumerate().any(|(i, s)| list[..i].contains(s)) {
+                    return Err(bad());
+                }
+                Some(list)
+            }
+        };
+        if maps.len() > 26 {
+            return Err(at("maps: at most 26 values (the cell name letters A to Z)".into()));
+        }
+        if maps.is_empty() && root.contains_key("maps") || air.is_empty() && root.contains_key("air")
+            || ground.is_empty() && root.contains_key("ground") {
+            return Err(at("maps, air and ground: a list that is given needs at least one value".into()));
+        }
+        if maps.is_empty() {
+            maps.push(Map::default());
+        }
+        if air.is_empty() {
+            air.push(Air::default());
+        }
+        if ground.is_empty() {
+            ground.push(Ground::default());
+        }
+        Ok(Spread { scenarios, points, maps, air, ground, seeds })
+    }
+
+    /// Every cell, scenarios outermost, seeds innermost. `scenario_names` are the loaded scenarios' names, in the
+    /// file's order. `default_seed` is `--seed`: needed when the file has no `seeds` axis, refused when it has one.
+    pub fn cells(&self, scenario_names: &[String], default_seed: Option<u64>) -> Result<Vec<Cell>, String> {
+        let seeds = match (&self.seeds, default_seed) {
+            (Some(list), None) => list.clone(),
+            (None, Some(seed)) => vec![seed],
+            (Some(_), Some(_)) => return Err("--seed: this file has a seeds axis; remove --seed".to_string()),
+            (None, None) => return Err("--seed is required: this file has no seeds axis".to_string()),
+        };
+        let prefix = scenario_names.len() > 1;
+        let mut cells = Vec::new();
+        for (scenario, scenario_name) in scenario_names.iter().enumerate() {
+            for point in 0..self.points.len() {
+                for map in 0..self.maps.len() {
+                    for air in 0..self.air.len() {
+                        for ground in 0..self.ground.len() {
+                            for &seed in &seeds {
+                                let head = if prefix { format!("{scenario_name}-") } else { String::new() };
+                                let name = format!("{head}p{point}-map{}-air{}-gnd{}-seed{seed}",
+                                    (b'A' + map as u8) as char, air + 1, ground + 1);
+                                cells.push(Cell { name, scenario, point, map, air, ground, seed });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(cells)
+    }
+
+    /// What this cell changes that lies outside the card's numeric range of that number (card decision, section 8).
+    /// A number whose range is "ask" or missing has no numeric range and is not checked.
+    pub fn range_errors(&self, cell: &Cell, card: &Card, env: &Env) -> Vec<String> {
+        let mut errs = Vec::new();
+        let p = self.points[cell.point];
+        let prop = &card.propulsion;
+        let thrust = &prop.thrust_coefficient;
+        if let Some(k) = thrust.v {
+            errs.extend(outside("point kf_scale -> propulsion.thrust_coefficient", &thrust.unit, k * p.kf_scale, thrust.v, &thrust.range));
+        }
+        let inertia = &card.mass.inertia;
+        if let Some(j) = inertia.v {
+            for (r, row) in j.iter().enumerate() {
+                for (c, &x) in row.iter().enumerate() {
+                    errs.extend(outside(&format!("point inertia_scale -> mass.inertia[{r}][{c}]"), &inertia.unit,
+                        x * p.inertia_scale, Some(x), &inertia.range));
+                }
+            }
+        }
+        if let Some(lag) = p.lag_s {
+            for (key, rec) in [("propulsion.time_constant_up", &prop.time_constant_up),
+                ("propulsion.time_constant_down", &prop.time_constant_down)] {
+                errs.extend(outside(&format!("point lag_s -> {key}"), &rec.unit, lag, rec.v, &rec.range));
+            }
+        }
+        if let Some(w) = self.maps[cell.map].speed_at_level_min {
+            let r = &prop.speed_at_level_min;
+            errs.extend(outside("map speed_at_level_min -> propulsion.speed_at_level_min", &r.unit, w, r.v, &r.range));
+        }
+        let air = &self.air[cell.air];
+        if let Some(d) = air.drag_rotor_linear {
+            let r = &card.drag_rotor_linear;
+            errs.extend(outside("air drag -> drag.rotor_linear", &r.unit, d, r.v, &r.range));
+        }
+        if let Some(w) = air.wind_ned_ms {
+            let r = &env.wind_mean_ned;
+            for (k, x) in w.into_iter().enumerate() {
+                errs.extend(outside(&format!("air wind_ned[{k}] -> wind.mean_ned"), &r.unit, x, r.v.map(|v| v[k]), &r.range));
+            }
+        }
+        let g = &self.ground[cell.ground];
+        for (key, set, rec) in [
+            ("imu1.gyro_bias", g.imu1_gyro_bias_rads, &card.imu1.gyro_bias),
+            ("imu1.accel_bias", g.imu1_accel_bias_ms2, &card.imu1.accel_bias),
+        ] {
+            for (k, x) in set.into_iter().flatten().enumerate() {
+                errs.extend(outside(&format!("ground {key}[{k}]"), &rec.unit, x, rec.v.map(|v| v[k]), &rec.range));
+            }
+        }
+        errs
     }
 }

@@ -21,7 +21,7 @@ scenarios and a five-point parameter spread. `takeoff-land` takes off from the g
 | `marv-sim/src/` | `plant.rs` (motor levels to a wrench), `backend.rs` (wrench to truth, RK4, and the ground), `sensors.rs` (the IMU model), `rng.rs` (seeded noise), `scenario.rs` (scenario and spread files), `pilot.rs` (the sim pilot, a test device), `verdict.rs` (the checks), `log.rs` (DataFlash), `math.rs`. |
 | `marv-sim/src/bin/marv-run.rs` | The runner. |
 | `marv-sim/tests/invariants.rs` | The plant invariants and the ground contact. |
-| `scenarios/*.toml` | The four scenarios (`hover`, `steps`, `stick-sign`, `rc-loss`), `takeoff-land` and the spread (`spread.toml`). |
+| `scenarios/*.toml` | The four scenarios (`hover`, `steps`, `stick-sign`, `rc-loss`), `takeoff-land`, the spread (`spread.toml`) and the take-off and landing matrix (`takeoff-land-matrix.toml`). |
 | `env/default.toml` | Gravity, atmosphere, origin, magnetic field, wind. Its origin is a public reference point, never home. |
 | `env/home.local.toml` | The real home location, if you create it. Git-ignored; never commit it. |
 
@@ -126,21 +126,58 @@ to touchdown, the touchdown state before the hold (vertical and horizontal speed
 throttle is cut, Stop after switch-off, and (nominal card only) the pilot's mean thrust ratio in hover. The pilot's
 drift correction is printed.
 
-## The parameter spread
+## The parameter spread and the run matrix
 
     cargo run -q --release -p marv-sim --bin marv-run -- --card marv-card/marv.toml --env env/default.toml \
         --spread scenarios/spread.toml --seed 1 --out-dir logs/spread
 
 Runs the four scenarios at the five points of `spread.toml` (nominal; k_F x0.7 or x1.3 with the inertia x1.25 or
 x0.75, each with both motor time constants 0.060 or 0.030 s). Only the plant and the backend take a point; the flight
-code keeps the compiled card. One log per run (`<scenario>-p<NN>-seed<S>.BIN`), one table (PASS, or FAIL with the
-first failing check), exit 0 only if all 20 pass, 3 if any fails, 1 on an error.
+code keeps the compiled card.
+
+A spread file is a matrix of cells: `scenarios`, `points` (required) and the axes `maps`, `air`, `ground`, `seeds`. A
+missing axis has one default value that changes nothing; a missing `seeds` means `--seed` is the one seed (and
+`--seed` is a usage error, exit 2, when the file has `seeds`). `scenarios/takeoff-land-matrix.toml` is `takeoff-land` at
+5 points x 2 maps x 3 air x 3 ground x 3 seeds = 270 cells (decision-sim-takeoff-landing, section 4):
+
+| axis | key | values |
+|---|---|---|
+| map | `speed_at_level_min` (plant only) | A: card (0); B: 128.9 rad/s |
+| air | `drag` N/(m/s), `wind_ned` m/s | 1: drag 0, calm; 2: drag 0.407, calm; 3: drag 0.407, wind [0, 2, 0] |
+| ground | `imu1_gyro_bias_rads`, `imu1_accel_bias_ms2`, `roll_pitch_deg` | 1: level; 2: IMU1 bias corner; 3: 5 deg roll slope |
+
+Axis values change only the plant, the environment and the sensors, never the flight code or the pilot's stick map.
+
+    cargo run -q --release -p marv-sim --bin marv-run -- --card marv-card/marv.toml --env env/default.toml \
+        --spread scenarios/takeoff-land-matrix.toml --out-dir logs/tl [--logs fail|all] [--only <cell>]
+
+A cell is named `p<point>-map<letter>-air<n>-gnd<n>-seed<s>` (letter and numbers by position in the file, the seed by
+value), with `<scenario>-` in front when the file has more than one scenario: `p2-mapB-air3-gnd2-seed1`. One line per
+cell (name, PASS or FAIL, the failing checks), then the failures per check, `PASS cells n of N`, the wall time (about
+20 s for the 270 cells) and `RESULT`: PASS only if every cell passes. Exit 0 pass, 3 a check failed, 1 an error, 2 usage.
+
+- `--only <cell>` runs that cell alone, prints its summary and checks, and writes its log. A rerun gives a
+  byte-identical log.
+- `--logs fail` (default) keeps `<out-dir>/<cell>.BIN` only for a cell with a failing check (about 11 MB each for
+  `takeoff-land`); `--logs all` keeps every one.
+- Range refusal (card decision, section 8): before any run, every cell is checked against the card's numeric range
+  of each number it changes: k_F and the inertia scale (`range_pct`), `lag_s` (both time constants), `speed_at_level_min`,
+  `drag.rotor_linear`, the IMU1 biases, and the wind. A cell outside one is refused, exit 1, naming the cell and the range
+  (once per distinct fault). A number whose range is `"ask"` (the wind) has no numeric range and is not checked. A
+  slope on a scenario that does not start on the ground is refused too.
+
+The bias corner (`gnd2`): the sim reads gyro = w + b_g and accel = [b_ax, b_ay, -g] at rest. In the Mahony filter the
+estimate settles at dx = -b_ax/g - b_gy/Kp and dy = -b_ay/g + b_gx/Kp (Kp 0.25 armed), so the tilt errors add on x
+when b_ax and b_gy have the same sign and on y when b_ay and b_gx have opposite signs: accel +0.1961 on x and y, gyro x
+-6.981e-3 and gyro y +6.981e-3. Check, nominal cell, seed 1, `nav_gap_deg` (limit 5): level 2.07; gyro alone 4.85; accel
+alone 3.88; both, these signs 6.94; gyro x flipped 5.83; gyro y flipped 4.74; both gyro signs flipped 1.53; accel y
+flipped 5.83; both accel signs flipped 2.89.
 
 ## The log
 
 The log is an ArduPilot DataFlash `.BIN`. It holds the firmware's records `MSG` (at time 0: sim version, firmware
 commit with `-dirty` if the checkout has uncommitted changes, card hash, scenario name, seed, and the spread point if
-one is used), `IMU` (instance 0 and 1: exactly what the flight step was given) and, for every flight step, `NAV`,
+one is used; a spread or matrix cell adds `cell`, `map`, `air` and `ground` lines with its name and axis values), `IMU` (instance 0 and 1: exactly what the flight step was given) and, for every flight step, `NAV`,
 `SETP`, `DMD` and `MOT` (written by the firmware's `encode_step`); and three sim-only records: `TRU` (truth:
 position, velocity, attitude quaternion, body rates), `ROT` (the levels the plant used and the true rotor speeds, by
 DShot line) and `RCS` (at every report time: the sticks, the switch, and `Lost` = 1 inside a lost interval). A
@@ -159,7 +196,7 @@ records the state before the hold).
 ## Not built yet
 
 Barometer, compass and GNSS models, wind gusts, the shadow estimator, the TCP link and the Gazebo backend (steps 6
-to 9). The spread does not yet refuse a point outside a number's card range.
+to 9).
 
 ## Check the card
 

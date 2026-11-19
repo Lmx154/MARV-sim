@@ -1,0 +1,51 @@
+# The run matrix of take-off and landing (decision-sim-takeoff-landing-20261119, section 4; approved by the owner
+# 2026-11-19): 5 points x 2 maps x 3 air x 3 ground x 3 seeds = 270 cells of takeoff-land.toml.
+# Every axis value changes only the plant, the environment or the sensors, never the flight code or the pilot's map
+# (the pilot's inverse map comes from the nominal card). A value outside the card's numeric range of the number it
+# changes is refused before any run.
+#
+# A cell is named p<point>-map<letter>-air<n>-gnd<n>-seed<s>: point P0..P4 as in spread.toml, the map letter and the
+# air and ground numbers by position in the lists below (A and 1 are the first), the seed's value.
+#   e.g. p2-mapB-air3-gnd2-seed1 = P2, map B, drag 0.407 with wind, the IMU1 bias corner, seed 1.
+scenarios = ["takeoff-land.toml"]   # relative to this file
+points = [
+  { kf_scale = 1.0, inertia_scale = 1.0 },                    # P0: nominal card
+  { kf_scale = 0.7, inertia_scale = 1.25, lag_s = 0.060 },    # P1
+  { kf_scale = 0.7, inertia_scale = 1.25, lag_s = 0.030 },    # P2
+  { kf_scale = 1.3, inertia_scale = 0.75, lag_s = 0.060 },    # P3
+  { kf_scale = 1.3, inertia_scale = 0.75, lag_s = 0.030 },    # P4
+]
+
+# Map shape (section 6), for the plant only: the flight code keeps its compiled speed_at_level_min of 0.
+#   A: the card (speed_at_level_min 0).
+#   B: 128.9 rad/s: the line through the props-off idle speed measured on the board (2280 rpm at level 111) and the
+#      card's full-throttle speed; card range [0, 129].
+maps = [
+  {},                                  # A
+  { speed_at_level_min = 128.9 },      # B, rad/s
+]
+
+# Air (section 5): linear rotor drag, N/(m/s), card range [0, 0.41]; the upper value is mass x 0.544 1/s (another
+# quadrotor, an order-of-magnitude bound). Wind, NED m/s, only matters with drag (plant.rs).
+air = [
+  { drag = 0.0 },                                       # 1: calm, no drag
+  { drag = 0.407 },                                     # 2: calm
+  { drag = 0.407, wind_ned = [0.0, 2.0, 0.0] },         # 3: 2 m/s from the west
+]
+
+# Ground (section 4). The IMU1 bias corner is the card's range of imu1.gyro_bias (+/-6.981e-3 rad/s) and
+# imu1.accel_bias (+/-0.1961 m/s^2) on body x and y, with the signs that make the two tilt errors ADD.
+# Derivation (fw-flight/src/mahony.rs; marv-sim/src/sensors.rs). The sim's IMU reads gyro = w + b_g and, at rest and
+# level, accel = [b_ax, b_ay, -g]. Mahony measures down d_m = -f/|f| = [-b_ax/g, -b_ay/g, 1] and keeps d_e, down in
+# the body, which moves as d_e' = -(omega + Kp e) x d_e with e = d_m x d_e. At rest it stops when omega + Kp e is
+# parallel to d_e, so with d_e = [dx, dy, 1]:  b_gx + Kp (d_m.y - dy) = 0 and b_gy + Kp (dx - d_m.x) = 0, that is
+#   dx = -b_ax/g - b_gy/Kp      dy = -b_ay/g + b_gx/Kp          (Kp 0.25 armed; 1.15 deg and 1.60 deg per axis).
+# The accel and the gyro terms add on x when b_ax and b_gy have the SAME sign, and on y when b_ay and b_gx have
+# OPPOSITE signs. So accel +0.1961 on x and y, gyro x -6.981e-3 and gyro y +6.981e-3. Confirmed by running this
+# corner, each bias alone and one sign flipped (README, "the bias corner").
+ground = [
+  {},                                                   # 1: level
+  { imu1_gyro_bias_rads = [-6.981e-3, 6.981e-3, 0.0], imu1_accel_bias_ms2 = [0.1961, 0.1961, 0.0] },   # 2: bias corner
+  { roll_pitch_deg = [5.0, 0.0] },                      # 3: 5 deg roll slope
+]
+seeds = [1, 2, 3]
