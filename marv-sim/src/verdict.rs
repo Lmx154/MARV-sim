@@ -4,7 +4,7 @@
 //! happens gives NaN, and NaN fails every check.
 
 use crate::backend::{Reaction, Touchdown};
-use crate::pilot::{PhaseRun, Report};
+use crate::pilot::{Ending, PhaseRun, Report};
 use crate::scenario::{Pulse, Verdict};
 
 /// One flight step as the checks see it. Quaternions are body to world `[w, x, y, z]`.
@@ -209,11 +209,197 @@ pub fn judge(verdict: &Verdict, trace: &Trace) -> (Vec<Check>, Vec<String>) {
             ];
             (checks, Vec::new())
         }
-        Verdict::TakeoffLand { .. } => {
-            let none = Check { name: "takeoff_land".into(), measured: "not_built".into(), limit: "-".into(), pass: false };
-            (vec![none], Vec::new())
-        }
+        Verdict::TakeoffLand { .. } => takeoff_land(verdict, trace),
     }
+}
+
+/// The phases the takeoff_land checks name (decision-sim-takeoff-landing, section 3 table).
+const IDLE_PHASE: &str = "idle";
+const HOVER_PHASE: &str = "hover";
+const BAND_PHASES: [&str; 4] = ["hover", "settle", "yaw", "steady"];
+const SPEED_PHASES: [&str; 5] = ["hover", "yaw", "steady", "descend", "land"];
+
+/// The index and `[start, end)` of the named phase; an unended phase runs to the end of the trace.
+fn phase(trace: &Trace, name: &str) -> Option<(usize, u64, u64)> {
+    let i = trace.phases.iter().position(|p| p.name == name)?;
+    let p = &trace.phases[i];
+    Some((i, p.start_us, p.end.map_or(u64::MAX, |(t, _)| t)))
+}
+
+/// Flight steps in `[from_us, to_us)`.
+fn between(trace: &Trace, from_us: u64, to_us: u64) -> impl Iterator<Item = &Sample> {
+    trace.steps.iter().filter(move |s| s.t_us >= from_us && s.t_us < to_us)
+}
+
+/// Flight steps in any of the named phases; `None` when one of them did not run.
+fn in_phases<'a>(trace: &'a Trace, names: &[&str]) -> Option<Vec<&'a Sample>> {
+    let mut out = Vec::new();
+    for n in names {
+        let (_, from, to) = phase(trace, n)?;
+        out.extend(between(trace, from, to));
+    }
+    Some(out)
+}
+
+/// The angle between the estimate's and the truth's down, degrees.
+fn down_gap_deg(a: [f64; 4], b: [f64; 4]) -> f64 {
+    let down = |[w, x, y, z]: [f64; 4]| [2.0 * (x * z - w * y), 2.0 * (y * z + w * x), 1.0 - 2.0 * (x * x + y * y)];
+    let (u, v) = (down(a), down(b));
+    (u[0] * v[0] + u[1] * v[1] + u[2] * v[2]).clamp(-1.0, 1.0).acos().to_degrees()
+}
+
+fn count_check(name: &str, bad: Option<usize>) -> Check {
+    Check {
+        name: name.into(),
+        measured: bad.map_or("NaN".into(), |n| n.to_string()),
+        limit: "=0".into(),
+        pass: bad == Some(0),
+    }
+}
+
+/// decision-sim-takeoff-landing, section 3: one check per row of its table. Lift-off is the end of the first tick off
+/// the ground (backend), touchdown the backend's (state before the hold); switch-on and switch-off are the first pilot
+/// reports with the switch on, then off again.
+fn takeoff_land(verdict: &Verdict, trace: &Trace) -> (Vec<Check>, Vec<String>) {
+    let Verdict::TakeoffLand { airborne_m, arm_bound_s, r_stance_m, stance_floor_weight, max_stance_ratio,
+        liftoff_window_s, max_liftoff_tilt_deg, height_band_m, max_tilt_deg, max_speed_h_ms, max_nav_gap_deg,
+        max_td_vz_ms, max_td_vh_ms, max_td_tilt_deg, max_td_rate_dps, idle_after_s, stop_bound_s,
+        hover_trim_tolerance } = *verdict else { unreachable!() };
+    let idle = [marv_card::IDLE_LEVEL; 4];
+    let t_on = trace.pilot.iter().find(|r| r.row.arm).map(|r| r.row.t_us);
+    let t_off = t_on.and_then(|on| trace.pilot.iter().find(|r| r.row.t_us > on && !r.row.arm).map(|r| r.row.t_us));
+    let t_lo = trace.liftoffs.first().copied();
+    let t_td = trace.touchdowns.first().map(|d| d.t_us);
+    let height = |s: &Sample| -s.truth_pos[2];
+    let mut checks = Vec::new();
+
+    // stop_disarmed, armed_on_ground, idle_exact.
+    checks.push(count_check("stop_disarmed", t_on.and_then(|on| {
+        let ticks: Vec<_> = trace.esc.iter().filter(|(t, _)| *t < on).collect();
+        (!ticks.is_empty()).then(|| ticks.iter().filter(|(_, l)| *l != [0; 4]).count())
+    })));
+    let t_spin = t_on.and_then(|on| trace.esc.iter().find(|(t, l)| *t >= on && *l != [0; 4]).map(|(t, _)| *t));
+    let armed_delay = match (t_on, t_spin) {
+        (Some(on), Some(spin)) => secs(spin - on),
+        _ => f64::NAN,
+    };
+    checks.push(at_most("armed_on_ground_s", armed_delay, arm_bound_s));
+    checks.push(count_check("idle_exact", match (t_on, t_spin, phase(trace, IDLE_PHASE)) {
+        (Some(on), Some(spin), Some((_, _, end))) if spin < end => {
+            let lines = trace.esc.iter().filter(|(t, l)| *t >= spin && *t < end && *l != idle).count();
+            Some(lines + between(trace, on, end).filter(|s| !s.on_ground).count())
+        }
+        _ => None,
+    }));
+
+    // stance_margin: armed, in contact, N >= the floor.
+    let floor = stance_floor_weight * trace.weight_n;
+    let stance = largest(trace.steps.iter().filter(|s| s.armed && s.on_ground && s.reaction.normal_n >= floor).map(|s| {
+        let [tx, ty] = s.reaction.torque_xy_nm;
+        (tx * tx + ty * ty).sqrt() / (s.reaction.normal_n * r_stance_m)
+    }));
+    checks.push(at_most("stance_margin", stance, max_stance_ratio));
+
+    // liftoff_tilt over [lift-off, + window).
+    let lift_tilt = t_lo.map_or(f64::NAN, |lo| {
+        largest(between(trace, lo, lo + us(liftoff_window_s)).map(|s| tilt_deg(s.truth_q)))
+    });
+    checks.push(at_most("liftoff_tilt_deg", lift_tilt, max_liftoff_tilt_deg));
+
+    // single_flight: one rise through airborne_m, one touchdown, never above airborne_m after it.
+    let rises = trace.steps.windows(2).filter(|w| height(&w[0]) < airborne_m && height(&w[1]) >= airborne_m).count();
+    let above = t_td.map_or(0, |td| trace.steps.iter().filter(|s| s.t_us >= td && height(s) > airborne_m).count());
+    let single = (rises, trace.touchdowns.len(), above);
+    checks.push(Check {
+        name: "single_flight".into(),
+        measured: format!("{}/{}/{}", single.0, single.1, single.2),
+        limit: "=1/1/0".into(),
+        pass: single == (1, 1, 0),
+    });
+
+    // no_timeout: no phase timed out, and the table ran to its end.
+    let timeouts = trace.phases.iter().filter(|p| !matches!(p.end, Some((_, Ending::Time | Ending::Event)))).count();
+    checks.push(count_check("no_timeout", (!trace.phases.is_empty()).then_some(timeouts)));
+
+    // height_band: abs(h - h_ref) in the named phases, h_ref from the pilot's own reference in that phase.
+    let band = largest(BAND_PHASES.iter().flat_map(|n| {
+        let found = phase(trace, n);
+        let h_ref = found.and_then(|(i, _, _)| trace.pilot.iter().find(|r| r.phase == i && r.mode == 2))
+            .map_or(f64::NAN, |r| r.reference);
+        let samples: Vec<f64> = found.map_or(vec![f64::NAN], |(_, from, to)| {
+            between(trace, from, to).map(|s| (height(s) - h_ref).abs()).collect()
+        });
+        samples
+    }));
+    checks.push(at_most("height_band_m", band, height_band_m));
+
+    checks.push(at_most("tilt_max_deg", largest(trace.steps.iter().filter(|s| !s.on_ground).map(|s| tilt_deg(s.truth_q))),
+        max_tilt_deg));
+    let speed = in_phases(trace, &SPEED_PHASES).map_or(f64::NAN, |v| {
+        largest(v.into_iter().map(|s| s.truth_vel[0].hypot(s.truth_vel[1])))
+    });
+    checks.push(at_most("speed_h_ms", speed, max_speed_h_ms));
+    checks.push(at_most("nav_gap_deg", largest(trace.steps.iter().filter(|s| s.armed).map(|s| down_gap_deg(s.nav_q, s.truth_q))),
+        max_nav_gap_deg));
+
+    // no_saturation from lift-off to touchdown; a refused demand counts as a flag.
+    checks.push(count_check("no_saturation", match (t_lo, t_td) {
+        (Some(lo), Some(td)) => Some(between(trace, lo, td).filter(|s| s.flags != Some(0)).count()),
+        _ => None,
+    }));
+
+    // Touchdown: the worst over every touchdown, the state before the hold.
+    let td = |f: fn(&Touchdown) -> f64| {
+        if trace.touchdowns.is_empty() { f64::NAN } else { largest(trace.touchdowns.iter().map(f)) }
+    };
+    checks.push(at_most("td_vz_ms", td(|d| d.velocity_ms[2].abs()), max_td_vz_ms));
+    checks.push(at_most("td_vh_ms", td(|d| d.velocity_ms[0].hypot(d.velocity_ms[1])), max_td_vh_ms));
+    checks.push(at_most("td_tilt_deg", td(|d| d.tilt_rad.to_degrees()), max_td_tilt_deg));
+    checks.push(at_most("td_rate_dps", td(|d| {
+        let [p, q, r] = d.rates_rads;
+        (p * p + q * q + r * r).sqrt().to_degrees()
+    }), max_td_rate_dps));
+
+    // idle_after: from the first throttle-0 report after touchdown, + idle_after_s, to switch-off.
+    let t_zero = t_td.and_then(|td| trace.pilot.iter().find(|r| r.row.t_us >= td && r.row.throttle == 0.0)).map(|r| r.row.t_us);
+    checks.push(count_check("idle_after", match (t_zero, t_off) {
+        (Some(z), Some(off)) => {
+            let ticks: Vec<_> = trace.esc.iter().filter(|(t, _)| *t >= z + us(idle_after_s) && *t < off).collect();
+            (!ticks.is_empty()).then(|| ticks.iter().filter(|(_, l)| *l != idle).count())
+        }
+        _ => None,
+    }));
+
+    // stop_after: the first ESC tick from which every line stays 0 to the end, after switch-off.
+    let stop = t_off.map_or(f64::NAN, |off| {
+        let last_spin = trace.esc.iter().rposition(|(_, l)| *l != [0; 4]);
+        let from = last_spin.map_or(0, |i| i + 1);
+        trace.esc[from..].iter().find(|(t, _)| *t >= off).map_or(f64::NAN, |(t, _)| secs(*t - off))
+    });
+    checks.push(at_most("stop_after_s", stop, stop_bound_s));
+
+    // hover_trim: the pilot's mean thrust ratio in hover, judged at the nominal cell only.
+    let trim = phase(trace, HOVER_PHASE).map_or(f64::NAN, |(i, _, _)| {
+        mean(trace.pilot.iter().filter(|r| r.phase == i).map(|r| r.ratio))
+    });
+    let mut notes = Vec::new();
+    if trace.nominal {
+        checks.push(Check {
+            name: "hover_trim".into(),
+            measured: format!("{trim:.4}"),
+            limit: format!("1+/-{hover_trim_tolerance:.4}"),
+            pass: (trim - 1.0).abs() <= hover_trim_tolerance,
+        });
+    } else {
+        notes.push(format!("INFO hover_trim {trim:.4} (judged at the nominal cell only)"));
+    }
+    let held: Vec<&Report> = trace.pilot.iter().filter(|r| r.xy != [0.0; 2]).collect();
+    let xy = |r: &&Report| r.xy[0].hypot(r.xy[1]);
+    notes.push(format!("INFO pilot xy correction: largest {:.4}, mean {:.4} of stick (cap at 0.25 = 7.5 deg)",
+        largest(held.iter().map(xy)), mean(held.iter().map(xy))));
+    notes.push(format!("INFO lift-off {:.4} s, touchdown {:.4} s",
+        t_lo.map_or(f64::NAN, secs), t_td.map_or(f64::NAN, secs)));
+    (checks, notes)
 }
 
 /// Hover: the largest change of truth heading from its value at the first step at or after `from_s`, to the end.

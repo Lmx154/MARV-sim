@@ -8,7 +8,8 @@ State on 2026-11-19: build step 5 of 9. The vehicle card and its checker, the pl
 the scenario file, the runner `marv-run` and the DataFlash log exist. The runner flies the firmware's real flight code
 (`Flight<Mahony, CascadedPid, CardAllocator>` with the gate, `Tuning::DEFAULT` and the compiled card) from a stick
 script, and judges each run against the thresholds of `decision-first-pair-20261119.md` (sections 8 and 13): four
-scenarios and a five-point parameter spread.
+scenarios and a five-point parameter spread. `takeoff-land` takes off from the ground, flies and lands with a sim pilot
+(`decision-sim-takeoff-landing-20261119.md`).
 
 ## What is here
 
@@ -17,10 +18,10 @@ scenarios and a five-point parameter spread.
 | `marv-card/marv.toml` | The vehicle card: the only source of the vehicle's physical numbers. Every number is a record with a value, a unit, a tag (`measured`, `datasheet`, `cad`, `derived`, `placeholder`) and a source. |
 | `marv-card/src/` | The loader and the checks (`schema.rs`) and the `card-check` program. |
 | `marv-card/build.rs` | Compiles the card into `const` data for the firmware (`no_std`, without feature `std`): rotor positions and spins, the mixer matrix, coefficients, levels, mass, the card's sha256. `marv-run` refuses a card whose sha256 differs. An `"ask"` in a number the firmware needs fails the build; placeholders show as cargo warnings. |
-| `marv-sim/src/` | `plant.rs` (motor levels to a wrench), `backend.rs` (wrench to truth, RK4, and the ground), `sensors.rs` (the IMU model), `rng.rs` (seeded noise), `scenario.rs` (scenario and spread files), `verdict.rs` (the checks), `log.rs` (DataFlash), `math.rs`. |
+| `marv-sim/src/` | `plant.rs` (motor levels to a wrench), `backend.rs` (wrench to truth, RK4, and the ground), `sensors.rs` (the IMU model), `rng.rs` (seeded noise), `scenario.rs` (scenario and spread files), `pilot.rs` (the sim pilot, a test device), `verdict.rs` (the checks), `log.rs` (DataFlash), `math.rs`. |
 | `marv-sim/src/bin/marv-run.rs` | The runner. |
 | `marv-sim/tests/invariants.rs` | The plant invariants and the ground contact. |
-| `scenarios/*.toml` | The four scenarios (`hover`, `steps`, `stick-sign`, `rc-loss`) and the spread (`spread.toml`). |
+| `scenarios/*.toml` | The four scenarios (`hover`, `steps`, `stick-sign`, `rc-loss`), `takeoff-land` and the spread (`spread.toml`). |
 | `env/default.toml` | Gravity, atmosphere, origin, magnetic field, wind. Its origin is a public reference point, never home. |
 | `env/home.local.toml` | The real home location, if you create it. Git-ignored; never commit it. |
 
@@ -59,7 +60,8 @@ angular accel are 0, so the IMU model reads gravity only. The vehicle lifts off 
 force in NED (weight included) points up, and that tick integrates normally. It touches down at the end of a tick with
 down >= 0: the velocity, tilt and rates from before the hold go to `NativeBackend::touchdown()`, then down, velocity and
 rates are set to 0 and the attitude is kept. `Truth` carries `on_ground` and `reaction` (normal force, horizontal force,
-roll/pitch torque: minus the applied wrench). No friction, spring or pivot. No scenario file asks for the ground yet.
+roll/pitch torque: minus the applied wrench). No friction, spring or pivot. `[initial] contact = "ground"` starts a
+scenario held on it.
 
 ## The scenario file
 
@@ -92,6 +94,37 @@ The four scenarios (all start level in the air with the rotors at hover speed; s
   movement on the other axes.
 - `rc-loss.toml`: arming rules, the RC-loss Stop within 2.5 ms of the 1.0 s timeout, no re-arm without a switch
   cycle, switch-off Stop; judged at the levels the plant is given.
+- `takeoff-land.toml`: starts on the ground, motors stopped; phases instead of a script (below).
+
+## Phases and the sim pilot
+
+Instead of `script`, `[rc] phase = [...]` (a file has one or the other) with a `[pilot]` table. Each phase starts when
+the previous one ends: after `after_s`, or at an `event` (`airborne`: height >= `[pilot] airborne_m`; `below`: height
+< `below_m`; `landed`: the contact flag) with a `timeout_s`; a timeout is recorded and the next phase starts. The run
+ends with the last phase (`duration_s` is an upper bound). `arm` is the switch (kept from the previous phase if not
+given); `throttle = "zero" | "ramp"`, or `height_m`, or `descend_ms`; `roll`, `pitch`, `yaw` are scripted sticks;
+`xy = "hold"` turns on the drift correction (not with roll or pitch). The runner prints each phase's start and how it
+ended.
+
+The pilot (`pilot.rs`) is a test device in the harness, NOT flight code: the flight code has no height hold, so the
+harness flies the throttle as a human would by eye. It is given only a `PilotView` (truth height, vertical speed,
+horizontal velocity in the heading frame, contact flag) delayed by `delay_s`, and makes one stick report per 4 ms
+through the RC path. It never sees the estimate, the allocator flags, the spread point or the level-to-speed map, and
+never arms or disarms. Throttle: "zero" moves the stick to 0; "ramp" raises the thrust ratio from 0 at
+`ramp_ratio_per_s`; "height" and "descend" set `v_ref = clamp(k_h (h_ref - h), -v_dn, v_up)` or `-descend_ms`, then
+the thrust ratio `1 + (clamp(k_v (v_ref - v), +/-accel_max_g g) + I) / g` with `I' = k_i (v_ref - v)`, frozen while
+the stick is at 0 or 1, and set at the ramp-to-height switch so the stick does not jump. The ratio becomes a stick by
+the inverse of the documented two-slope map (0.5 = m g, 1 = full collective), computed from the nominal card. Drift:
+roll and pitch sticks `-xy_k v_h / g / ANGLE_MAX` (30 deg), at most `xy_stick_max` in length. Every stick moves at most
+`stick_rate_per_s` and stays in its range.
+
+`check = "takeoff_land"` judges the table of the decision's section 3: Stop before switch-on, armed within 6.5 ms, idle
+level exactly through "idle", the stance margin `tau_xy / (N r_stance)` while armed in contact with N above the floor,
+the tilt for 1 s after lift-off (first tick off the ground), a single flight, no timeout, the height band, the
+largest tilt in the air, horizontal speed, the angle between estimated and true down, no allocator flag from lift-off
+to touchdown, the touchdown state before the hold (vertical and horizontal speed, tilt, rate), idle level after the
+throttle is cut, Stop after switch-off, and (nominal card only) the pilot's mean thrust ratio in hover. The pilot's
+drift correction is printed.
 
 ## The parameter spread
 
@@ -110,7 +143,10 @@ commit with `-dirty` if the checkout has uncommitted changes, card hash, scenari
 one is used), `IMU` (instance 0 and 1: exactly what the flight step was given) and, for every flight step, `NAV`,
 `SETP`, `DMD` and `MOT` (written by the firmware's `encode_step`); and three sim-only records: `TRU` (truth:
 position, velocity, attitude quaternion, body rates), `ROT` (the levels the plant used and the true rotor speeds, by
-DShot line) and `RCS` (at every report time: the sticks, the switch, and `Lost` = 1 inside a lost interval).
+DShot line) and `RCS` (at every report time: the sticks, the switch, and `Lost` = 1 inside a lost interval). A
+phase-form scenario adds `GND` (every flight step: contact flag, normal force N, roll/pitch reaction torque) and `PIL`
+(every report: phase index, mode 0 zero / 1 ramp / 2 height / 3 descend, h_ref or v_ref, throttle stick, integrator,
+drift correction in roll and pitch); the script-form logs are unchanged.
 
 ## Check the plant
 
