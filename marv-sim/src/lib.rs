@@ -6,6 +6,7 @@
 pub mod backend;
 pub mod log;
 pub mod math;
+pub mod pilot;
 pub mod plant;
 pub mod rng;
 pub mod scenario;

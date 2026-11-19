@@ -1,5 +1,6 @@
 //! The scenario file and the spread file. Unknown keys are an error in every table and every row.
 
+use crate::backend::Start;
 use crate::math::{Quat, quat_mul};
 use std::path::{Path, PathBuf};
 use toml::{Table, Value};
@@ -21,8 +22,14 @@ pub struct Scenario {
     pub attitude: Quat,
     pub rates_rads: [f64; 3],
     pub rotors: Rotors,
-    /// The stick script, by time; each row holds until the next. The first row is at 0.
+    /// `[initial] contact`: `Start::Air` ("air", the default) or `Start::Ground` ("ground").
+    pub start: Start,
+    /// The stick script, by time; each row holds until the next. The first row is at 0. Empty in the phase form.
     pub rc_script: Vec<RcRow>,
+    /// `[rc] phase`: each phase starts when the previous one ends. Empty in the script form.
+    pub phases: Vec<Phase>,
+    /// `[pilot]`: present exactly when `phases` is not empty.
+    pub pilot: Option<PilotParams>,
     /// `[from_us, to_us)` intervals in which no stick report is made.
     pub rc_lost: Vec<(u64, u64)>,
     pub disturbances: Vec<Disturbance>,
@@ -38,6 +45,62 @@ pub struct RcRow {
     pub yaw: f32,
     pub throttle: f32,
     pub arm: bool,
+}
+
+/// `[pilot]`: the sim pilot's limits and gains (decision-sim-takeoff-landing, sections 2 and 10).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PilotParams {
+    pub delay_s: f64,
+    pub stick_rate_per_s: f64,
+    pub ramp_ratio_per_s: f64,
+    pub airborne_m: f64,
+    pub k_h: f64,
+    pub k_v: f64,
+    pub k_i: f64,
+    pub accel_max_g: f64,
+    pub v_up_ms: f64,
+    pub v_dn_ms: f64,
+    pub xy_k: f64,
+    pub xy_stick_max: f64,
+}
+
+/// How a phase ends. An event is seen through the pilot's delay; `timeout_us` ends the phase as a timeout.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PhaseEnd {
+    After { us: u64 },
+    /// Height at or above `[pilot] airborne_m`.
+    Airborne { timeout_us: u64 },
+    /// Height below `below_m`.
+    Below { below_m: f64, timeout_us: u64 },
+    /// The contact flag.
+    Landed { timeout_us: u64 },
+}
+
+/// What the pilot does with the throttle in a phase.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Throttle {
+    /// Stick to 0 at the rate limit.
+    Zero,
+    /// Thrust ratio up from 0 at `ramp_ratio_per_s`.
+    Ramp,
+    /// Hold this height, m.
+    Height(f64),
+    /// Descend at this speed, m/s.
+    Descend(f64),
+}
+
+/// One row of `[rc] phase`. Roll, pitch and yaw are scripted sticks; `arm = None` keeps the previous phase's switch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Phase {
+    pub name: String,
+    pub end: PhaseEnd,
+    pub arm: Option<bool>,
+    pub throttle: Throttle,
+    pub roll: f32,
+    pub pitch: f32,
+    pub yaw: f32,
+    /// `xy = "hold"`: the pilot's drift correction on roll and pitch.
+    pub xy_hold: bool,
 }
 
 /// A body torque added to the plant's wrench over `[from_us, to_us)`.
@@ -101,6 +164,27 @@ pub enum Verdict {
         rearm_s: f64,
         off_s: f64,
         off_bound_s: f64,
+    },
+    /// decision-sim-takeoff-landing, section 3. `airborne_m` is `[pilot] airborne_m`, the verdict's lift-off height.
+    TakeoffLand {
+        airborne_m: f64,
+        arm_bound_s: f64,
+        r_stance_m: f64,
+        stance_floor_weight: f64,
+        max_stance_ratio: f64,
+        liftoff_window_s: f64,
+        max_liftoff_tilt_deg: f64,
+        height_band_m: f64,
+        max_tilt_deg: f64,
+        max_speed_h_ms: f64,
+        max_nav_gap_deg: f64,
+        max_td_vz_ms: f64,
+        max_td_vh_ms: f64,
+        max_td_tilt_deg: f64,
+        max_td_rate_dps: f64,
+        idle_after_s: f64,
+        stop_bound_s: f64,
+        hover_trim_tolerance: f64,
     },
 }
 
@@ -198,6 +282,100 @@ fn rc_script(rc: &Table) -> Result<Vec<RcRow>, String> {
     Ok(script)
 }
 
+fn pilot(p: &Table) -> Result<PilotParams, String> {
+    let f = |key: &str| {
+        let x = scalar(p, "pilot", key)?;
+        if x < 0.0 {
+            return Err(format!("pilot.{key}: must be >= 0"));
+        }
+        Ok(x)
+    };
+    Ok(PilotParams {
+        delay_s: f("delay_s")?,
+        stick_rate_per_s: f("stick_rate_per_s")?,
+        ramp_ratio_per_s: f("ramp_ratio_per_s")?,
+        airborne_m: f("airborne_m")?,
+        k_h: f("k_h")?,
+        k_v: f("k_v")?,
+        k_i: f("k_i")?,
+        accel_max_g: f("accel_max_g")?,
+        v_up_ms: f("v_up_ms")?,
+        v_dn_ms: f("v_dn_ms")?,
+        xy_k: f("xy_k")?,
+        xy_stick_max: f("xy_stick_max")?,
+    })
+}
+
+const PILOT_KEYS: [&str; 12] = ["delay_s", "stick_rate_per_s", "ramp_ratio_per_s", "airborne_m", "k_h", "k_v", "k_i",
+    "accel_max_g", "v_up_ms", "v_dn_ms", "xy_k", "xy_stick_max"];
+
+fn rc_phases(rc: &Table) -> Result<Vec<Phase>, String> {
+    let keys = ["name", "after_s", "event", "below_m", "timeout_s", "arm", "throttle", "height_m", "descend_ms", "xy",
+        "roll", "pitch", "yaw"];
+    let mut phases: Vec<Phase> = Vec::new();
+    for (i, row) in rows(rc, "rc", "phase", &keys)?.into_iter().enumerate() {
+        let at = format!("rc.phase[{i}]");
+        let name = match get(row, &at, "name")? {
+            Value::String(n) if !n.is_empty() => n.clone(),
+            _ => return Err(format!("{at}.name: must be a non-empty string")),
+        };
+        if phases.iter().any(|p| p.name == name) {
+            return Err(format!("{at}.name: \"{name}\" is used twice"));
+        }
+        let has = |k: &str| row.contains_key(k);
+        let event = if has("event") {
+            Some(get(row, &at, "event")?.as_str().ok_or(format!("{at}.event: must be a string"))?)
+        } else {
+            None
+        };
+        if has("below_m") && event != Some("below") {
+            return Err(format!("{at}.below_m: only with event = \"below\""));
+        }
+        let end = match (has("after_s"), event) {
+            (true, None) if !has("timeout_s") => PhaseEnd::After { us: micros(row, &at, "after_s")? },
+            (false, Some(e)) => {
+                let timeout_us = micros(row, &at, "timeout_s")?;
+                match e {
+                    "airborne" => PhaseEnd::Airborne { timeout_us },
+                    "below" => PhaseEnd::Below { below_m: scalar(row, &at, "below_m")?, timeout_us },
+                    "landed" => PhaseEnd::Landed { timeout_us },
+                    _ => return Err(format!("{at}.event: must be \"airborne\", \"below\" or \"landed\"")),
+                }
+            }
+            _ => return Err(format!("{at}: needs either after_s, or event with timeout_s")),
+        };
+        let throttle = match (has("throttle"), has("height_m"), has("descend_ms")) {
+            (true, false, false) => match get(row, &at, "throttle")?.as_str() {
+                Some("zero") => Throttle::Zero,
+                Some("ramp") => Throttle::Ramp,
+                _ => return Err(format!("{at}.throttle: must be \"zero\" or \"ramp\"")),
+            },
+            (false, true, false) => Throttle::Height(scalar(row, &at, "height_m")?),
+            (false, false, true) => Throttle::Descend(scalar(row, &at, "descend_ms")?),
+            _ => return Err(format!("{at}: needs exactly one of throttle, height_m, descend_ms")),
+        };
+        let xy_hold = match row.get("xy") {
+            None => false,
+            Some(Value::String(x)) if x == "hold" => true,
+            Some(_) => return Err(format!("{at}.xy: must be \"hold\"")),
+        };
+        if xy_hold && (has("roll") || has("pitch")) {
+            return Err(format!("{at}.xy: the drift correction is off in a phase that scripts roll or pitch"));
+        }
+        let stick = |k: &str| if has(k) { ranged(row, &at, k, -1.0, 1.0) } else { Ok(0.0) };
+        let arm = match row.get("arm") {
+            None => None,
+            Some(v) => Some(v.as_bool().ok_or(format!("{at}.arm: must be true or false"))?),
+        };
+        phases.push(Phase { name, end, arm, throttle, roll: stick("roll")?, pitch: stick("pitch")?, yaw: stick("yaw")?,
+            xy_hold });
+    }
+    if phases.is_empty() {
+        return Err("rc.phase: empty".to_string());
+    }
+    Ok(phases)
+}
+
 fn verdict(root: &Table) -> Result<Verdict, String> {
     let v = root
         .get("verdict")
@@ -213,7 +391,12 @@ fn verdict(root: &Table) -> Result<Verdict, String> {
             "min_accel_rise_ms2"],
         "rc_loss" => &["on_high_s", "low_s", "arm_s", "throttle_s", "lost_at_s", "rc_fs_timeout_s", "stop_bound_s",
             "resume_s", "rearm_s", "off_s", "off_bound_s"],
-        _ => return Err("verdict.check: must be \"hover\", \"steps\", \"stick_sign\" or \"rc_loss\"".to_string()),
+        "takeoff_land" => &["arm_bound_s", "r_stance_m", "stance_floor_weight", "max_stance_ratio", "liftoff_window_s",
+            "max_liftoff_tilt_deg", "height_band_m", "max_tilt_deg", "max_speed_h_ms", "max_nav_gap_deg",
+            "max_td_vz_ms", "max_td_vh_ms", "max_td_tilt_deg", "max_td_rate_dps", "idle_after_s", "stop_bound_s",
+            "hover_trim_tolerance"],
+        _ => return Err("verdict.check: must be \"hover\", \"steps\", \"stick_sign\", \"rc_loss\" or \"takeoff_land\""
+            .to_string()),
     };
     known_keys(v, "verdict", &[&["check"], keys].concat())?;
     let f = |key: &str| scalar(v, "verdict", key);
@@ -263,6 +446,30 @@ fn verdict(root: &Table) -> Result<Verdict, String> {
                 min_accel_rise_ms2: f("min_accel_rise_ms2")?,
             }
         }
+        "takeoff_land" => Verdict::TakeoffLand {
+            airborne_m: root
+                .get("pilot")
+                .and_then(Value::as_table)
+                .ok_or("verdict.check: \"takeoff_land\" needs [pilot] (airborne_m is the lift-off height)".to_string())
+                .and_then(|p| scalar(p, "pilot", "airborne_m"))?,
+            arm_bound_s: f("arm_bound_s")?,
+            r_stance_m: f("r_stance_m")?,
+            stance_floor_weight: f("stance_floor_weight")?,
+            max_stance_ratio: f("max_stance_ratio")?,
+            liftoff_window_s: f("liftoff_window_s")?,
+            max_liftoff_tilt_deg: f("max_liftoff_tilt_deg")?,
+            height_band_m: f("height_band_m")?,
+            max_tilt_deg: f("max_tilt_deg")?,
+            max_speed_h_ms: f("max_speed_h_ms")?,
+            max_nav_gap_deg: f("max_nav_gap_deg")?,
+            max_td_vz_ms: f("max_td_vz_ms")?,
+            max_td_vh_ms: f("max_td_vh_ms")?,
+            max_td_tilt_deg: f("max_td_tilt_deg")?,
+            max_td_rate_dps: f("max_td_rate_dps")?,
+            idle_after_s: f("idle_after_s")?,
+            stop_bound_s: f("stop_bound_s")?,
+            hover_trim_tolerance: f("hover_trim_tolerance")?,
+        },
         _ => Verdict::RcLoss {
             on_high_s: f("on_high_s")?,
             low_s: f("low_s")?,
@@ -329,16 +536,26 @@ impl Scenario {
     pub fn parse(text: &str) -> Result<Scenario, String> {
         let root: Table = text.parse().map_err(|e: toml::de::Error| format!("toml: {}", e.to_string().trim_end()))?;
         for key in root.keys() {
-            if !["scenario", "initial", "rc", "disturbance", "verdict"].contains(&key.as_str()) {
+            if !["scenario", "initial", "pilot", "rc", "disturbance", "verdict"].contains(&key.as_str()) {
                 return Err(format!("{key}: unknown table"));
             }
         }
         let s = table(&root, "scenario", &["name", "duration_s"])?;
-        let i = table(
-            &root,
-            "initial",
-            &["position_ned_m", "velocity_ned_ms", "roll_pitch_yaw_deg", "rates_rads", "rotors"],
-        )?;
+        let ground = match root.get("initial").and_then(Value::as_table).and_then(|i| i.get("contact")) {
+            None => false,
+            Some(Value::String(c)) if c == "air" => false,
+            Some(Value::String(c)) if c == "ground" => true,
+            Some(_) => return Err("initial.contact: must be \"air\" or \"ground\"".to_string()),
+        };
+        let i = if ground {
+            table(&root, "initial", &["contact", "ground_roll_pitch_deg", "yaw_deg", "rotors"])?
+        } else {
+            table(
+                &root,
+                "initial",
+                &["contact", "position_ned_m", "velocity_ned_ms", "roll_pitch_yaw_deg", "rates_rads", "rotors"],
+            )?
+        };
 
         let name = match get(s, "scenario", "name")? {
             Value::String(n) if !n.is_empty() && n.len() <= NAME_MAX => n.clone(),
@@ -353,7 +570,20 @@ impl Scenario {
             Value::String(r) if r == "stopped" => Rotors::Stopped,
             _ => return Err("initial.rotors: must be \"hover\" or \"stopped\"".to_string()),
         };
-        let rc = table(&root, "rc", &["script", "lost"])?;
+        let rc = table(&root, "rc", &["script", "phase", "lost"])?;
+        let (rc_script, phases, pilot) = match (rc.contains_key("script"), rc.contains_key("phase")) {
+            (true, false) => {
+                if root.contains_key("pilot") {
+                    return Err("[pilot]: only with [rc] phase".to_string());
+                }
+                (rc_script(rc)?, Vec::new(), None)
+            }
+            (false, true) => {
+                let p = pilot(table(&root, "pilot", &PILOT_KEYS)?)?;
+                (Vec::new(), rc_phases(rc)?, Some(p))
+            }
+            _ => return Err("rc: needs either script or phase, not both".to_string()),
+        };
         let mut rc_lost = Vec::new();
         for (i, row) in rows(rc, "rc", "lost", &["from_s", "to_s"])?.into_iter().enumerate() {
             let name = format!("rc.lost[{i}]");
@@ -365,15 +595,35 @@ impl Scenario {
             let to_us = if row.contains_key("to_s") { micros(row, &name, "to_s")? } else { u64::MAX };
             disturbances.push(Disturbance { from_us: micros(row, &name, "from_s")?, to_us, torque_nm: vec3(row, &name, "torque_nm")? });
         }
+        let (position_ned_m, velocity_ned_ms, attitude, rates_rads, start) = if ground {
+            let bad = || "initial.ground_roll_pitch_deg: must be two numbers".to_string();
+            let a = get(i, "initial", "ground_roll_pitch_deg")?.as_array().ok_or_else(bad)?;
+            let [r, p] = a.as_slice() else { return Err(bad()) };
+            let (r, p) = (number(r).ok_or_else(bad)?, number(p).ok_or_else(bad)?);
+            let yaw = scalar(i, "initial", "yaw_deg")?;
+            let start = Start::Ground { roll_pitch_rad: [r.to_radians(), p.to_radians()], yaw_rad: yaw.to_radians() };
+            ([0.0; 3], [0.0; 3], quat_from_euler_deg([r, p, yaw]), [0.0; 3], start)
+        } else {
+            (
+                vec3(i, "initial", "position_ned_m")?,
+                vec3(i, "initial", "velocity_ned_ms")?,
+                quat_from_euler_deg(vec3(i, "initial", "roll_pitch_yaw_deg")?),
+                vec3(i, "initial", "rates_rads")?,
+                Start::Air,
+            )
+        };
         Ok(Scenario {
             name,
             duration_s,
-            position_ned_m: vec3(i, "initial", "position_ned_m")?,
-            velocity_ned_ms: vec3(i, "initial", "velocity_ned_ms")?,
-            attitude: quat_from_euler_deg(vec3(i, "initial", "roll_pitch_yaw_deg")?),
-            rates_rads: vec3(i, "initial", "rates_rads")?,
+            position_ned_m,
+            velocity_ned_ms,
+            attitude,
+            rates_rads,
             rotors,
-            rc_script: rc_script(rc)?,
+            start,
+            rc_script,
+            phases,
+            pilot,
             rc_lost,
             disturbances,
             verdict: verdict(&root)?,

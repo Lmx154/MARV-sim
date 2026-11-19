@@ -1,8 +1,10 @@
 //! The sim's DataFlash log: the firmware's own records (header, MSG, IMU, and the flight step's NAV, SETP, DMD, MOT)
 //! through `fw_core::dflog` and `fw_flight::step::encode_step`, and the sim-only truth (TRU), rotor (ROT) and stick
-//! (RCS) records, written by hand with their FMT.
+//! (RCS) records, written by hand with their FMT; for a phase-form scenario also the ground (GND) and pilot (PIL)
+//! records.
 
 use crate::backend::Truth;
+use crate::pilot::Report;
 use fw_core::dflog::{self, HEAD1, HEAD2, RecordDef};
 use fw_flight::imu::ImuReading;
 use fw_flight::step::{StepOut, encode_step};
@@ -11,6 +13,8 @@ use std::path::Path;
 const ID_TRU: u8 = 200;
 const ID_ROT: u8 = 201;
 const ID_RCS: u8 = 202;
+const ID_GND: u8 = 203;
+const ID_PIL: u8 = 204;
 
 /// Format characters used by the sim-only records: Q is u64, H is u16, B is u8, f is f32. Same sizes as the firmware's.
 fn char_size(c: char) -> usize {
@@ -40,6 +44,18 @@ fn rot_def() -> RecordDef {
 /// The sticks as the flight step was given them: one record per RC sample time (decision-first-pair-wiring A6).
 fn rcs_def() -> RecordDef {
     sim_def(ID_RCS, "RCS", "QffffBB", "TimeUS,R,P,T,Y,Arm,Lost")
+}
+
+/// The ground contact at every flight step (phase-form scenarios only): the contact flag, the normal force N and the
+/// roll/pitch reaction torque, body x and y.
+fn gnd_def() -> RecordDef {
+    sim_def(ID_GND, "GND", "QBfff", "TimeUS,Gnd,N,TX,TY")
+}
+
+/// The sim pilot at every report (phase-form scenarios only): phase index, mode (0 zero, 1 ramp, 2 height, 3 descend),
+/// h_ref or v_ref, the throttle stick it sent, its integrator, and the drift correction in the roll and pitch sticks.
+fn pil_def() -> RecordDef {
+    sim_def(ID_PIL, "PIL", "QBBfffff", "TimeUS,Ph,Mode,Ref,Thr,I,XR,XP")
 }
 
 /// One column of a sim-only record.
@@ -90,6 +106,8 @@ pub struct Counts {
     /// Flight steps: each wrote one NAV, SETP, DMD and MOT.
     pub step: u64,
     pub rcs: u64,
+    pub gnd: u64,
+    pub pil: u64,
 }
 
 pub struct Log {
@@ -111,6 +129,16 @@ impl Log {
             bytes.extend_from_slice(&fmt[..n]);
         }
         Log { bytes, counts: Counts::default() }
+    }
+
+    /// The FMTs of GND and PIL, for a phase-form scenario only (the script-form logs stay as they were).
+    pub fn declare_phase_records(&mut self) {
+        for def in [gnd_def(), pil_def()] {
+            let mut fmt = [0u8; 128];
+            let n = dflog::fmt_record(&def, &mut fmt);
+            assert!(n > 0, "FMT does not fit its buffer");
+            self.bytes.extend_from_slice(&fmt[..n]);
+        }
     }
 
     /// Appends what a firmware encoder wrote into `buf`; 0 bytes would mean the buffer was too small.
@@ -173,6 +201,34 @@ impl Log {
         fields.extend([Field::B(u8::from(arm)), Field::B(u8::from(lost))]);
         put(&mut self.bytes, &rcs_def(), &fields);
         self.counts.rcs += 1;
+    }
+
+    pub fn ground(&mut self, truth: &Truth) {
+        let r = &truth.reaction;
+        let fields = [
+            Field::Q(truth.t_us),
+            Field::B(u8::from(truth.on_ground)),
+            Field::F(r.normal_n as f32),
+            Field::F(r.torque_xy_nm[0] as f32),
+            Field::F(r.torque_xy_nm[1] as f32),
+        ];
+        put(&mut self.bytes, &gnd_def(), &fields);
+        self.counts.gnd += 1;
+    }
+
+    pub fn pilot(&mut self, r: &Report) {
+        let fields = [
+            Field::Q(r.row.t_us),
+            Field::B(r.phase as u8),
+            Field::B(r.mode),
+            Field::F(r.reference as f32),
+            Field::F(r.row.throttle),
+            Field::F(r.integrator as f32),
+            Field::F(r.xy[0] as f32),
+            Field::F(r.xy[1] as f32),
+        ];
+        put(&mut self.bytes, &pil_def(), &fields);
+        self.counts.pil += 1;
     }
 
     /// Creates the parent folder if it is missing.

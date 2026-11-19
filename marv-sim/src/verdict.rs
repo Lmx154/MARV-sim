@@ -3,6 +3,8 @@
 //! steps (800 Hz) or ESC ticks (1 kHz) at or after `from` and before `to`. An empty window or a crossing that never
 //! happens gives NaN, and NaN fails every check.
 
+use crate::backend::{Reaction, Touchdown};
+use crate::pilot::{PhaseRun, Report};
 use crate::scenario::{Pulse, Verdict};
 
 /// One flight step as the checks see it. Quaternions are body to world `[w, x, y, z]`.
@@ -17,6 +19,16 @@ pub struct Sample {
     /// `StepOut.setpoint`: its attitude and heading rate (rad/s); identity and 0 for any other kind.
     pub sp_q: [f64; 4],
     pub sp_heading_rate: f64,
+    /// `StepOut.armed`.
+    pub armed: bool,
+    /// The allocator's saturation bits as the MOT/DMD log has them (roll 1, pitch 2, yaw 4, thrust low 8, thrust high
+    /// 16); `None` when there was no allocation (the demand was refused).
+    pub flags: Option<u8>,
+    /// Truth NED position, m, and velocity, m/s.
+    pub truth_pos: [f64; 3],
+    pub truth_vel: [f64; 3],
+    pub on_ground: bool,
+    pub reaction: Reaction,
 }
 
 /// A value read from one flight step (degrees or degrees per second).
@@ -30,6 +42,15 @@ pub struct Trace {
     pub esc: Vec<(u64, [u16; 4])>,
     /// The times of the RC samples given to the flight step.
     pub rc_us: Vec<u64>,
+    /// Phase form only: every pilot report, the phases as they ran, every touchdown (the state before its hold), the
+    /// time of every lift-off (the end of the first tick off the ground), the weight m g (N) and whether the plant
+    /// runs the card as it is (no spread point, or the nominal one).
+    pub pilot: Vec<Report>,
+    pub phases: Vec<PhaseRun>,
+    pub touchdowns: Vec<Touchdown>,
+    pub liftoffs: Vec<u64>,
+    pub weight_n: f64,
+    pub nominal: bool,
 }
 
 /// One `CHECK` line. `limit` carries its comparison, for example `<=1.5000`.
@@ -187,6 +208,10 @@ pub fn judge(verdict: &Verdict, trace: &Trace) -> (Vec<Check>, Vec<String>) {
                 at_most("stop_after_switch_off_s", off, off_bound_s),
             ];
             (checks, Vec::new())
+        }
+        Verdict::TakeoffLand { .. } => {
+            let none = Check { name: "takeoff_land".into(), measured: "not_built".into(), limit: "-".into(), pass: false };
+            (vec![none], Vec::new())
         }
     }
 }

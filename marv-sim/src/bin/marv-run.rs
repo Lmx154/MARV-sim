@@ -14,6 +14,7 @@ use fw_flight::step::{Flight, FlightInputs, StepOut};
 use fw_flight::tuning::Tuning;
 use marv_card::{Card, Env};
 use marv_sim::log::Log;
+use marv_sim::pilot::{Ending, Pilot, PilotView};
 use marv_sim::rng::Rng;
 use marv_sim::scenario::{Point, RcRow, Rotors, Scenario, Spread};
 use marv_sim::sensors::{IMU_PERIOD_US, ImuModel};
@@ -126,6 +127,12 @@ fn sample(truth: &Truth, out: &StepOut) -> Sample {
         Setpoint::Attitude { attitude, heading_rate_rads, .. } => (attitude.map(f64::from), f64::from(heading_rate_rads)),
         _ => ([1.0, 0.0, 0.0, 0.0], 0.0),
     };
+    // The same bits as the firmware's DMD record (step.rs, encode_step).
+    let flags = out.allocation.map(|a| {
+        let s = a.saturation;
+        u8::from(s.roll) | u8::from(s.pitch) << 1 | u8::from(s.yaw) << 2 | u8::from(s.thrust_low) << 3
+            | u8::from(s.thrust_high) << 4
+    });
     Sample {
         t_us: truth.t_us,
         truth_q: truth.attitude,
@@ -134,24 +141,34 @@ fn sample(truth: &Truth, out: &StepOut) -> Sample {
         nav_q: out.nav.attitude.map(f64::from),
         sp_q,
         sp_heading_rate,
+        armed: out.armed,
+        flags,
+        truth_pos: truth.position_m,
+        truth_vel: truth.velocity_ms,
+        on_ground: truth.on_ground,
+        reaction: truth.reaction,
     }
 }
 
-/// Runs `ticks` base ticks; returns how many flight steps it made and what the verdict needs.
+/// Runs at most `ticks` base ticks (with a pilot, until its phase table ends); returns how many ticks and flight steps
+/// it made and what the verdict needs.
 fn run<E: Estimator, C: Controller, A: Allocator>(
     mut flight: Flight<E, C, A>,
     world: &mut World,
     scenario: &Scenario,
+    mut pilot: Option<&mut Pilot>,
     ticks: u64,
     log: &mut Log,
-) -> (u64, Trace) {
+) -> (u64, u64, Trace) {
     // The newest StepOut's time and command, as the ESC task sees them; none yet counts as (0, Stop).
     let mut newest = (0, MotorCommand::STOP);
     let mut levels = [0u16; 4];
     let mut pending: Option<RcSample> = None;
-    let mut given = scenario.rc_script[0];
+    let none = RcRow { t_us: 0, roll: 0.0, pitch: 0.0, yaw: 0.0, throttle: 0.0, arm: false };
+    let mut given = scenario.rc_script.first().copied().unwrap_or(none);
     let mut trace = Trace::default();
     let mut flight_steps = 0;
+    let mut ran = 0;
     for k in 0..ticks {
         let now = world.backend.truth().t_us;
         if k.is_multiple_of(ESC_TICKS) {
@@ -159,10 +176,20 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             trace.esc.push((now, levels));
         }
         if k.is_multiple_of(RC_TICKS) {
+            // The script row in force, or the pilot's report from what it sees (it flies on through a lost link).
+            let row = match pilot.as_deref_mut() {
+                None => row_at(&scenario.rc_script, now),
+                Some(p) => {
+                    let Some(report) = p.report(now, PilotView::see(world.backend.truth())) else { break };
+                    log.pilot(&report);
+                    trace.pilot.push(report);
+                    report.row
+                }
+            };
             // Only the newest report reaches the next flight step, once.
             let lost = scenario.rc_lost.iter().any(|&(from, to)| now >= from && now < to);
             if !lost {
-                given = row_at(&scenario.rc_script, now);
+                given = row;
                 let sticks = Sticks { roll: given.roll, pitch: given.pitch, throttle: given.throttle, yaw: given.yaw };
                 pending = Some(RcSample { sticks, arm: given.arm, t_us: now });
                 trace.rc_us.push(now);
@@ -175,7 +202,14 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
                 wrench.torque_nm[i] += d.torque_nm[i];
             }
         }
+        let was_on_ground = world.backend.truth().on_ground;
         let truth = world.backend.step(&wrench, TICK_US).clone();
+        ran += 1;
+        if truth.on_ground && !was_on_ground {
+            trace.touchdowns.extend(world.backend.touchdown().copied());
+        } else if was_on_ground && !truth.on_ground {
+            trace.liftoffs.push(truth.t_us);
+        }
 
         if truth.t_us.is_multiple_of(IMU_PERIOD_US) {
             let s1 = world.imu1.sample(&truth);
@@ -190,10 +224,13 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             log.truth(&truth);
             log.rotors(truth.t_us, levels, world.plant.rotor_speeds());
             log.step(&out);
+            if pilot.is_some() {
+                log.ground(&truth);
+            }
             trace.steps.push(sample(&truth, &out));
         }
     }
-    (flight_steps, trace)
+    (ran, flight_steps, trace)
 }
 
 fn firmware_text() -> String {
@@ -228,7 +265,7 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
         on_ground: false,
         reaction: Reaction::default(),
     };
-    let backend = NativeBackend::new(&plant_card, initial)?;
+    let backend = NativeBackend::with_start(&plant_card, initial, scenario.start)?;
     let imu1 = ImuModel::new("imu1", &card.imu1, env, Rng::new(seed, STREAM_IMU1))?;
     let imu2 = ImuModel::new("imu2", &card.imu2, env, Rng::new(seed, STREAM_IMU2))?;
     // Wind for this step is the mean only; gusts come in step 7.
@@ -243,6 +280,14 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
     if let Some(p) = point {
         log.msg(0, &format!("point {}", p.text()));
     }
+    // The pilot's idea of the stick map comes from the card as it is, never from a spread point.
+    let mut pilot = match scenario.pilot {
+        Some(p) => Some(Pilot::new(card, env, p, scenario.phases.clone())?),
+        None => None,
+    };
+    if pilot.is_some() {
+        log.declare_phase_records();
+    }
 
     let ticks = (scenario.duration_s * 1e6 / TICK_US as f64).round() as u64;
     // The flight code with the compiled card and the default tuning, as on the board.
@@ -250,16 +295,16 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
     let tuning = Tuning::DEFAULT;
     let flight = Flight::new(Mahony::new(&tuning), CascadedPid::new(&tuning), CardAllocator::new(), &tuning, handshake);
     let mut world = World { plant, backend, imu1, imu2, wind_ned_ms: wind };
-    let (flight_steps, trace) = run(flight, &mut world, scenario, ticks, &mut log);
+    let (ran, flight_steps, mut trace) = run(flight, &mut world, scenario, pilot.as_mut(), ticks, &mut log);
     log.write(out)?;
 
     let last = world.backend.truth();
     let c = log.counts;
-    let summary = vec![
+    let mut summary = vec![
         format!("scenario      {}", scenario.name),
         format!("point         {}", point.map_or("card".to_string(), |p| p.text())),
         format!("duration      {} s", scenario.duration_s),
-        format!("ticks         {} (125 us each)", ticks),
+        format!("ticks         {} (125 us each)", ran),
         format!("flight steps  {}", flight_steps),
         format!("records       MSG {}, IMU {}, TRU {}, ROT {}, NAV/SETP/DMD/MOT {} each, RCS {}",
             c.msg, c.imu, c.tru, c.rot, c.step, c.rcs),
@@ -267,6 +312,22 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
         format!("final velocity NED {:.4?} m/s", last.velocity_ms),
         format!("log           {}", out.display()),
     ];
+    if let Some(p) = &pilot {
+        summary.push(format!("records       GND {}, PIL {}", c.gnd, c.pil));
+        summary.push(format!("pilot         full collective / m g = {:.4} (nominal card)", p.full_ratio()));
+        for (i, ph) in p.timeline().iter().enumerate() {
+            let how = match ph.end {
+                None => "not ended (duration_s reached)".to_string(),
+                Some((t, Ending::Time)) => format!("ended {:.3} s by time", t as f64 * 1e-6),
+                Some((t, Ending::Event)) => format!("ended {:.3} s by event", t as f64 * 1e-6),
+                Some((t, Ending::Timeout)) => format!("ended {:.3} s by TIMEOUT", t as f64 * 1e-6),
+            };
+            summary.push(format!("PHASE {i:>2} {:<8} start {:>7.3} s  {how}", ph.name, ph.start_us as f64 * 1e-6));
+        }
+        trace.phases = p.timeline().to_vec();
+        trace.weight_n = card.mass.mass.v.unwrap_or(f64::NAN) * env.gravity.v.unwrap_or(f64::NAN);
+        trace.nominal = point.is_none_or(|q| q.kf_scale == 1.0 && q.inertia_scale == 1.0 && q.lag_s.is_none());
+    }
     let (checks, notes) = judge(&scenario.verdict, &trace);
     Ok(Outcome { summary, checks, notes })
 }
