@@ -205,6 +205,8 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
     let mut trace = Trace::default();
     let mut flight_steps = 0;
     let mut ran = 0;
+    // Contact at any tick since the last stick report: what the pilot's eye catches between reports (Amendment B1).
+    let mut touched = false;
     for k in 0..ticks {
         let now = world.backend.truth().t_us;
         if k.is_multiple_of(ESC_TICKS) {
@@ -216,7 +218,9 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             let row = match pilot.as_deref_mut() {
                 None => row_at(&scenario.rc_script, now),
                 Some(p) => {
-                    let Some(report) = p.report(now, PilotView::see(world.backend.truth())) else { break };
+                    let view = PilotView::see(world.backend.truth(), touched);
+                    touched = false;
+                    let Some(report) = p.report(now, view) else { break };
                     log.pilot(&report);
                     trace.pilot.push(report);
                     report.row
@@ -241,6 +245,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
         let was_on_ground = world.backend.truth().on_ground;
         let truth = world.backend.step(&wrench, TICK_US).clone();
         ran += 1;
+        touched |= truth.on_ground;
         if truth.on_ground && !was_on_ground {
             trace.touchdowns.extend(world.backend.touchdown().copied());
         } else if was_on_ground && !truth.on_ground {

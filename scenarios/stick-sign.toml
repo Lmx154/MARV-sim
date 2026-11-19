@@ -28,7 +28,9 @@ script = [
   { t_s = 8.340,  roll = 0.0,  pitch = 0.0,  yaw = 0.0,  throttle = 0.5,  arm = true },
   { t_s = 9.540,  roll = 0.0,  pitch = 0.0,  yaw = -0.2, throttle = 0.5,  arm = true },   # yaw -0.2
   { t_s = 9.840,  roll = 0.0,  pitch = 0.0,  yaw = 0.0,  throttle = 0.5,  arm = true },
-  { t_s = 11.040, roll = 0.0,  pitch = 0.0,  yaw = 0.0,  throttle = 0.52, arm = true },   # throttle 0.52
+  # 0.6, not 0.52: the pilot's collective is capped at 2 x weight (first-pair rulings, Amendment C), so the stick is
+  # one straight line and 0.6 asks for 1.2 x weight (take-off decision, Amendment B5).
+  { t_s = 11.040, roll = 0.0,  pitch = 0.0,  yaw = 0.0,  throttle = 0.6,  arm = true },   # throttle 0.6
   { t_s = 11.340, roll = 0.0,  pitch = 0.0,  yaw = 0.0,  throttle = 0.5,  arm = true },
 ]
 

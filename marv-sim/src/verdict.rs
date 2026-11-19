@@ -258,19 +258,22 @@ fn count_check(name: &str, bad: Option<usize>) -> Check {
 }
 
 /// decision-sim-takeoff-landing, section 3: one check per row of its table. Lift-off is the end of the first tick off
-/// the ground (backend), touchdown the backend's (state before the hold); switch-on and switch-off are the first pilot
+/// the ground (backend); touchdown is the first backend contact after the first rise through airborne_m (Amendment B7;
+/// a contact between lift-off and that rise is a lift-off recontact); switch-on and switch-off are the first pilot
 /// reports with the switch on, then off again.
 fn takeoff_land(verdict: &Verdict, trace: &Trace) -> (Vec<Check>, Vec<String>) {
     let Verdict::TakeoffLand { airborne_m, arm_bound_s, r_stance_m, stance_floor_weight, max_stance_ratio,
-        max_light_after_td_s, liftoff_window_s, max_liftoff_tilt_deg, height_band_m, max_tilt_deg, max_speed_h_ms, max_nav_gap_deg,
-        max_td_vz_ms, max_td_vh_ms, max_td_tilt_deg, max_td_rate_dps, idle_after_s, stop_bound_s,
+        max_light_after_td_s, max_peak_height_m, max_peak_climb_ms, liftoff_window_s, max_liftoff_tilt_deg, height_band_m,
+        max_tilt_deg, max_speed_h_ms, max_nav_gap_deg, max_td_vz_ms, max_td_vh_ms, max_td_tilt_deg, max_td_rate_dps, idle_after_s, stop_bound_s,
         hover_trim_tolerance } = *verdict else { unreachable!() };
     let idle = [marv_card::IDLE_LEVEL; 4];
     let t_on = trace.pilot.iter().find(|r| r.row.arm).map(|r| r.row.t_us);
     let t_off = t_on.and_then(|on| trace.pilot.iter().find(|r| r.row.t_us > on && !r.row.arm).map(|r| r.row.t_us));
     let t_lo = trace.liftoffs.first().copied();
-    let t_td = trace.touchdowns.first().map(|d| d.t_us);
     let height = |s: &Sample| -s.truth_pos[2];
+    let rising = |w: &&[Sample]| height(&w[0]) < airborne_m && height(&w[1]) >= airborne_m;
+    let t_rise = trace.steps.windows(2).find(rising).map(|w| w[1].t_us);
+    let t_td = t_rise.and_then(|r| trace.touchdowns.iter().find(|d| d.t_us > r)).map(|d| d.t_us);
     let mut checks = Vec::new();
 
     // stop_disarmed, armed_on_ground, idle_exact.
@@ -306,9 +309,14 @@ fn takeoff_land(verdict: &Verdict, trace: &Trace) -> (Vec<Check>, Vec<String>) {
     });
     checks.push(at_most("liftoff_tilt_deg", lift_tilt, max_liftoff_tilt_deg));
 
-    // single_flight (Amendment A3(b)): one rise through airborne_m, never above airborne_m after the first
-    // touchdown; no touchdown at all fails. Backend touchdowns (hops below airborne_m included) are printed only.
-    let rises = trace.steps.windows(2).filter(|w| height(&w[0]) < airborne_m && height(&w[1]) >= airborne_m).count();
+    // liftoff_recontacts (Amendment B7): backend contacts between lift-off and the first rise through airborne_m.
+    checks.push(count_check("liftoff_recontacts", t_lo.map(|lo| {
+        trace.touchdowns.iter().filter(|d| d.t_us >= lo && t_rise.is_none_or(|r| d.t_us < r)).count()
+    })));
+
+    // single_flight (Amendment A3(b)): one rise through airborne_m, never above airborne_m after the touchdown; no
+    // touchdown at all fails. Backend touchdowns (hops below airborne_m included) are printed only.
+    let rises = trace.steps.windows(2).filter(rising).count();
     let above = t_td.map(|td| trace.steps.iter().filter(|s| s.t_us >= td && height(s) > airborne_m).count());
     checks.push(Check {
         name: "single_flight".into(),
@@ -317,7 +325,13 @@ fn takeoff_land(verdict: &Verdict, trace: &Trace) -> (Vec<Check>, Vec<String>) {
         pass: rises == 1 && above == Some(0),
     });
 
-    // light_after_td_s (Amendment A3(b)): from the first touchdown until N >= the floor for good, hops included.
+    // Climb (Amendment B4): the largest height and climb speed from lift-off to touchdown.
+    let flight: Vec<&Sample> = t_lo.map_or(Vec::new(), |lo| between(trace, lo, t_td.unwrap_or(u64::MAX)).collect());
+    let peak = |f: fn(&Sample) -> f64| if flight.is_empty() { f64::NAN } else { largest(flight.iter().map(|s| f(s))) };
+    checks.push(at_most("peak_height_m", peak(|s| -s.truth_pos[2]), max_peak_height_m));
+    checks.push(at_most("peak_climb_ms", peak(|s| -s.truth_vel[2]), max_peak_climb_ms));
+
+    // light_after_td_s (Amendment A3(b)): from the touchdown until N >= the floor for good, hops included.
     let light = t_td.map_or(f64::NAN, |td| {
         let after: Vec<&Sample> = trace.steps.iter().filter(|s| s.t_us >= td).collect();
         let last_light = after.iter().rposition(|s| !(s.on_ground && s.reaction.normal_n >= floor));
@@ -359,7 +373,7 @@ fn takeoff_land(verdict: &Verdict, trace: &Trace) -> (Vec<Check>, Vec<String>) {
         _ => None,
     }));
 
-    // Touchdown: the worst over every touchdown, the state before the hold.
+    // Touchdown: the worst over every contact (lift-off recontacts included), the state before the hold.
     let td = |f: fn(&Touchdown) -> f64| {
         if trace.touchdowns.is_empty() { f64::NAN } else { largest(trace.touchdowns.iter().map(f)) }
     };
@@ -408,6 +422,8 @@ fn takeoff_land(verdict: &Verdict, trace: &Trace) -> (Vec<Check>, Vec<String>) {
     let xy = |r: &&Report| r.xy[0].hypot(r.xy[1]);
     notes.push(format!("INFO pilot xy correction: largest {:.4}, mean {:.4} of stick (cap at 0.25 = 7.5 deg)",
         largest(held.iter().map(xy)), mean(held.iter().map(xy))));
+    notes.push(format!("INFO pilot xy integral term: largest {:.4} of stick (before the cap)",
+        largest(trace.pilot.iter().map(|r| r.xy_trim[0].hypot(r.xy_trim[1])))));
     notes.push(format!("INFO lift-off {:.4} s, touchdown {:.4} s, backend touchdowns {}",
         t_lo.map_or(f64::NAN, secs), t_td.map_or(f64::NAN, secs), trace.touchdowns.len()));
     (checks, notes)

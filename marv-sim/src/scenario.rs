@@ -63,6 +63,8 @@ pub struct PilotParams {
     pub v_dn_ms: f64,
     pub xy_k: f64,
     pub xy_stick_max: f64,
+    /// Integral gain of the drift correction, 1/s^2 (Amendment B2; provisional until the owner approves it).
+    pub xy_ki: f64,
     /// The documented stick map's top point, x m g (the flight code's cap, mirrored here; never read from it).
     pub stick_thrust_max_g: f64,
 }
@@ -176,6 +178,8 @@ pub enum Verdict {
         stance_floor_weight: f64,
         max_stance_ratio: f64,
         max_light_after_td_s: f64,
+        max_peak_height_m: f64,
+        max_peak_climb_ms: f64,
         liftoff_window_s: f64,
         max_liftoff_tilt_deg: f64,
         height_band_m: f64,
@@ -348,12 +352,13 @@ fn pilot(p: &Table) -> Result<PilotParams, String> {
         v_dn_ms: f("v_dn_ms")?,
         xy_k: f("xy_k")?,
         xy_stick_max: f("xy_stick_max")?,
+        xy_ki: f("xy_ki")?,
         stick_thrust_max_g: f("stick_thrust_max_g")?,
     })
 }
 
-const PILOT_KEYS: [&str; 13] = ["delay_s", "stick_rate_per_s", "ramp_stick_per_s", "airborne_m", "k_h", "k_v", "k_i",
-    "accel_max_g", "v_up_ms", "v_dn_ms", "xy_k", "xy_stick_max", "stick_thrust_max_g"];
+const PILOT_KEYS: [&str; 14] = ["delay_s", "stick_rate_per_s", "ramp_stick_per_s", "airborne_m", "k_h", "k_v", "k_i",
+    "accel_max_g", "v_up_ms", "v_dn_ms", "xy_k", "xy_stick_max", "xy_ki", "stick_thrust_max_g"];
 
 fn rc_phases(rc: &Table) -> Result<Vec<Phase>, String> {
     let keys = ["name", "after_s", "event", "below_m", "timeout_s", "arm", "throttle", "height_m", "descend_ms", "xy",
@@ -438,7 +443,8 @@ fn verdict(root: &Table) -> Result<Verdict, String> {
         "rc_loss" => &["on_high_s", "low_s", "arm_s", "throttle_s", "lost_at_s", "rc_fs_timeout_s", "stop_bound_s",
             "resume_s", "rearm_s", "off_s", "off_bound_s"],
         "takeoff_land" => &["arm_bound_s", "r_stance_m", "stance_floor_weight", "max_stance_ratio",
-            "max_light_after_td_s", "liftoff_window_s", "max_liftoff_tilt_deg", "height_band_m", "max_tilt_deg",
+            "max_light_after_td_s", "max_peak_height_m", "max_peak_climb_ms", "liftoff_window_s",
+            "max_liftoff_tilt_deg", "height_band_m", "max_tilt_deg",
             "max_speed_h_ms", "max_nav_gap_deg",
             "max_td_vz_ms", "max_td_vh_ms", "max_td_tilt_deg", "max_td_rate_dps", "idle_after_s", "stop_bound_s",
             "hover_trim_tolerance"],
@@ -504,6 +510,8 @@ fn verdict(root: &Table) -> Result<Verdict, String> {
             stance_floor_weight: f("stance_floor_weight")?,
             max_stance_ratio: f("max_stance_ratio")?,
             max_light_after_td_s: f("max_light_after_td_s")?,
+            max_peak_height_m: f("max_peak_height_m")?,
+            max_peak_climb_ms: f("max_peak_climb_ms")?,
             liftoff_window_s: f("liftoff_window_s")?,
             max_liftoff_tilt_deg: f("max_liftoff_tilt_deg")?,
             height_band_m: f("height_band_m")?,

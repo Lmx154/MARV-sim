@@ -27,11 +27,14 @@ pub struct PilotView {
     pub v_heading_ms: [f64; 2],
     /// Truth contact flag.
     pub on_ground: bool,
+    /// Contact at any tick since the last report, or now (decision Amendment B1: a human sees a touchdown that a
+    /// 4 ms sample of a 125 us contact would miss).
+    pub touched: bool,
 }
 
 impl PilotView {
-    /// What the pilot sees of `truth`.
-    pub fn see(truth: &Truth) -> PilotView {
+    /// What the pilot sees of `truth`; `touched_since` is whether any tick since the last report was in contact.
+    pub fn see(truth: &Truth, touched_since: bool) -> PilotView {
         let [w, x, y, z] = truth.attitude;
         let yaw = (2.0 * (w * z + x * y)).atan2(1.0 - 2.0 * (y * y + z * z));
         let [vn, ve, vd] = truth.velocity_ms;
@@ -40,6 +43,7 @@ impl PilotView {
             climb_ms: -vd,
             v_heading_ms: [vn * yaw.cos() + ve * yaw.sin(), -vn * yaw.sin() + ve * yaw.cos()],
             on_ground: truth.on_ground,
+            touched: touched_since || truth.on_ground,
         }
     }
 }
@@ -71,8 +75,10 @@ pub struct Report {
     /// h_ref (m) in height, v_ref (m/s, up) in descend, 0 otherwise.
     pub reference: f64,
     pub integrator: f64,
-    /// The drift correction in the roll and pitch sticks.
+    /// The drift correction in the roll and pitch sticks (after the cap).
     pub xy: [f64; 2],
+    /// Its integral term in the roll and pitch sticks, -xy_ki * integral of v / g / ANGLE_MAX (before the cap).
+    pub xy_trim: [f64; 2],
     /// The thrust ratio (of weight) the throttle stick stands for, by the pilot's map.
     pub ratio: f64,
 }
@@ -107,6 +113,9 @@ pub struct Pilot {
     /// Roll, pitch, throttle, yaw as last sent.
     sticks: [f64; 4],
     integrator: f64,
+    /// The drift integral: the integral of the seen velocity, right and forward, m. It runs only in xy = "hold"
+    /// phases and is kept (frozen) through the others, so the trim against a steady wind survives fwd and back.
+    xy_int: [f64; 2],
     /// The thrust ratio commanded at the first report whose delayed view shows contact = false.
     c_lift: Option<f64>,
     /// The thrust ratio the stick stood for at the ramp-to-height switch.
@@ -140,6 +149,7 @@ impl Pilot {
             arm,
             sticks: [0.0; 4],
             integrator: 0.0,
+            xy_int: [0.0; 2],
             c_lift: None,
             switch_ratio: None,
             timeline,
@@ -216,7 +226,7 @@ impl Pilot {
                 PhaseEnd::After { us } => (elapsed >= us).then_some(Ending::Time),
                 PhaseEnd::Airborne { timeout_us } => event(timeout_us, v.height_m >= self.p.airborne_m),
                 PhaseEnd::Below { below_m, timeout_us } => event(timeout_us, v.height_m < below_m),
-                PhaseEnd::Landed { timeout_us } => event(timeout_us, v.on_ground),
+                PhaseEnd::Landed { timeout_us } => event(timeout_us, v.touched),
             };
             let Some(ending) = ending else { break };
             self.timeline[self.index].end = Some((now_us, ending));
@@ -241,12 +251,21 @@ impl Pilot {
                 (reference.0, reference.1, ratio_to_stick(1.0 + a / self.gravity, self.full))
             }
         };
+        // Drift (Amendment B2): tilt_cmd = -(xy_k v + xy_ki * integral of v) / g, capped in length; the integral
+        // is frozen while the cap is reached.
+        let k = self.gravity * ANGLE_MAX_RAD;
+        let xy_trim = self.xy_int.map(|i| -self.p.xy_ki * i / k);
         let xy = if ph.xy_hold {
-            let g = self.gravity;
             let [fwd, right] = v.v_heading_ms;
-            let c = [-self.p.xy_k * right / g / ANGLE_MAX_RAD, -self.p.xy_k * fwd / g / ANGLE_MAX_RAD];
+            let c = [-self.p.xy_k * right / k + xy_trim[0], -self.p.xy_k * fwd / k + xy_trim[1]];
             let n = (c[0] * c[0] + c[1] * c[1]).sqrt();
-            if n > self.p.xy_stick_max { c.map(|x| x * self.p.xy_stick_max / n) } else { c }
+            if n > self.p.xy_stick_max {
+                c.map(|x| x * self.p.xy_stick_max / n)
+            } else {
+                self.xy_int[0] += right * dt;
+                self.xy_int[1] += fwd * dt;
+                c
+            }
         } else {
             [0.0; 2]
         };
@@ -268,6 +287,7 @@ impl Pilot {
             reference,
             integrator: self.integrator,
             xy,
+            xy_trim,
             ratio: stick_to_ratio(self.sticks[2], self.full),
         })
     }

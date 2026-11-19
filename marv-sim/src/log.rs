@@ -53,9 +53,10 @@ fn gnd_def() -> RecordDef {
 }
 
 /// The sim pilot at every report (phase-form scenarios only): phase index, mode (0 zero, 1 ramp, 2 height, 3 descend),
-/// h_ref or v_ref, the throttle stick it sent, its integrator, and the drift correction in the roll and pitch sticks.
+/// h_ref or v_ref, the throttle stick it sent, its integrator, the drift correction in the roll and pitch sticks
+/// (after the cap) and that correction's integral term (before the cap).
 fn pil_def() -> RecordDef {
-    sim_def(ID_PIL, "PIL", "QBBfffff", "TimeUS,Ph,Mode,Ref,Thr,I,XR,XP")
+    sim_def(ID_PIL, "PIL", "QBBfffffff", "TimeUS,Ph,Mode,Ref,Thr,I,XR,XP,XIR,XIP")
 }
 
 /// One column of a sim-only record.
@@ -226,6 +227,8 @@ impl Log {
             Field::F(r.integrator as f32),
             Field::F(r.xy[0] as f32),
             Field::F(r.xy[1] as f32),
+            Field::F(r.xy_trim[0] as f32),
+            Field::F(r.xy_trim[1] as f32),
         ];
         put(&mut self.bytes, &pil_def(), &fields);
         self.counts.pil += 1;

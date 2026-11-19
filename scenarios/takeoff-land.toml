@@ -24,6 +24,7 @@ v_up_ms = 0.5
 v_dn_ms = 0.5
 xy_k = 1.0                        # 1/s
 xy_stick_max = 0.25               # 7.5 deg
+xy_ki = 0.25                      # 1/s^2, drift integral (Amendment B2): PROVISIONAL until the owner approves it
 stick_thrust_max_g = 2.0          # the documented stick map's top point (flight code's cap, rulings Amendment C)
 
 [rc]                              # phases instead of a timed script; each starts when the last ends
@@ -50,6 +51,8 @@ arm_bound_s = 0.0065              # armed_on_ground: first non-Stop after switch
 r_stance_m = 0.020                # stance_margin: bottom-plate screw heads, abs(y) <= 20.0 mm
 stance_floor_weight = 0.5         # stance_margin: judged while N >= 0.5 m g
 max_stance_ratio = 1.0            # stance_margin: tau_xy / (N r_stance)
+max_peak_height_m = 2.5           # peak_height_m, lift-off to touchdown (Amendment B4): PROVISIONAL, owner to approve
+max_peak_climb_ms = 1.5           # peak_climb_ms, lift-off to touchdown (Amendment B4): PROVISIONAL, owner to approve
 max_light_after_td_s = 0.6        # light_after_td_s: first touchdown until N >= 0.5 m g for good (Amendment A3(b))
 liftoff_window_s = 1.0            # liftoff_tilt: over [lift-off, + 1 s]
 max_liftoff_tilt_deg = 6.0        # liftoff_tilt: the hover disturbance peak

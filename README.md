@@ -90,8 +90,8 @@ The four scenarios (all start level in the air with the rotors at hover speed; s
   peak tilt under the disturbance and the settled tilt.
 - `steps.toml`: roll, pitch (15 deg) and yaw (75 deg/s) steps and returns; 10-90 % rise time and overshoot, roll and
   pitch on the estimate, yaw on truth body rate; the truth-versus-estimate gap is printed, not judged.
-- `stick-sign.toml`: short roll, pitch, yaw and throttle pulses; truth must move the conventions-7b way, with little
-  movement on the other axes.
+- `stick-sign.toml`: short roll, pitch, yaw and throttle pulses (throttle 0.6: 1.2 x weight under the flight code's
+  2 x weight cap); truth must move the conventions-7b way, with little movement on the other axes.
 - `rc-loss.toml`: arming rules, the RC-loss Stop within 2.5 ms of the 1.0 s timeout, no re-arm without a switch
   cycle, switch-off Stop; judged at the levels the plant is given.
 - `takeoff-land.toml`: starts on the ground, motors stopped; phases instead of a script (below).
@@ -100,7 +100,7 @@ The four scenarios (all start level in the air with the rotors at hover speed; s
 
 Instead of `script`, `[rc] phase = [...]` (a file has one or the other) with a `[pilot]` table. Each phase starts when
 the previous one ends: after `after_s`, or at an `event` (`airborne`: height >= `[pilot] airborne_m`; `below`: height
-< `below_m`; `landed`: the contact flag) with a `timeout_s`; a timeout is recorded and the next phase starts. The run
+< `below_m`; `landed`: contact at any tick since the previous report, so the first touchdown) with a `timeout_s`; a timeout is recorded and the next phase starts. The run
 ends with the last phase (`duration_s` is an upper bound). `arm` is the switch (kept from the previous phase if not
 given); `throttle = "zero" | "ramp"`, or `height_m`, or `descend_ms`; `roll`, `pitch`, `yaw` are scripted sticks;
 `xy = "hold"` turns on the drift correction (not with roll or pitch). The runner prints each phase's start and how it
@@ -108,7 +108,8 @@ ended.
 
 The pilot (`pilot.rs`) is a test device in the harness, NOT flight code: the flight code has no height hold, so the
 harness flies the throttle as a human would by eye. It is given only a `PilotView` (truth height, vertical speed,
-horizontal velocity in the heading frame, contact flag) delayed by `delay_s`, and makes one stick report per 4 ms
+horizontal velocity in the heading frame, contact flag, and contact at any tick since the last report) delayed by
+`delay_s`, and makes one stick report per 4 ms
 through the RC path. It never sees the estimate, the allocator flags, the spread point or the level-to-speed map, and
 never arms or disarms. Throttle: "zero" moves the stick to 0; "ramp" raises the throttle STICK from 0 at
 `ramp_stick_per_s`; "height" and "descend" set `v_ref = clamp(k_h (h_ref - h), -v_dn, v_up)` or `-descend_ms`, then
@@ -118,17 +119,22 @@ the pilot was commanding at the first report whose delayed view shows contact = 
 smoothing (decision Amendment A1). The ratio becomes a stick by the inverse of the documented map 0 -> 0, 0.5 -> m g,
 1 -> min(`stick_thrust_max_g`, 4 k_F w_max^2 / m g) x m g, computed from the nominal card (2.0: one straight line, as
 the flight code's cap `pilot_thrust_max_g`; another value gives the two-slope map). Drift:
-roll and pitch sticks `-xy_k v_h / g / ANGLE_MAX` (30 deg), at most `xy_stick_max` in length. Every stick moves at most
+roll and pitch sticks `-(xy_k v_h + xy_ki * integral of v_h) / g / ANGLE_MAX` (30 deg), at most `xy_stick_max` in
+length; the integral runs only in xy = "hold" phases, is kept through the others and is frozen while the cap is
+reached (Amendment B2; `xy_ki` provisional). Every stick moves at most
 `stick_rate_per_s` and stays in its range.
 
 `check = "takeoff_land"` judges the table of the decision's section 3: Stop before switch-on, armed within 6.5 ms, idle
 level exactly through "idle", the stance margin `tau_xy / (N r_stance)` while armed in contact with N above the floor,
-the tilt for 1 s after lift-off (first tick off the ground), a single flight (one rise through `airborne_m`, never
-above it after the first touchdown; backend touchdowns, hops below `airborne_m` included, are printed), the time from
-the first touchdown until N >= 0.5 m g for good (`light_after_td_s`), no timeout, the height band, the
+the tilt for 1 s after lift-off (first tick off the ground), no contact between lift-off and the first rise through
+`airborne_m` (`liftoff_recontacts`), a single flight (one rise, never above `airborne_m` after the touchdown; backend
+touchdowns, hops below `airborne_m` included, are printed), the peak height and climb speed from lift-off to touchdown
+(provisional limits), the time from the touchdown until N >= 0.5 m g for good (`light_after_td_s`), no timeout, the height band, the
 largest tilt in the air, horizontal speed, the angle between estimated and true down, no allocator flag from lift-off
-to touchdown, the touchdown state before the hold (vertical and horizontal speed, tilt, rate), idle level after the
-throttle is cut, Stop after switch-off, and (nominal card only) the pilot's mean thrust ratio in hover. The pilot's
+to touchdown, the touchdown state before the hold (vertical and horizontal speed, tilt, rate; the worst over every
+contact), idle level after the
+throttle is cut, Stop after switch-off, and (nominal card only) the pilot's mean thrust ratio in hover. Touchdown is
+the first contact after the first rise through `airborne_m` (Amendment B7). The pilot's
 drift correction is printed.
 
 ## The parameter spread and the run matrix
@@ -188,7 +194,7 @@ position, velocity, attitude quaternion, body rates), `ROT` (the levels the plan
 DShot line) and `RCS` (at every report time: the sticks, the switch, and `Lost` = 1 inside a lost interval). A
 phase-form scenario adds `GND` (every flight step: contact flag, normal force N, roll/pitch reaction torque) and `PIL`
 (every report: phase index, mode 0 zero / 1 ramp / 2 height / 3 descend, h_ref or v_ref, throttle stick, integrator,
-drift correction in roll and pitch); the script-form logs are unchanged.
+drift correction in roll and pitch after the cap, and its integral term before the cap); the script-form logs are unchanged.
 
 ## Check the plant
 
