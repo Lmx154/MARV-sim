@@ -110,17 +110,22 @@ The pilot (`pilot.rs`) is a test device in the harness, NOT flight code: the fli
 harness flies the throttle as a human would by eye. It is given only a `PilotView` (truth height, vertical speed,
 horizontal velocity in the heading frame, contact flag) delayed by `delay_s`, and makes one stick report per 4 ms
 through the RC path. It never sees the estimate, the allocator flags, the spread point or the level-to-speed map, and
-never arms or disarms. Throttle: "zero" moves the stick to 0; "ramp" raises the thrust ratio from 0 at
-`ramp_ratio_per_s`; "height" and "descend" set `v_ref = clamp(k_h (h_ref - h), -v_dn, v_up)` or `-descend_ms`, then
+never arms or disarms. Throttle: "zero" moves the stick to 0; "ramp" raises the throttle STICK from 0 at
+`ramp_stick_per_s`; "height" and "descend" set `v_ref = clamp(k_h (h_ref - h), -v_dn, v_up)` or `-descend_ms`, then
 the thrust ratio `1 + (clamp(k_v (v_ref - v), +/-accel_max_g g) + I) / g` with `I' = k_i (v_ref - v)`, frozen while
-the stick is at 0 or 1, and set at the ramp-to-height switch so the stick does not jump. The ratio becomes a stick by
-the inverse of the documented two-slope map (0.5 = m g, 1 = full collective), computed from the nominal card. Drift:
+the stick is at 0 or 1. At the ramp-to-height switch `I = g (c_lift - 1)` within +/-0.5 g, where `c_lift` is the ratio
+the pilot was commanding at the first report whose delayed view shows contact = false; the stick rate limit does the
+smoothing (decision Amendment A1). The ratio becomes a stick by the inverse of the documented map 0 -> 0, 0.5 -> m g,
+1 -> min(`stick_thrust_max_g`, 4 k_F w_max^2 / m g) x m g, computed from the nominal card (2.0: one straight line, as
+the flight code's cap `pilot_thrust_max_g`; another value gives the two-slope map). Drift:
 roll and pitch sticks `-xy_k v_h / g / ANGLE_MAX` (30 deg), at most `xy_stick_max` in length. Every stick moves at most
 `stick_rate_per_s` and stays in its range.
 
 `check = "takeoff_land"` judges the table of the decision's section 3: Stop before switch-on, armed within 6.5 ms, idle
 level exactly through "idle", the stance margin `tau_xy / (N r_stance)` while armed in contact with N above the floor,
-the tilt for 1 s after lift-off (first tick off the ground), a single flight, no timeout, the height band, the
+the tilt for 1 s after lift-off (first tick off the ground), a single flight (one rise through `airborne_m`, never
+above it after the first touchdown; backend touchdowns, hops below `airborne_m` included, are printed), the time from
+the first touchdown until N >= 0.5 m g for good (`light_after_td_s`), no timeout, the height band, the
 largest tilt in the air, horizontal speed, the angle between estimated and true down, no allocator flag from lift-off
 to touchdown, the touchdown state before the hold (vertical and horizontal speed, tilt, rate), idle level after the
 throttle is cut, Stop after switch-off, and (nominal card only) the pilot's mean thrust ratio in hover. The pilot's

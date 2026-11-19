@@ -412,6 +412,12 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
     if let Some(p) = &pilot {
         summary.push(format!("records       GND {}, PIL {}", c.gnd, c.pil));
         summary.push(format!("pilot         full collective / m g = {:.4} (nominal card)", p.full_ratio()));
+        let (c_lift, at_switch) = p.lift_ratios();
+        summary.push(format!(
+            "pilot         thrust ratio at lift-off seen (c_lift) {:.4}, at the ramp-to-height switch {:.4}",
+            c_lift.unwrap_or(f64::NAN),
+            at_switch.unwrap_or(f64::NAN)
+        ));
         for (i, ph) in p.timeline().iter().enumerate() {
             let how = match ph.end {
                 None => "not ended (duration_s reached)".to_string(),

@@ -77,8 +77,11 @@ pub struct Report {
     pub ratio: f64,
 }
 
+/// The bound on I at the ramp-to-height switch: |I| <= 0.5 g (decision Amendment A1).
+const SWITCH_I_MAX_G: f64 = 0.5;
+
 /// Thrust ratio c (of m g) to throttle stick: the documented two-slope map 0 -> 0, 0.5 -> m g, 1 -> full, inverted.
-/// `full` is the full collective over m g.
+/// `full` is the full collective over m g (2.0 with the flight code's cap: one straight line).
 pub fn ratio_to_stick(c: f64, full: f64) -> f64 {
     if c <= 1.0 { c / 2.0 } else { 0.5 + (c - 1.0) / (2.0 * (full - 1.0)) }
 }
@@ -92,7 +95,8 @@ pub struct Pilot {
     p: PilotParams,
     phases: Vec<Phase>,
     gravity: f64,
-    /// Full collective over m g, from the nominal card: 4 k_F w_max^2 / (m g).
+    /// Full collective over m g, the documented map's top point from the nominal card:
+    /// min(stick_thrust_max_g, 4 k_F w_max^2 / (m g)).
     full: f64,
     delay_reports: usize,
     /// What the pilot saw, newest at the back; the front is what it acts on now.
@@ -103,6 +107,10 @@ pub struct Pilot {
     /// Roll, pitch, throttle, yaw as last sent.
     sticks: [f64; 4],
     integrator: f64,
+    /// The thrust ratio commanded at the first report whose delayed view shows contact = false.
+    c_lift: Option<f64>,
+    /// The thrust ratio the stick stood for at the ramp-to-height switch.
+    switch_ratio: Option<f64>,
     timeline: Vec<PhaseRun>,
 }
 
@@ -113,7 +121,10 @@ impl Pilot {
         let g = env.gravity.v.ok_or("gravity.g is \"ask\"")?;
         let k = card.propulsion.thrust_coefficient.v.ok_or("propulsion.thrust_coefficient is \"ask\"")?;
         let w_max = card.propulsion.max_rotor_speed.v.ok_or("propulsion.max_rotor_speed is \"ask\"")?;
-        let full = 4.0 * k * w_max * w_max / (mass * g);
+        let full = p.stick_thrust_max_g.min(4.0 * k * w_max * w_max / (mass * g));
+        if full <= 1.0 {
+            return Err(format!("pilot: the stick's full collective {full} x m g must be above m g"));
+        }
         let first = phases.first().ok_or("pilot: no phases")?;
         let timeline = vec![PhaseRun { name: first.name.clone(), start_us: 0, end: None }];
         let arm = first.arm.unwrap_or(false);
@@ -129,6 +140,8 @@ impl Pilot {
             arm,
             sticks: [0.0; 4],
             integrator: 0.0,
+            c_lift: None,
+            switch_ratio: None,
             timeline,
         })
     }
@@ -136,6 +149,11 @@ impl Pilot {
     /// Full collective over m g, as the pilot believes it.
     pub fn full_ratio(&self) -> f64 {
         self.full
+    }
+
+    /// c_lift and the thrust ratio at the ramp-to-height switch, once they happened.
+    pub fn lift_ratios(&self) -> (Option<f64>, Option<f64>) {
+        (self.c_lift, self.switch_ratio)
     }
 
     pub fn timeline(&self) -> &[PhaseRun] {
@@ -155,7 +173,9 @@ impl Pilot {
         self.p.accel_max_g * self.gravity
     }
 
-    /// Starts phase `i` at `now_us`. From "ramp" into a closed-loop phase, I is set so the stick does not jump.
+    /// Starts phase `i` at `now_us`. From "ramp" into a closed-loop phase, I = g (c_lift - 1), within +/-0.5 g: the
+    /// pilot goes back to where it came off the ground, and the stick rate limit does the smoothing (Amendment A1).
+    /// Before any lift-off is seen, c_lift is the ratio the stick stands for now.
     fn enter(&mut self, i: usize, now_us: u64) {
         let was = self.phases[self.index].throttle;
         self.index = i;
@@ -164,10 +184,11 @@ impl Pilot {
         self.timeline.push(PhaseRun { name: ph.name.clone(), start_us: now_us, end: None });
         self.arm = ph.arm.unwrap_or(self.arm);
         if was == Throttle::Ramp && matches!(ph.throttle, Throttle::Height(_) | Throttle::Descend(_)) {
-            let v = self.seen[0];
-            let e = self.v_ref(ph.throttle, &v) - v.climb_ms;
-            let held = stick_to_ratio(self.sticks[2], self.full);
-            self.integrator = (held - 1.0) * self.gravity - (self.p.k_v * e).clamp(-self.accel_max(), self.accel_max());
+            let now = stick_to_ratio(self.sticks[2], self.full);
+            self.switch_ratio = Some(now);
+            let c_lift = self.c_lift.unwrap_or(now);
+            let bound = SWITCH_I_MAX_G * self.gravity;
+            self.integrator = (self.gravity * (c_lift - 1.0)).clamp(-bound, bound);
         }
     }
 
@@ -207,7 +228,7 @@ impl Pilot {
         let elapsed_s = (now_us - self.start_us) as f64 * 1e-6;
         let (mode, reference, target) = match ph.throttle {
             Throttle::Zero => (0, 0.0, 0.0),
-            Throttle::Ramp => (1, 0.0, ratio_to_stick(self.p.ramp_ratio_per_s * elapsed_s, self.full)),
+            Throttle::Ramp => (1, 0.0, self.p.ramp_stick_per_s * elapsed_s),
             Throttle::Height(_) | Throttle::Descend(_) => {
                 let v_ref = self.v_ref(ph.throttle, &v);
                 let e = v_ref - v.climb_ms;
@@ -235,6 +256,9 @@ impl Pilot {
         for (i, t) in targets.into_iter().enumerate() {
             let lo = if i == 2 { 0.0 } else { -1.0 };
             self.sticks[i] = (self.sticks[i] + (t - self.sticks[i]).clamp(-step, step)).clamp(lo, 1.0);
+        }
+        if self.c_lift.is_none() && !v.on_ground {
+            self.c_lift = Some(stick_to_ratio(self.sticks[2], self.full));
         }
         let [roll, pitch, throttle, yaw] = self.sticks.map(|x| x as f32);
         Some(Report {

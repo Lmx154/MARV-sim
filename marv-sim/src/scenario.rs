@@ -53,7 +53,7 @@ pub struct RcRow {
 pub struct PilotParams {
     pub delay_s: f64,
     pub stick_rate_per_s: f64,
-    pub ramp_ratio_per_s: f64,
+    pub ramp_stick_per_s: f64,
     pub airborne_m: f64,
     pub k_h: f64,
     pub k_v: f64,
@@ -63,6 +63,8 @@ pub struct PilotParams {
     pub v_dn_ms: f64,
     pub xy_k: f64,
     pub xy_stick_max: f64,
+    /// The documented stick map's top point, x m g (the flight code's cap, mirrored here; never read from it).
+    pub stick_thrust_max_g: f64,
 }
 
 /// How a phase ends. An event is seen through the pilot's delay; `timeout_us` ends the phase as a timeout.
@@ -82,7 +84,7 @@ pub enum PhaseEnd {
 pub enum Throttle {
     /// Stick to 0 at the rate limit.
     Zero,
-    /// Thrust ratio up from 0 at `ramp_ratio_per_s`.
+    /// Throttle stick up from 0 at `ramp_stick_per_s`.
     Ramp,
     /// Hold this height, m.
     Height(f64),
@@ -173,6 +175,7 @@ pub enum Verdict {
         r_stance_m: f64,
         stance_floor_weight: f64,
         max_stance_ratio: f64,
+        max_light_after_td_s: f64,
         liftoff_window_s: f64,
         max_liftoff_tilt_deg: f64,
         height_band_m: f64,
@@ -335,7 +338,7 @@ fn pilot(p: &Table) -> Result<PilotParams, String> {
     Ok(PilotParams {
         delay_s: f("delay_s")?,
         stick_rate_per_s: f("stick_rate_per_s")?,
-        ramp_ratio_per_s: f("ramp_ratio_per_s")?,
+        ramp_stick_per_s: f("ramp_stick_per_s")?,
         airborne_m: f("airborne_m")?,
         k_h: f("k_h")?,
         k_v: f("k_v")?,
@@ -345,11 +348,12 @@ fn pilot(p: &Table) -> Result<PilotParams, String> {
         v_dn_ms: f("v_dn_ms")?,
         xy_k: f("xy_k")?,
         xy_stick_max: f("xy_stick_max")?,
+        stick_thrust_max_g: f("stick_thrust_max_g")?,
     })
 }
 
-const PILOT_KEYS: [&str; 12] = ["delay_s", "stick_rate_per_s", "ramp_ratio_per_s", "airborne_m", "k_h", "k_v", "k_i",
-    "accel_max_g", "v_up_ms", "v_dn_ms", "xy_k", "xy_stick_max"];
+const PILOT_KEYS: [&str; 13] = ["delay_s", "stick_rate_per_s", "ramp_stick_per_s", "airborne_m", "k_h", "k_v", "k_i",
+    "accel_max_g", "v_up_ms", "v_dn_ms", "xy_k", "xy_stick_max", "stick_thrust_max_g"];
 
 fn rc_phases(rc: &Table) -> Result<Vec<Phase>, String> {
     let keys = ["name", "after_s", "event", "below_m", "timeout_s", "arm", "throttle", "height_m", "descend_ms", "xy",
@@ -433,8 +437,9 @@ fn verdict(root: &Table) -> Result<Verdict, String> {
             "min_accel_rise_ms2"],
         "rc_loss" => &["on_high_s", "low_s", "arm_s", "throttle_s", "lost_at_s", "rc_fs_timeout_s", "stop_bound_s",
             "resume_s", "rearm_s", "off_s", "off_bound_s"],
-        "takeoff_land" => &["arm_bound_s", "r_stance_m", "stance_floor_weight", "max_stance_ratio", "liftoff_window_s",
-            "max_liftoff_tilt_deg", "height_band_m", "max_tilt_deg", "max_speed_h_ms", "max_nav_gap_deg",
+        "takeoff_land" => &["arm_bound_s", "r_stance_m", "stance_floor_weight", "max_stance_ratio",
+            "max_light_after_td_s", "liftoff_window_s", "max_liftoff_tilt_deg", "height_band_m", "max_tilt_deg",
+            "max_speed_h_ms", "max_nav_gap_deg",
             "max_td_vz_ms", "max_td_vh_ms", "max_td_tilt_deg", "max_td_rate_dps", "idle_after_s", "stop_bound_s",
             "hover_trim_tolerance"],
         _ => return Err("verdict.check: must be \"hover\", \"steps\", \"stick_sign\", \"rc_loss\" or \"takeoff_land\""
@@ -498,6 +503,7 @@ fn verdict(root: &Table) -> Result<Verdict, String> {
             r_stance_m: f("r_stance_m")?,
             stance_floor_weight: f("stance_floor_weight")?,
             max_stance_ratio: f("max_stance_ratio")?,
+            max_light_after_td_s: f("max_light_after_td_s")?,
             liftoff_window_s: f("liftoff_window_s")?,
             max_liftoff_tilt_deg: f("max_liftoff_tilt_deg")?,
             height_band_m: f("height_band_m")?,
