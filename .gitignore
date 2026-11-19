@@ -1,0 +1,5 @@
+/target/
+# The owner's real home location: never committed (decision-sim-card-20261119, section 10)
+/env/home.local.toml
+# Sim logs: a run with the home override carries GNSS coordinates
+/logs/

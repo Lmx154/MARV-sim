@@ -1,0 +1,29 @@
+# MARV sim environment. Schema and rules: MARV-V2-drivers/_plan/decision-sim-card-20261119.md, section 10.
+# The origin here is a public reference point, never home. The real home goes in env/home.local.toml (git-ignored).
+
+[env]
+name = "default"
+schema = 1
+home_override = "env/home.local.toml"
+
+[gravity]
+g = { v = 9.80665, unit = "m/s^2", tag = "datasheet", src = "standard gravity (CGPM 1901, defined)" }
+
+# ISA troposphere: the barometer sees pressure and temperature at the origin altitude minus down.
+[atmosphere]
+sea_level_pressure = { v = 101325.0, unit = "Pa", tag = "datasheet", src = "ISA, ISO 2533" }
+sea_level_temperature = { v = 288.15, unit = "K", tag = "datasheet", src = "ISA, ISO 2533" }
+lapse_rate = { v = 0.0065, unit = "K/m", tag = "datasheet", src = "ISA, ISO 2533" }
+
+[origin]
+latitude = { v = "ask", unit = "deg", tag = "placeholder", range = "ask", src = "none: a public point the owner names" }
+longitude = { v = "ask", unit = "deg", tag = "placeholder", range = "ask", src = "none: a public point the owner names" }
+altitude = { v = "ask", unit = "m", tag = "placeholder", range = "ask", src = "none: above mean sea level, same point" }
+
+[magnetic_field]
+ned = { v = "ask", unit = "uT", tag = "placeholder", range = "ask", src = "none: a field model at [origin], once the owner names the point" }
+
+# The wind scenario sets its own.
+[wind]
+mean_ned = { v = [0.0, 0.0, 0.0], unit = "m/s", tag = "placeholder", range = "ask", src = "none; owner 2026-11-19 took the recommendation: zero" }
+gust_sd = { v = 0.0, unit = "m/s", tag = "placeholder", range = "ask", src = "none; owner 2026-11-19 took the recommendation: zero" }
