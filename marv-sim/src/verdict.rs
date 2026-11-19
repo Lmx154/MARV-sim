@@ -84,10 +84,21 @@ fn window(trace: &Trace, from_s: f64, to_s: f64) -> impl Iterator<Item = &Sample
     trace.steps.iter().filter(move |s| s.t_us >= from && s.t_us < to)
 }
 
-/// The largest value; NaN when there is none.
+/// The largest value; NaN when there is none, and NaN when any value is NaN, so that one bad sample fails the check
+/// instead of being skipped.
 fn largest(values: impl Iterator<Item = f64>) -> f64 {
-    values.fold(f64::NAN, f64::max)
+    let mut out = f64::NAN;
+    for v in values {
+        if v.is_nan() {
+            return f64::NAN;
+        }
+        out = if out.is_nan() { v } else { out.max(v) };
+    }
+    out
 }
+
+/// How far a commanded step may differ from the size the scenario expects, deg or deg/s: float rounding only.
+const SETPOINT_TOLERANCE: f64 = 0.01;
 
 fn mean(values: impl Iterator<Item = f64>) -> f64 {
     let (sum, n) = values.fold((0.0, 0), |(s, n), v| (s + v, n + 1));
@@ -116,19 +127,25 @@ pub fn judge(verdict: &Verdict, trace: &Trace) -> (Vec<Check>, Vec<String>) {
             ];
             (checks, Vec::new())
         }
-        Verdict::Steps { roll_at_s, pitch_at_s, yaw_at_s, hold_s, max_rise_s, max_overshoot_rp_pct,
-            max_overshoot_yaw_pct } => {
+        Verdict::Steps { roll_at_s, pitch_at_s, yaw_at_s, hold_s, step_angle_deg, step_yaw_rate_dps, max_rise_s,
+            max_overshoot_rp_pct, max_overshoot_yaw_pct } => {
             let mut checks = Vec::new();
-            // (axis, step instant, signal, target, overshoot limit)
-            let axes: [(&str, f64, Signal, Signal, f64); 3] = [
-                ("roll", roll_at_s, |s| euler_deg(s.nav_q)[0], |s| euler_deg(s.sp_q)[0], max_overshoot_rp_pct),
-                ("pitch", pitch_at_s, |s| euler_deg(s.nav_q)[1], |s| euler_deg(s.sp_q)[1], max_overshoot_rp_pct),
+            // (axis, step instant, signal, target, expected step size, overshoot limit)
+            let axes: [(&str, f64, Signal, Signal, f64, f64); 3] = [
+                ("roll", roll_at_s, |s| euler_deg(s.nav_q)[0], |s| euler_deg(s.sp_q)[0], step_angle_deg,
+                    max_overshoot_rp_pct),
+                ("pitch", pitch_at_s, |s| euler_deg(s.nav_q)[1], |s| euler_deg(s.sp_q)[1], step_angle_deg,
+                    max_overshoot_rp_pct),
                 ("yaw", yaw_at_s, |s| s.truth_rates[2].to_degrees(), |s| s.sp_heading_rate.to_degrees(),
-                    max_overshoot_yaw_pct),
+                    step_yaw_rate_dps, max_overshoot_yaw_pct),
             ];
-            for (axis, at_s, signal, target, max_overshoot) in axes {
+            for (axis, at_s, signal, target, size, max_overshoot) in axes {
                 for (part, start) in [("step", at_s), ("return", at_s + hold_s)] {
-                    let (rise, overshoot) = step_response(trace, start, hold_s, signal, target);
+                    let (rise, overshoot, amplitude) = step_response(trace, start, hold_s, signal, target);
+                    // The flight code's own setpoint must be the step the scenario asked for: a wrong stick scale
+                    // would otherwise be followed faithfully and pass.
+                    checks.push(at_most(&format!("{axis}_{part}_size_error"), (amplitude.abs() - size).abs(),
+                        SETPOINT_TOLERANCE));
                     checks.push(at_most(&format!("{axis}_{part}_rise_s"), rise, max_rise_s));
                     checks.push(at_most(&format!("{axis}_{part}_overshoot_pct"), overshoot, max_overshoot));
                 }
@@ -181,16 +198,17 @@ fn heading_change(trace: &Trace, from_s: f64) -> f64 {
     largest(window(trace, from_s, f64::INFINITY).map(|s| wrap_deg(euler_deg(s.truth_q)[2] - y0).abs()))
 }
 
-/// Rise time (s) and overshoot (%) of one step of `signal` toward `target`, over the hold window `[at, at + hold)`.
+/// Rise time (s), overshoot (%) and the commanded amplitude of one step of `signal` toward `target`, over the hold
+/// window `[at, at + hold)`.
 /// Amplitude: the target at the window's last step minus the target at the last step before `at`.
 /// Rise time: the time between the first crossing of 10 % and the first crossing of 90 % of the amplitude (measured
 /// from the target before the step), both searched from the step instant.
 /// Overshoot: the largest excursion of `signal` beyond the target (in the step's direction) within the window, as a
 /// percentage of the amplitude; 0 if it never passes the target.
-fn step_response(trace: &Trace, at_s: f64, hold_s: f64, signal: Signal, target: Signal) -> (f64, f64) {
+fn step_response(trace: &Trace, at_s: f64, hold_s: f64, signal: Signal, target: Signal) -> (f64, f64, f64) {
     let before = trace.steps.iter().rfind(|s| s.t_us < us(at_s));
     let held: Vec<&Sample> = window(trace, at_s, at_s + hold_s).collect();
-    let (Some(before), Some(last)) = (before, held.last()) else { return (f64::NAN, f64::NAN) };
+    let (Some(before), Some(last)) = (before, held.last()) else { return (f64::NAN, f64::NAN, f64::NAN) };
     let (base, goal) = (target(before), target(last));
     let amplitude = goal - base;
     let dir = amplitude.signum();
@@ -199,8 +217,10 @@ fn step_response(trace: &Trace, at_s: f64, hold_s: f64, signal: Signal, target: 
         held.iter().find(|s| (signal(s) - level) * dir >= 0.0).map_or(f64::NAN, |s| secs(s.t_us))
     };
     let rise = crossing(0.9) - crossing(0.1);
-    let beyond = largest(held.iter().map(|s| (signal(s) - goal) * dir)).max(0.0);
-    (rise, 100.0 * beyond / amplitude.abs())
+    // `f64::max` would turn a NaN into 0 here, so the NaN case is kept apart.
+    let beyond = largest(held.iter().map(|s| (signal(s) - goal) * dir));
+    let overshoot = if beyond.is_nan() { f64::NAN } else { 100.0 * beyond.max(0.0) / amplitude.abs() };
+    (rise, overshoot, amplitude)
 }
 
 /// Stick sign: the change of truth roll, pitch and yaw from the pulse's start to its end. The primary axis must
