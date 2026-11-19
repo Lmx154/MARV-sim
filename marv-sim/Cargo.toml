@@ -1,0 +1,14 @@
+[package]
+name = "marv-sim"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+license = "MIT"
+
+[dependencies]
+marv-card = { path = "../marv-card" }
+# The firmware by path: an edit to the flight code runs in the sim at once (build.rs records which commit).
+fw-flight = { path = "../../MARV-V2-firmware/crates/fw-flight" }
+fw-core = { path = "../../MARV-V2-firmware/crates/fw-core" }
+toml = "0.9"

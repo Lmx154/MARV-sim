@@ -101,6 +101,17 @@ pub struct Propulsion {
     pub speed_at_level_min: Record<f64>,
 }
 
+/// One IMU's model numbers: position from the centre of mass (FRD, m), noise sd and bias per axis, latency.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImuProfile {
+    pub position: Record<[f64; 3]>,
+    pub gyro_noise_sd: Record<[f64; 3]>,
+    pub accel_noise_sd: Record<[f64; 3]>,
+    pub gyro_bias: Record<[f64; 3]>,
+    pub accel_bias: Record<[f64; 3]>,
+    pub latency: Record<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Card {
     pub name: String,
@@ -112,6 +123,8 @@ pub struct Card {
     pub propulsion: Propulsion,
     pub drag_body: Record<[f64; 3]>,
     pub battery_voltage: Record<f64>,
+    pub imu1: ImuProfile,
+    pub imu2: ImuProfile,
     /// Lowercase hex SHA-256 of the file bytes.
     pub sha256: String,
     open: Vec<String>,
@@ -606,6 +619,17 @@ fn parse_motor(val: Option<&Value>, name: &str, errs: &mut Vec<String>) -> Optio
     })
 }
 
+fn imu_profile(root: &Table, table: &str, errs: &mut Vec<String>) -> Option<ImuProfile> {
+    Some(ImuProfile {
+        position: rec(root, table, "position", errs)?,
+        gyro_noise_sd: rec(root, table, "gyro_noise_sd", errs)?,
+        accel_noise_sd: rec(root, table, "accel_noise_sd", errs)?,
+        gyro_bias: rec(root, table, "gyro_bias", errs)?,
+        accel_bias: rec(root, table, "accel_bias", errs)?,
+        latency: rec(root, table, "latency", errs)?,
+    })
+}
+
 fn parse_motors(root: &Table, errs: &mut Vec<String>) -> Option<Motors> {
     let Some(t) = root.get("motors").and_then(Value::as_table) else {
         errs.push("motors: missing table".into());
@@ -712,6 +736,8 @@ impl Card {
         })();
         let drag_body = rec::<[f64; 3]>(&root, "drag", "body", &mut errs);
         let battery_voltage = rec::<f64>(&root, "battery", "voltage", &mut errs);
+        let imu1 = imu_profile(&root, "imu1", &mut errs);
+        let imu2 = imu_profile(&root, "imu2", &mut errs);
 
         // Generated region (check 3) and the tables inside it. An empty region reports one
         // error; the missing tables behind it are not reported again.
@@ -776,6 +802,8 @@ impl Card {
                 propulsion: propulsion?,
                 drag_body: drag_body?,
                 battery_voltage: battery_voltage?,
+                imu1: imu1?,
+                imu2: imu2?,
                 sha256: sha256_hex(text.as_bytes()),
                 open,
             })
@@ -960,6 +988,19 @@ voltage = { v = 1.0, unit = "V", tag = "datasheet", src = "fake" }
 
 [imu1]
 position = { v = [0.0, 0.0, 0.0], unit = "m", tag = "derived", src = "fake" }
+gyro_noise_sd = { v = [1.0, 1.0, 1.0], unit = "rad/s", tag = "derived", src = "fake" }
+accel_noise_sd = { v = [1.0, 1.0, 1.0], unit = "m/s^2", tag = "derived", src = "fake" }
+gyro_bias = { v = [0.0, 0.0, 0.0], unit = "rad/s", tag = "derived", src = "fake" }
+accel_bias = { v = [0.0, 0.0, 0.0], unit = "m/s^2", tag = "derived", src = "fake" }
+latency = { v = 0.0, unit = "s", tag = "derived", src = "fake" }
+
+[imu2]
+position = { v = [0.0, 0.0, 0.0], unit = "m", tag = "derived", src = "fake" }
+gyro_noise_sd = { v = [1.0, 1.0, 1.0], unit = "rad/s", tag = "derived", src = "fake" }
+accel_noise_sd = { v = [1.0, 1.0, 1.0], unit = "m/s^2", tag = "derived", src = "fake" }
+gyro_bias = { v = [0.0, 0.0, 0.0], unit = "rad/s", tag = "derived", src = "fake" }
+accel_bias = { v = [0.0, 0.0, 0.0], unit = "m/s^2", tag = "derived", src = "fake" }
+latency = { v = 0.0, unit = "s", tag = "derived", src = "fake" }
 "#;
 
     const ENV: &str = r#"

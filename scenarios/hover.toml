@@ -1,0 +1,13 @@
+# Hover: level at the origin, rotors at hover speed, no sticks.
+# The stick script, the disturbances, the thresholds and the duration are proposed to the owner in step 5.
+# Until then the numbers below are only enough to run the sim loop.
+[scenario]
+name = "hover"
+duration_s = 10.0
+
+[initial]
+position_ned_m = [0.0, 0.0, 0.0]
+velocity_ned_ms = [0.0, 0.0, 0.0]
+roll_pitch_yaw_deg = [0.0, 0.0, 0.0]   # conventions 7c: yaw, then pitch, then roll (Z-Y-X)
+rates_rads = [0.0, 0.0, 0.0]
+rotors = "hover"                       # "hover": each at sqrt(mass * g / (4 * thrust_coefficient)); "stopped": 0
