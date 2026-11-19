@@ -16,6 +16,7 @@ pub struct Plant {
     mass: f64,
     gravity: f64,
     drag_body: Vec3,
+    drag_rotor_linear: f64,
     thrust_coefficient: f64,
     moment_coefficient: f64,
     max_rotor_speed: f64,
@@ -63,6 +64,7 @@ impl Plant {
             mass: need(&card.mass.mass, "mass.mass")?,
             gravity: need(&env.gravity, "gravity.g")?,
             drag_body: need(&card.drag_body, "drag.body")?,
+            drag_rotor_linear: need(&card.drag_rotor_linear, "drag.rotor_linear")?,
             thrust_coefficient: need(&p.thrust_coefficient, "propulsion.thrust_coefficient")?,
             moment_coefficient: need(&p.moment_coefficient, "propulsion.moment_coefficient")?,
             max_rotor_speed: need(&p.max_rotor_speed, "propulsion.max_rotor_speed")?,
@@ -115,6 +117,10 @@ impl Plant {
         );
         for k in 0..3 {
             force[k] += weight[k] - self.drag_body[k] * air[k] * air[k].abs();
+        }
+        // Linear rotor drag in body x and y only.
+        for k in 0..2 {
+            force[k] -= self.drag_rotor_linear * air[k];
         }
         Wrench { force_n: force, torque_nm: torque }
     }

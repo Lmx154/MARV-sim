@@ -18,7 +18,7 @@ use marv_sim::rng::Rng;
 use marv_sim::scenario::{Point, RcRow, Rotors, Scenario, Spread};
 use marv_sim::sensors::{IMU_PERIOD_US, ImuModel};
 use marv_sim::verdict::{Check, Sample, Trace, judge};
-use marv_sim::{Backend, NativeBackend, Plant, Truth};
+use marv_sim::{Backend, NativeBackend, Plant, Reaction, Truth};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -225,6 +225,8 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
         rates_rads: scenario.rates_rads,
         accel_ms2: [0.0; 3],
         ang_accel_rads2: [0.0; 3],
+        on_ground: false,
+        reaction: Reaction::default(),
     };
     let backend = NativeBackend::new(&plant_card, initial)?;
     let imu1 = ImuModel::new("imu1", &card.imu1, env, Rng::new(seed, STREAM_IMU1))?;

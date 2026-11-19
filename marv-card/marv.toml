@@ -56,11 +56,13 @@ level_max = { v = 2000, unit = "level", tag = "datasheet", src = "dshot Throttle
 # The lowest level the allocator sends while armed. A starting value; the thrust test (step 6) replaces it.
 idle_level = { v = 111, unit = "level", tag = "placeholder", range = [100, 201], src = "owner 2026-11-19 took the recommendation: 5.5 % of the 1..2000 range, as Betaflight motorIdle 550 and PX4 DSHOT_MIN 0.055; range up to ArduPilot MOT_SPIN_ARM 0.10 (PLAN:facts-flight-references-20261119.md section 1)" }
 # Speed command is linear in level from (level_min, speed_at_level_min) to (level_max, max_rotor_speed).
-speed_at_level_min = { v = 0.0, unit = "rad/s", tag = "placeholder", range = "ask", src = "none; owner 2026-11-19 took the recommendation: 0 with a linear map until the thrust test" }
+speed_at_level_min = { v = 0.0, unit = "rad/s", tag = "placeholder", range = [0, 129], src = "none; owner 2026-11-19 took the recommendation: 0 with a linear map until the thrust test; range upper bound: the props-off idle speed measured on the board on 2026-11-19, 2280 rpm at level 111, props add load so it bounds the props-on idle speed (decision-sim-takeoff-landing-20261119.md section 6)" }
 
 # Body drag: force_i = -c_i * va_i * |va_i|, va = air-relative velocity in body FRD.
 [drag]
 body = { v = [0.0, 0.0, 0.0], unit = "N/(m/s)^2", tag = "placeholder", range = "ask", src = "none; owner 2026-11-19 took the recommendation: term off for steps 4 and 5, a value before the wind scenario" }
+# Linear rotor drag: force_xy = -rotor_linear * va_xy in body x and y, none in z; va as above.
+rotor_linear = { v = 0.0, unit = "N/(m/s)", tag = "placeholder", range = [0.0, 0.41], src = "none; term off (owner 2026-11-19, as drag.body); range upper bound = mass 0.74872 kg x 0.544 1/s, the largest mass-normalised rotor-drag coefficient in Faessler, Franchi, Scaramuzza, IEEE RA-L 3(2) 2018, arXiv:1712.02402, measured on another quadrotor; order-of-magnitude bound only (decision-sim-takeoff-landing-20261119.md section 5)" }
 
 # Constant voltage: no internal resistance or discharge data exists.
 [battery]

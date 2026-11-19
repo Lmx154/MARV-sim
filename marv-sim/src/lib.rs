@@ -12,5 +12,5 @@ pub mod scenario;
 pub mod sensors;
 pub mod verdict;
 
-pub use backend::{Backend, NativeBackend, Truth};
+pub use backend::{Backend, NativeBackend, Reaction, Start, Touchdown, Truth};
 pub use plant::{Plant, Wrench};

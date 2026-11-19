@@ -3,7 +3,7 @@
 
 use marv_card::{Card, Env, Spin};
 use marv_sim::math::{mat_t_vec, rot_matrix};
-use marv_sim::{Backend, NativeBackend, Plant, Truth, Wrench};
+use marv_sim::{Backend, NativeBackend, Plant, Reaction, Start, Truth, Wrench};
 
 const TICK_US: u64 = 125;
 const ONE_SECOND: u64 = 1_000_000 / TICK_US;
@@ -26,6 +26,8 @@ fn at_rest() -> Truth {
         rates_rads: [0.0; 3],
         accel_ms2: [0.0; 3],
         ang_accel_rads2: [0.0; 3],
+        on_ground: false,
+        reaction: Reaction::default(),
     }
 }
 
@@ -147,4 +149,112 @@ fn yaw_torque_sign_matches_rotor_spin() {
     assert!(torque_z > 0.0 && rate_z > 0.0, "ccw faster: torque {torque_z} rate {rate_z}");
     let (torque_z, rate_z) = yaw_run(&card, &env, false);
     assert!(torque_z < 0.0 && rate_z < 0.0, "cw faster: torque {torque_z} rate {rate_z}");
+}
+
+/// The IMU model's specific force (sensors.rs): `R^T (a - g)` in the body frame.
+fn specific_force(truth: &Truth, g: f64) -> [f64; 3] {
+    let a = truth.accel_ms2;
+    mat_t_vec(&rot_matrix(truth.attitude), [a[0], a[1], a[2] - g])
+}
+
+#[test]
+fn ground_contact() {
+    let (card, env) = load();
+    let mass = card.mass.mass.v.unwrap();
+    let g = env.gravity.v.unwrap();
+    let k = card.propulsion.thrust_coefficient.v.unwrap();
+
+    // (a) At rest on the ground at idle thrust for 10 s: position and attitude do not move and the accelerometer reads
+    // gravity only (a clamp that kept the wrench's acceleration would read free fall).
+    let idle = [card.propulsion.idle_level.v.unwrap() as u16; 4];
+    let start = Start::Ground { roll_pitch_rad: [0.05, -0.03], yaw_rad: 0.5 };
+    let mut plant = Plant::new(&card, &env).unwrap();
+    let mut backend = NativeBackend::with_start(&card, at_rest(), start).unwrap();
+    let (position, attitude) = (backend.truth().position_m, backend.truth().attitude);
+    for _ in 0..10 * ONE_SECOND {
+        let wrench = plant.step(idle, backend.truth(), NO_WIND, TICK_US);
+        let truth = backend.step(&wrench, TICK_US);
+        assert!(truth.on_ground, "left the ground at {} us", truth.t_us);
+        assert_eq!(truth.position_m, position);
+        assert_eq!(truth.attitude, attitude);
+        assert_eq!(truth.velocity_ms, [0.0; 3]);
+        assert_eq!(truth.rates_rads, [0.0; 3]);
+        let f = specific_force(truth, g);
+        let norm = (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt();
+        assert!((norm - g).abs() < 1e-9, "specific force {f:?} at {} us", truth.t_us);
+    }
+    // The reaction is minus the applied wrench: N = m g - T cos(tilt) (no drag, no wind).
+    let thrust: f64 = plant.rotor_speeds().iter().map(|w| k * w * w).sum();
+    let normal = mass * g - thrust * rot_matrix(attitude)[2][2];
+    assert!((backend.truth().reaction.normal_n - normal).abs() < 1e-9, "N {:?}", backend.truth().reaction);
+
+    // (b) A thrust ramp on a tilted ground: release on the first tick where T cos(tilt) > m g, not before.
+    let tilt = Start::Ground { roll_pitch_rad: [0.3, -0.2], yaw_rad: 0.0 };
+    let mut plant = Plant::new(&card, &env).unwrap();
+    let mut backend = NativeBackend::with_start(&card, at_rest(), tilt).unwrap();
+    let cos_tilt = rot_matrix(backend.truth().attitude)[2][2];
+    let held = backend.truth().position_m;
+    let ramp_ticks = 2 * ONE_SECOND;
+    let mut released = None;
+    for i in 1..=ramp_ticks {
+        // Total thrust rises from 0 to 1.5 m g over the ramp.
+        let speed = (1.5 * mass * g * i as f64 / ramp_ticks as f64 / (4.0 * k)).sqrt();
+        let wrench = wrench_at(&mut plant, [speed; 4], backend.truth());
+        let net_up = 4.0 * k * speed * speed * cos_tilt > mass * g;
+        let truth = backend.step(&wrench, TICK_US);
+        assert_eq!(truth.on_ground, !net_up, "tick {i}: T cos(tilt) {} m g", if net_up { ">" } else { "<=" });
+        if net_up {
+            // The release tick integrates normally: the vehicle is already moving up.
+            assert!(truth.position_m[2] < 0.0 && truth.velocity_ms[2] < 0.0, "tick {i}: {truth:?}");
+            released = Some(i);
+            break;
+        }
+        assert_eq!(truth.position_m, held);
+    }
+    let first = released.expect("never released");
+    assert!(first > 1, "released at the first tick");
+
+    // (c) Touchdown records the state before the hold. A vehicle with the ground plane falls from 1 m, tilted and
+    // turning; its twin without a plane runs the same arithmetic through the plane, so it shows the pre-hold state.
+    let falling = Truth {
+        position_m: [0.0, 0.0, -1.0],
+        attitude: [0.9689, 0.1237, 0.2150, 0.0369],
+        rates_rads: [0.3, -0.2, 0.5],
+        ..at_rest()
+    };
+    let norm = falling.attitude.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let falling = Truth { attitude: falling.attitude.map(|x| x / norm), ..falling };
+    let mut plant_a = Plant::new(&card, &env).unwrap();
+    let mut plant_b = Plant::new(&card, &env).unwrap();
+    let mut free = NativeBackend::new(&card, falling.clone()).unwrap();
+    let mut over_ground = NativeBackend::with_start(&card, falling, Start::AirOverGround).unwrap();
+    let mut landed = false;
+    for _ in 0..2 * ONE_SECOND {
+        let wa = plant_a.step([0; 4], free.truth(), NO_WIND, TICK_US);
+        let wb = plant_b.step([0; 4], over_ground.truth(), NO_WIND, TICK_US);
+        free.step(&wa, TICK_US);
+        over_ground.step(&wb, TICK_US);
+        if !over_ground.truth().on_ground {
+            assert!(free.truth().position_m[2] < 0.0, "the twin is below the plane before contact");
+            assert!(over_ground.touchdown().is_none());
+            continue;
+        }
+        let before = free.truth();
+        let td = over_ground.touchdown().expect("on the ground without a touchdown record");
+        assert!(before.position_m[2] >= 0.0, "contact when the twin is above the plane");
+        assert_eq!(td.t_us, before.t_us);
+        assert_eq!(td.velocity_ms, before.velocity_ms);
+        assert_eq!(td.rates_rads, before.rates_rads);
+        let tilt_before = rot_matrix(before.attitude)[2][2].acos();
+        assert!((td.tilt_rad - tilt_before).abs() < 1e-12, "tilt {} vs {tilt_before}", td.tilt_rad);
+        assert!(td.velocity_ms[2] > 4.0 && td.rates_rads[0] != 0.0, "{td:?}");
+        let held = over_ground.truth();
+        assert_eq!(held.position_m[2], 0.0);
+        assert_eq!(held.velocity_ms, [0.0; 3]);
+        assert_eq!(held.rates_rads, [0.0; 3]);
+        assert_eq!(held.attitude, before.attitude);
+        landed = true;
+        break;
+    }
+    assert!(landed, "never touched down");
 }

@@ -122,6 +122,7 @@ pub struct Card {
     pub rotor_position: RotorPositions,
     pub propulsion: Propulsion,
     pub drag_body: Record<[f64; 3]>,
+    pub drag_rotor_linear: Record<f64>,
     pub battery_voltage: Record<f64>,
     pub imu1: ImuProfile,
     pub imu2: ImuProfile,
@@ -735,6 +736,7 @@ impl Card {
             })
         })();
         let drag_body = rec::<[f64; 3]>(&root, "drag", "body", &mut errs);
+        let drag_rotor_linear = rec::<f64>(&root, "drag", "rotor_linear", &mut errs);
         let battery_voltage = rec::<f64>(&root, "battery", "voltage", &mut errs);
         let imu1 = imu_profile(&root, "imu1", &mut errs);
         let imu2 = imu_profile(&root, "imu2", &mut errs);
@@ -801,6 +803,7 @@ impl Card {
                 rotor_position: rotor_position?,
                 propulsion: propulsion?,
                 drag_body: drag_body?,
+                drag_rotor_linear: drag_rotor_linear?,
                 battery_voltage: battery_voltage?,
                 imu1: imu1?,
                 imu2: imu2?,
@@ -982,6 +985,7 @@ speed_at_level_min = { v = 0.0, unit = "rad/s", tag = "placeholder", range = "as
 
 [drag]
 body = { v = [0.0, 0.0, 0.0], unit = "N/(m/s)^2", tag = "placeholder", range = "ask", src = "fake" }
+rotor_linear = { v = 0.0, unit = "N/(m/s)", tag = "derived", src = "fake" }
 
 [battery]
 voltage = { v = 1.0, unit = "V", tag = "datasheet", src = "fake" }

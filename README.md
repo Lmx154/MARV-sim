@@ -17,9 +17,9 @@ scenarios and a five-point parameter spread.
 | `marv-card/marv.toml` | The vehicle card: the only source of the vehicle's physical numbers. Every number is a record with a value, a unit, a tag (`measured`, `datasheet`, `cad`, `derived`, `placeholder`) and a source. |
 | `marv-card/src/` | The loader and the checks (`schema.rs`) and the `card-check` program. |
 | `marv-card/build.rs` | Compiles the card into `const` data for the firmware (`no_std`, without feature `std`): rotor positions and spins, the mixer matrix, coefficients, levels, mass, the card's sha256. `marv-run` refuses a card whose sha256 differs. An `"ask"` in a number the firmware needs fails the build; placeholders show as cargo warnings. |
-| `marv-sim/src/` | `plant.rs` (motor levels to a wrench), `backend.rs` (wrench to truth, RK4), `sensors.rs` (the IMU model), `rng.rs` (seeded noise), `scenario.rs` (scenario and spread files), `verdict.rs` (the checks), `log.rs` (DataFlash), `math.rs`. |
+| `marv-sim/src/` | `plant.rs` (motor levels to a wrench), `backend.rs` (wrench to truth, RK4, and the ground), `sensors.rs` (the IMU model), `rng.rs` (seeded noise), `scenario.rs` (scenario and spread files), `verdict.rs` (the checks), `log.rs` (DataFlash), `math.rs`. |
 | `marv-sim/src/bin/marv-run.rs` | The runner. |
-| `marv-sim/tests/invariants.rs` | The three plant invariants. |
+| `marv-sim/tests/invariants.rs` | The plant invariants and the ground contact. |
 | `scenarios/*.toml` | The four scenarios (`hover`, `steps`, `stick-sign`, `rc-loss`) and the spread (`spread.toml`). |
 | `env/default.toml` | Gravity, atmosphere, origin, magnetic field, wind. Its origin is a public reference point, never home. |
 | `env/home.local.toml` | The real home location, if you create it. Git-ignored; never commit it. |
@@ -46,6 +46,20 @@ newest flight command, the board's own stale-command rule (0 for Stop). Every 32
 from the script row in force, unless the link is lost then; the newest one goes to the next flight step, once. Every
 tick the plant makes a wrench (plus any disturbance torque) and the backend integrates it. Every 10 ticks (800 Hz)
 both IMU models make a sample and the flight step runs once.
+
+## The plant, the ground and the drag
+
+The plant adds the weight, the quadratic body drag (`drag.body`) and one linear rotor drag, `F_xy = -drag.rotor_linear *
+va_xy` in body x and y, none in z (`va` = air-relative velocity in body FRD). The card holds it at 0 (term off); its
+range [0, 0.41] N/(m/s) is an order-of-magnitude bound from another quadrotor (see its `src`).
+
+The native backend has an optional ground plane at down = 0 for the centre of mass (`Start` in `backend.rs`;
+`NativeBackend::new` has none, as before). In GROUND the position and attitude are held and velocity, rates, accel and
+angular accel are 0, so the IMU model reads gravity only. The vehicle lifts off at the start of a tick when the applied
+force in NED (weight included) points up, and that tick integrates normally. It touches down at the end of a tick with
+down >= 0: the velocity, tilt and rates from before the hold go to `NativeBackend::touchdown()`, then down, velocity and
+rates are set to 0 and the attitude is kept. `Truth` carries `on_ground` and `reaction` (normal force, horizontal force,
+roll/pitch torque: minus the applied wrench). No friction, spring or pivot. No scenario file asks for the ground yet.
 
 ## The scenario file
 
@@ -102,7 +116,9 @@ DShot line) and `RCS` (at every report time: the sticks, the switch, and `Lost` 
 
     cargo test -p marv-sim
 
-Three tests: the plant invariants (free fall, hover thrust equals weight, yaw torque sign matches rotor spin).
+Four tests: the plant invariants (free fall, hover thrust equals weight, yaw torque sign matches rotor spin) and
+`ground_contact` (at rest the IMU reads gravity only; release on the first tick the net force points up; a touchdown
+records the state before the hold).
 
 ## Not built yet
 
@@ -130,4 +146,4 @@ placeholder and every value or range that is still `"ask"`. Any error exits 1.
 
     cargo test --workspace
 
-Six tests in `marv-card` (one card that passes, and one broken card per check) and the three plant invariants.
+Six tests in `marv-card` (one card that passes, and one broken card per check) and the four of `marv-sim`.
