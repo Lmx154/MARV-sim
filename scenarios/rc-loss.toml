@@ -1,0 +1,43 @@
+# RC loss and the gate (decision-first-pair-20261119, 8d; gate rule: section 5). Mahony is initialised at t = 0, the
+# vehicle falls, truth is not judged. "Stop" is judged at the motors: the levels the plant is given at ESC ticks.
+[scenario]
+name = "rc-loss"
+duration_s = 6.5              # 8d gives no duration: 0.5 s after the last row
+
+[initial]
+position_ned_m = [0.0, 0.0, 0.0]
+velocity_ned_ms = [0.0, 0.0, 0.0]
+roll_pitch_yaw_deg = [0.0, 0.0, 0.0]
+rates_rads = [0.0, 0.0, 0.0]
+rotors = "hover"
+
+[rc]
+script = [
+  { t_s = 0.0,  roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.0, arm = false },  # switch off, throttle 0
+  { t_s = 0.1,  roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.5, arm = true },   # switch on, throttle 0.5
+  { t_s = 0.2,  roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.0, arm = true },   # throttle 0, switch still on
+  { t_s = 0.3,  roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.0, arm = false },  # switch off
+  { t_s = 0.4,  roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.0, arm = true },   # switch on
+  # 0.45 s is not on the 4 ms report grid: the first report with throttle 0.5 is made at 0.452 s.
+  { t_s = 0.45, roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.5, arm = true },   # throttle 0.5
+  { t_s = 5.0,  roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.0, arm = true },   # frames resume, on, throttle 0
+  { t_s = 5.5,  roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.0, arm = false },  # switch off
+  { t_s = 5.6,  roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.0, arm = true },   # switch on
+  { t_s = 6.0,  roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.0, arm = false },  # switch off
+]
+lost = [ { from_s = 3.0, to_s = 5.0 } ]   # 8d: RC frames stop at 3.0 s and resume at 5.0 s
+
+[verdict]
+check = "rc_loss"
+# Each row of 8d, by script time (s). A "Stop" window [a, b] counts the ESC ticks in it with any level above 0.
+on_high_s = 0.1         # 8d 0.1: stays Stop (throttle high), over [0.1, 0.2]
+low_s = 0.2             # 8d 0.2: stays Stop (the switch must be cycled), over [0.2, 0.4]
+arm_s = 0.4             # 8d 0.3/0.4: arms with all four lines at exactly the card's IDLE_LEVEL
+throttle_s = 0.45       #   (judged at the last ESC tick before this row)
+lost_at_s = 3.0         # 8d 3.0: frames stop; t_last = the last report before this time
+rc_fs_timeout_s = 1.0   # 5d, 13 RC_FS_TIMEOUT: plant levels stay above 0 until t_last + this
+stop_bound_s = 0.0025   # 8d, 13: all 0 no later than t_last + RC_FS_TIMEOUT + this
+resume_s = 5.0          # 8d 5.0: frames resume with the switch on: stays Stop over [5.0, 5.6]
+rearm_s = 5.6           # 8d 5.5/5.6: arms (judged at the last ESC tick before off_s: all four above 0)
+off_s = 6.0             # 8d 6.0: switch off
+off_bound_s = 0.0065    # 8d: Stop within 4 ms + 2.5 ms of the row's time

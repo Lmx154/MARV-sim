@@ -1,19 +1,23 @@
-//! The sim's DataFlash log: the firmware's own records (header, MSG, IMU) through `fw_core::dflog`, and the sim-only
-//! truth (TRU) and rotor (ROT) records, written by hand with their FMT.
+//! The sim's DataFlash log: the firmware's own records (header, MSG, IMU, and the flight step's NAV, SETP, DMD, MOT)
+//! through `fw_core::dflog` and `fw_flight::step::encode_step`, and the sim-only truth (TRU), rotor (ROT) and stick
+//! (RCS) records, written by hand with their FMT.
 
 use crate::backend::Truth;
 use fw_core::dflog::{self, HEAD1, HEAD2, RecordDef};
 use fw_flight::imu::ImuReading;
+use fw_flight::step::{StepOut, encode_step};
 use std::path::Path;
 
 const ID_TRU: u8 = 200;
 const ID_ROT: u8 = 201;
+const ID_RCS: u8 = 202;
 
-/// Format characters used by the sim-only records: Q is u64, H is u16, f is f32. Same sizes as the firmware's.
+/// Format characters used by the sim-only records: Q is u64, H is u16, B is u8, f is f32. Same sizes as the firmware's.
 fn char_size(c: char) -> usize {
     match c {
         'Q' => 8,
         'H' => 2,
+        'B' => 1,
         'f' => 4,
         _ => panic!("sim-only record: unknown format character {c}"),
     }
@@ -33,10 +37,16 @@ fn rot_def() -> RecordDef {
     sim_def(ID_ROT, "ROT", "QHHHHffff", "TimeUS,L0,L1,L2,L3,W0,W1,W2,W3")
 }
 
+/// The sticks as the flight step was given them: one record per RC sample time (decision-first-pair-wiring A6).
+fn rcs_def() -> RecordDef {
+    sim_def(ID_RCS, "RCS", "QffffBB", "TimeUS,R,P,T,Y,Arm,Lost")
+}
+
 /// One column of a sim-only record.
 enum Field {
     Q(u64),
     H(u16),
+    B(u8),
     F(f32),
 }
 
@@ -56,6 +66,10 @@ fn put(out: &mut Vec<u8>, def: &RecordDef, fields: &[Field]) {
                 letters.push('H');
                 out.extend_from_slice(&v.to_le_bytes());
             }
+            Field::B(v) => {
+                letters.push('B');
+                out.push(*v);
+            }
             Field::F(v) => {
                 letters.push('f');
                 out.extend_from_slice(&v.to_le_bytes());
@@ -73,6 +87,9 @@ pub struct Counts {
     pub imu: u64,
     pub tru: u64,
     pub rot: u64,
+    /// Flight steps: each wrote one NAV, SETP, DMD and MOT.
+    pub step: u64,
+    pub rcs: u64,
 }
 
 pub struct Log {
@@ -81,12 +98,13 @@ pub struct Log {
 }
 
 impl Log {
-    /// The header: the firmware's 11 FMTs, then one FMT for each sim-only record.
+    /// The header: the firmware's 11 FMTs, the sim-only TRU and ROT, the four flight-step types, then RCS.
     pub fn with_header() -> Log {
         let mut bytes = vec![0u8; dflog::HEADER_SEQUENCE_LEN];
         let n = dflog::write_header(&mut bytes);
         assert_eq!(n, dflog::HEADER_SEQUENCE_LEN);
-        for def in [tru_def(), rot_def()] {
+        let [nav, setp, dmd, mot] = dflog::FLIGHT_TYPES;
+        for def in [tru_def(), rot_def(), nav, setp, dmd, mot, rcs_def()] {
             let mut fmt = [0u8; 128];
             let n = dflog::fmt_record(&def, &mut fmt);
             assert!(n > 0, "FMT does not fit its buffer");
@@ -137,6 +155,24 @@ impl Log {
         fields.extend(speeds_rads.map(|w| Field::F(w as f32)));
         put(&mut self.bytes, &rot_def(), &fields);
         self.counts.rot += 1;
+    }
+
+    /// The four records of one flight step, written by the firmware's own encoder.
+    pub fn step(&mut self, out: &StepOut) {
+        let mut buf = [0u8; 256];
+        let n = encode_step(out, &mut buf);
+        self.append(&buf, n);
+        self.counts.step += 1;
+    }
+
+    /// Sticks in the order of the columns R, P, T, Y; `lost` = 1 inside a lost interval (the sticks are then the last
+    /// ones given).
+    pub fn rc(&mut self, t_us: u64, roll_pitch_throttle_yaw: [f32; 4], arm: bool, lost: bool) {
+        let mut fields = vec![Field::Q(t_us)];
+        fields.extend(roll_pitch_throttle_yaw.map(Field::F));
+        fields.extend([Field::B(u8::from(arm)), Field::B(u8::from(lost))]);
+        put(&mut self.bytes, &rcs_def(), &fields);
+        self.counts.rcs += 1;
     }
 
     /// Creates the parent folder if it is missing.

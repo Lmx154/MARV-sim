@@ -1,0 +1,12 @@
+# The parameter spread (decision-first-pair-20261119, 8e; rulings 4): five points x four scenarios = 20 runs.
+# Only the plant and the backend take a point; the flight code keeps the compiled card.
+# kf_scale scales k_F; inertia_scale scales the whole inertia tensor; lag_s sets BOTH motor time constants
+# (no lag_s: the card's, 0.045 s up and 0.060 s down).
+scenarios = ["hover.toml", "steps.toml", "stick-sign.toml", "rc-loss.toml"]   # relative to this file
+points = [
+  { kf_scale = 1.0, inertia_scale = 1.0 },                    # P0: nominal card
+  { kf_scale = 0.7, inertia_scale = 1.25, lag_s = 0.060 },    # P1
+  { kf_scale = 0.7, inertia_scale = 1.25, lag_s = 0.030 },    # P2
+  { kf_scale = 1.3, inertia_scale = 0.75, lag_s = 0.060 },    # P3
+  { kf_scale = 1.3, inertia_scale = 0.75, lag_s = 0.030 },    # P4
+]

@@ -10,6 +10,7 @@ pub mod plant;
 pub mod rng;
 pub mod scenario;
 pub mod sensors;
+pub mod verdict;
 
 pub use backend::{Backend, NativeBackend, Truth};
 pub use plant::{Plant, Wrench};

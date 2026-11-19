@@ -1,0 +1,51 @@
+# Stick sign (decision-first-pair-20261119, 8c): the common preamble, hover 2 s after the throttle row, then 0.3 s
+# pulses with 1.2 s centred between them. Truth must move the 7b way during each pulse.
+[scenario]
+name = "stick-sign"
+duration_s = 12.54            # 1.2 s centred after the last pulse
+
+[initial]
+position_ned_m = [0.0, 0.0, 0.0]
+velocity_ned_ms = [0.0, 0.0, 0.0]
+roll_pitch_yaw_deg = [0.0, 0.0, 0.0]
+rates_rads = [0.0, 0.0, 0.0]
+rotors = "hover"
+
+[rc]
+script = [
+  { t_s = 0.0,    roll = 0.0,  pitch = 0.0,  yaw = 0.0,  throttle = 0.0,  arm = false },  # 8: preamble
+  { t_s = 0.020,  roll = 0.0,  pitch = 0.0,  yaw = 0.0,  throttle = 0.0,  arm = true },
+  { t_s = 0.040,  roll = 0.0,  pitch = 0.0,  yaw = 0.0,  throttle = 0.5,  arm = true },
+  { t_s = 2.040,  roll = 0.2,  pitch = 0.0,  yaw = 0.0,  throttle = 0.5,  arm = true },   # roll +0.2
+  { t_s = 2.340,  roll = 0.0,  pitch = 0.0,  yaw = 0.0,  throttle = 0.5,  arm = true },
+  { t_s = 3.540,  roll = -0.2, pitch = 0.0,  yaw = 0.0,  throttle = 0.5,  arm = true },   # roll -0.2
+  { t_s = 3.840,  roll = 0.0,  pitch = 0.0,  yaw = 0.0,  throttle = 0.5,  arm = true },
+  { t_s = 5.040,  roll = 0.0,  pitch = 0.2,  yaw = 0.0,  throttle = 0.5,  arm = true },   # pitch +0.2 (forward)
+  { t_s = 5.340,  roll = 0.0,  pitch = 0.0,  yaw = 0.0,  throttle = 0.5,  arm = true },
+  { t_s = 6.540,  roll = 0.0,  pitch = -0.2, yaw = 0.0,  throttle = 0.5,  arm = true },   # pitch -0.2
+  { t_s = 6.840,  roll = 0.0,  pitch = 0.0,  yaw = 0.0,  throttle = 0.5,  arm = true },
+  { t_s = 8.040,  roll = 0.0,  pitch = 0.0,  yaw = 0.2,  throttle = 0.5,  arm = true },   # yaw +0.2
+  { t_s = 8.340,  roll = 0.0,  pitch = 0.0,  yaw = 0.0,  throttle = 0.5,  arm = true },
+  { t_s = 9.540,  roll = 0.0,  pitch = 0.0,  yaw = -0.2, throttle = 0.5,  arm = true },   # yaw -0.2
+  { t_s = 9.840,  roll = 0.0,  pitch = 0.0,  yaw = 0.0,  throttle = 0.5,  arm = true },
+  { t_s = 11.040, roll = 0.0,  pitch = 0.0,  yaw = 0.0,  throttle = 0.52, arm = true },   # throttle 0.52
+  { t_s = 11.340, roll = 0.0,  pitch = 0.0,  yaw = 0.0,  throttle = 0.5,  arm = true },
+]
+
+[verdict]
+check = "stick_sign"
+# 8c, conventions 7b: on truth, the change from pulse start to pulse end. sense +1: the angle goes up; -1: down.
+# Roll + gives roll up (right side down); pitch + (forward) gives pitch DOWN (nose down); yaw + gives heading up.
+pulses = [
+  { from_s = 2.040, to_s = 2.340, axis = "roll",  sense = 1 },
+  { from_s = 3.540, to_s = 3.840, axis = "roll",  sense = -1 },
+  { from_s = 5.040, to_s = 5.340, axis = "pitch", sense = -1 },
+  { from_s = 6.540, to_s = 6.840, axis = "pitch", sense = 1 },
+  { from_s = 8.040, to_s = 8.340, axis = "yaw",   sense = 1 },
+  { from_s = 9.540, to_s = 9.840, axis = "yaw",   sense = -1 },
+]
+min_move_deg = 2.0                         # 8c, 13: the primary axis moves at least this, the right way
+max_off_axis_ratio = 0.3333333333333333    # 8c, 13: each other axis at most 1/3 of the primary's move
+throttle_from_s = 11.040                   # 8c: the throttle pulse, against the same length (0.3 s) before it
+throttle_to_s = 11.340
+min_accel_rise_ms2 = 1.0                   # 8c, 13: mean upward truth acceleration (-accel down) rises this much
