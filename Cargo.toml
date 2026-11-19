@@ -1,3 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["marv-card", "marv-sim"]
+
+# The firmware (`fw-flight`) pins `marv-card` from this repo by git revision. Inside this workspace that pin is
+# pointed at the local folder, so a sim build has exactly one copy of the card crate.
+[patch."https://github.com/Lmx154/MARV-sim.git"]
+marv-card = { path = "marv-card" }
