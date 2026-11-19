@@ -1,0 +1,64 @@
+{
+ "cad_commit": "dd7f890c1c17258aaa3ee08bf1de83bcba623311",
+ "card_sha256": "6156b357263e1ee4fc5982c3f9dbab50addb5917b9a801241e9936a3fcadce1e",
+ "h_rest": 0.03343273317428403,
+ "mesh_dir_relative_to_model": "../../../../Projects/CAD/drone/model/marv_quad/meshes",
+ "meshes": [
+  "battery_battery.stl",
+  "battery_gps.stl",
+  "battery_pad.stl",
+  "elrs_rx.stl",
+  "esc.stl",
+  "fc_parts.stl",
+  "fc_pcb.stl",
+  "frame_carbon.stl",
+  "frame_printed.stl",
+  "frame_tpu.stl",
+  "motor_coils.stl",
+  "motor_stators.stl",
+  "rotor_fl_bell.stl",
+  "rotor_fl_magnets.stl",
+  "rotor_fl_nut.stl",
+  "rotor_fl_prop.stl",
+  "rotor_fl_shaft.stl",
+  "rotor_fr_bell.stl",
+  "rotor_fr_magnets.stl",
+  "rotor_fr_nut.stl",
+  "rotor_fr_prop.stl",
+  "rotor_fr_shaft.stl",
+  "rotor_rl_bell.stl",
+  "rotor_rl_magnets.stl",
+  "rotor_rl_nut.stl",
+  "rotor_rl_prop.stl",
+  "rotor_rl_shaft.stl",
+  "rotor_rr_bell.stl",
+  "rotor_rr_magnets.stl",
+  "rotor_rr_nut.stl",
+  "rotor_rr_prop.stl",
+  "rotor_rr_shaft.stl",
+  "screws.stl",
+  "standoffs.stl"
+ ],
+ "stance_box": {
+  "centre_cad_m": [
+   7.448717951774597e-06,
+   0.0,
+   -0.0008249999955296516
+  ],
+  "hi_cad_m": [
+   0.03882688656449318,
+   0.02281542308628559,
+   0.0
+  ],
+  "lo_cad_m": [
+   -0.03881198912858963,
+   -0.02281542308628559,
+   -0.0016499999910593033
+  ],
+  "size_m": [
+   0.07763887569308281,
+   0.04563084617257118,
+   0.0016499999910593033
+  ]
+ }
+}

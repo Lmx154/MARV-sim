@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""Write the Gazebo model of MARV from the vehicle card and the CAD export. Standard library only.
+
+  python3 gz/make_model.py --card marv-card/marv.toml --cad /home/luis/Projects/CAD/drone
+
+Frames: the model link frame is FLU at the centre of mass (link origin = CoM, inertial pose 0). CAD frame is
++X nose, +Y left, +Z up (FLU already); the card is FRD, D = diag(1,-1,-1).
+"""
+import argparse, hashlib, json, math, os, re, struct, subprocess, sys, tomllib
+import xml.etree.ElementTree as ET
+
+CORNERS = {"fl": "front_left", "fr": "front_right", "rl": "rear_left", "rr": "rear_right"}
+MU = 1.0  # SDF default, placeholder (decision section 2)
+RESTITUTION = 0.0  # SDF default, placeholder
+
+
+def g(x):
+    return repr(float(x)) if float(x) != 0.0 else "0"
+
+
+def sub(a, b):
+    return [x - y for x, y in zip(a, b)]
+
+
+def read_stl(path):
+    data = open(path, "rb").read()
+    n = struct.unpack_from("<I", data, 80)[0]
+    if 84 + 50 * n != len(data):
+        sys.exit(f"{path}: not a binary STL of the expected size")
+    pts = []
+    for i in range(n):
+        v = struct.unpack_from("<12f", data, 84 + 50 * i)
+        pts += [v[3:6], v[6:9], v[9:12]]
+    return pts
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--card", required=True)
+    ap.add_argument("--cad", required=True)
+    ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "marv"))
+    a = ap.parse_args()
+    card_bytes = open(a.card, "rb").read()
+    card = tomllib.loads(card_bytes.decode())
+    cad = os.path.abspath(a.cad)
+    mdir = os.path.join(cad, "model", "marv_quad")
+    meshes = os.path.join(mdir, "meshes")
+    out = os.path.abspath(a.out)
+    os.makedirs(out, exist_ok=True)
+    cad_commit = subprocess.run(["git", "-C", cad, "rev-parse", "HEAD"], capture_output=True, text=True,
+                                check=True).stdout.strip()
+
+    mass = card["mass"]["mass"]["v"]
+    com = card["mass"]["com_in_cad"]["v"]
+    J = card["mass"]["inertia"]["v"]
+    D = [1, -1, -1]
+    Jf = [[D[i] * D[j] * J[i][j] for j in range(3)] for i in range(3)]  # J' = D J D
+
+    manifest = json.load(open(os.path.join(meshes, "manifest.json")))
+    col = manifest["derived"]["collision"]
+    files = sorted(manifest["files"])
+    on_disk = sorted(f for f in os.listdir(meshes) if f.endswith(".stl"))
+    if files != on_disk:
+        sys.exit("manifest.json file list differs from the .stl files on disk")
+
+    # link offsets in the CAD frame: parse the CAD model.sdf link poses
+    cad_sdf = re.sub(r"<!--.*?-->", "", open(os.path.join(mdir, "model.sdf")).read(), flags=re.S)
+    root = ET.fromstring(cad_sdf.split("?>", 1)[1]).find("model")
+    linkpose = {}
+    for lk in root.findall("link"):
+        p = lk.find("pose")
+        linkpose[lk.get("name")] = [float(t) for t in p.text.split()][:3] if p is not None else [0.0, 0.0, 0.0]
+    for c, o in manifest["stamp"]["rotor_origins_m"].items():
+        if max(abs(x - y) for x, y in zip(o, linkpose[f"rotor_{c}"])) > 1e-8:
+            sys.exit(f"rotor_{c} origin differs between manifest and model.sdf")
+
+    # stance box: screws.stl vertices below z = 0 (CAD frame, m)
+    sv = [p for p in read_stl(os.path.join(meshes, "screws.stl")) if p[2] < 0.0]
+    stance_lo = [min(p[i] for p in sv) for i in range(3)]
+    stance_hi = [max(p[i] for p in sv) for i in range(3)]
+    stance_lo[2], stance_hi[2] = stance_lo[2], 0.0
+    stance_size = [h - l for h, l in zip(stance_hi, stance_lo)]
+    stance_ctr = [(h + l) / 2 for h, l in zip(stance_hi, stance_lo)]
+
+    # collisions in the CAD frame: (name, centre, size, yaw) boxes and (name, centre, radius, length) cylinders
+    boxes = []
+    for k, nm in (("LP", "col_bottom_plate"), ("FB", "col_middle_plate"), ("FT", "col_top_plate")):
+        boxes.append((nm, col[k]["pose"][:3], col[k]["size"], 0.0))
+    for c in CORNERS:
+        boxes.append((f"col_arm_{c}", col[f"AR_{c}"]["pose"][:3], col[f"AR_{c}"]["size"], col[f"AR_{c}"]["pose"][3]))
+    bx = linkpose["battery"]
+    boxes.append(("col_battery", [col["battery"]["pose"][i] + bx[i] for i in range(3)], col["battery"]["size"], 0.0))
+    cyls = []
+    for c in CORNERS:
+        r = col[f"rotor_{c}"]
+        o = linkpose[f"rotor_{c}"]
+        cyls.append((f"col_prop_disc_{c}", [o[0], o[1], o[2] + (r["z"][0] + r["z"][1]) / 2], r["radius"],
+                     r["z"][1] - r["z"][0]))
+
+    # lowest collision point, CAD z
+    lows = [stance_lo[2]] + [ctr[2] - (s[2] / 2) for _, ctr, s, _ in boxes] + [ctr[2] - l / 2 for _, ctr, _, l in cyls]
+    z_low = min(lows)
+    if z_low != stance_lo[2]:
+        sys.exit(f"the lowest collision point is not the stance box: {z_low} vs {stance_lo[2]}")
+    h_rest = com[2] - z_low
+
+    def P(p):  # CAD point -> link frame
+        return " ".join(g(x) for x in sub(p, com))
+
+    L = []
+    w = L.append
+    w('<?xml version="1.0"?>')
+    w("<!-- Generated by gz/make_model.py from the vehicle card and the CAD export. Do not edit; rerun it. -->")
+    w("<!-- Link frame FLU (x nose, y left, z up), origin at the centre of mass, inertial pose zero. -->")
+    w('<sdf version="1.9">')
+    w('  <model name="marv">')
+    w('    <link name="body">')
+    w("      <inertial>")
+    w("        <pose>0 0 0 0 0 0</pose>")
+    w(f"        <mass>{g(mass)}</mass>")
+    w(f"        <inertia><ixx>{g(Jf[0][0])}</ixx><ixy>{g(Jf[0][1])}</ixy><ixz>{g(Jf[0][2])}</ixz>"
+      f"<iyy>{g(Jf[1][1])}</iyy><iyz>{g(Jf[1][2])}</iyz><izz>{g(Jf[2][2])}</izz></inertia>")
+    w("      </inertial>")
+    mesh_list = []
+    rel = os.path.relpath(meshes, out)
+
+    def visual(name, fn, pos):
+        mesh_list.append(fn)
+        w(f'      <visual name="{name}">')
+        w(f"        <pose>{P(pos)} 0 0 0</pose>")
+        w(f"        <geometry><mesh><uri>{rel}/{fn}</uri></mesh></geometry>")
+        w("      </visual>")
+
+    base = manifest["stamp"]["groups"]["base"]
+    for gname in base:
+        visual(gname, f"{gname}.stl", [0.0, 0.0, 0.0])
+    for gname in manifest["stamp"]["groups"]["battery"]:
+        visual(f"battery_{gname}", f"battery_{gname}.stl", bx)
+    for c in CORNERS:
+        for gname in manifest["stamp"]["groups"]["rotor"]:
+            visual(f"rotor_{c}_{gname}", f"rotor_{c}_{gname}.stl", linkpose[f"rotor_{c}"])
+    mesh_list = sorted(mesh_list)
+    for f in mesh_list:
+        if f not in files:
+            sys.exit(f"mesh {f} not in manifest")
+
+    surface = (f"        <surface>\n          <friction><ode><mu>{g(MU)}</mu><mu2>{g(MU)}</mu2></ode></friction>\n"
+               f"          <bounce><restitution_coefficient>{g(RESTITUTION)}</restitution_coefficient></bounce>\n"
+               "        </surface>")
+
+    def collision(name, pose, geom):
+        w(f'      <collision name="{name}">')
+        w(f"        <pose>{pose}</pose>")
+        w(f"        <geometry>{geom}</geometry>")
+        w(surface)
+        w("      </collision>")
+
+    collision("col_stance", f"{P(stance_ctr)} 0 0 0", f"<box><size>{' '.join(g(s) for s in stance_size)}</size></box>")
+    for nm, ctr, size, yaw in boxes:
+        collision(nm, f"{P(ctr)} 0 0 {g(yaw)}", f"<box><size>{' '.join(g(s) for s in size)}</size></box>")
+    for nm, ctr, r, ln in cyls:
+        collision(nm, f"{P(ctr)} 0 0 0", f"<cylinder><radius>{g(r)}</radius><length>{g(ln)}</length></cylinder>")
+    w("    </link>")
+    w("  </model>")
+    w("</sdf>")
+    sdf_text = "\n".join(L) + "\n"
+    open(os.path.join(out, "model.sdf"), "w").write(sdf_text)
+    open(os.path.join(out, "model.config"), "w").write(
+        '<?xml version="1.0"?>\n<model>\n  <name>marv</name>\n  <version>1.0</version>\n'
+        '  <sdf version="1.9">model.sdf</sdf>\n  <description>MARV quadcopter, generated by gz/make_model.py.</description>\n'
+        "</model>\n")
+    open(os.path.join(out, "model.json"), "w").write(json.dumps({
+        "h_rest": h_rest,
+        "card_sha256": hashlib.sha256(card_bytes).hexdigest(),
+        "cad_commit": cad_commit,
+        "stance_box": {"lo_cad_m": stance_lo, "hi_cad_m": stance_hi, "size_m": stance_size,
+                       "centre_cad_m": stance_ctr},
+        "meshes": mesh_list,
+        "mesh_dir_relative_to_model": rel,
+    }, indent=1, sort_keys=True) + "\n")
+
+    # world: the model sits so that its lowest collision point touches the plane
+    open(os.path.join(os.path.dirname(out), "world.sdf"), "w").write(world_text(h_rest))
+
+    # numeric self-check, reading back from the written SDF
+    tree = ET.parse(os.path.join(out, "model.sdf")).getroot()
+    lk = tree.find("model/link")
+    ine = lk.find("inertial/inertia")
+    ok = True
+
+    def rel_err(x, y):
+        return abs(x - y) / max(abs(y), 1e-300)
+
+    m_sdf = float(lk.find("inertial/mass").text)
+    print(f"mass: sdf {m_sdf!r} card {mass!r} rel {rel_err(m_sdf, mass):.2e}")
+    ok &= rel_err(m_sdf, mass) <= 1e-9
+    for tag, (i, j) in {"ixx": (0, 0), "ixy": (0, 1), "ixz": (0, 2), "iyy": (1, 1), "iyz": (1, 2), "izz": (2, 2)}.items():
+        v = float(ine.find(tag).text)
+        want = D[i] * D[j] * J[i][j]
+        e = rel_err(v, want)
+        print(f"{tag}: sdf {v:.12e} card(FRD->FLU) {want:.12e} rel {e:.2e}")
+        ok &= e <= 1e-9
+    print(f"h_rest = {h_rest:.9f} m (com z {com[2]:.9f} + stance depth {-z_low:.9f})")
+    print("stance box (CAD frame, m): x %.6f..%.6f  y %.6f..%.6f  z %.6f..%.6f  (size %s)" % (
+        stance_lo[0], stance_hi[0], stance_lo[1], stance_hi[1], stance_lo[2], stance_hi[2],
+        " ".join(f"{s:.6f}" for s in stance_size)))
+    poses = {}
+    for v in lk.findall("visual"):
+        poses[v.get("name")] = [float(t) for t in v.find("pose").text.split()][:3]
+    for c, nm in CORNERS.items():
+        cp = card["rotor_position"][nm]["v"]
+        want = [cp[0], -cp[1], -cp[2]]  # FRD -> FLU
+        got = poses[f"rotor_{c}_prop"]
+        dxy = max(abs(got[0] - want[0]), abs(got[1] - want[1]))
+        pz = [p[2] for p in read_stl(os.path.join(meshes, f"rotor_{c}_prop.stl"))]
+        hub_z = got[2] + (min(pz) + max(pz)) / 2  # prop mesh mid-height, link frame
+        print(f"rotor {c}: visual origin xy diff to card {dxy:.2e} m; card z {want[2]:.6f}, visual origin z "
+              f"{got[2]:.6f} (the card point is the hub plane; the visual origin is the motor base); "
+              f"prop mesh z-range {got[2]+min(pz):.6f}..{got[2]+max(pz):.6f}, mid {hub_z:.6f}")
+        ok &= dxy <= 1e-6 and got[2] + min(pz) <= want[2] <= got[2] + max(pz)
+    print("self-check:", "PASS" if ok else "FAIL")
+    sys.exit(0 if ok else 1)
+
+
+def world_text(h_rest):
+    return f"""<?xml version="1.0"?>
+<!-- Generated by gz/make_model.py. Gravity is zero on purpose: the sim's plant applies the weight. -->
+<sdf version="1.9">
+  <world name="marv_world">
+    <gravity>0 0 0</gravity>
+    <physics name="step" type="dart">
+      <max_step_size>0.000125</max_step_size>
+      <real_time_factor>1</real_time_factor>
+    </physics>
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics">
+      <engine>gz-physics-dartsim-plugin</engine>
+    </plugin>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.9 0.9 0.9 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><plane><normal>0 0 1</normal><size>100 100</size></plane></geometry>
+          <surface>
+            <friction><ode><mu>1</mu><mu2>1</mu2></ode></friction>
+            <bounce><restitution_coefficient>0</restitution_coefficient></bounce>
+          </surface>
+        </collision>
+        <visual name="visual">
+          <geometry><plane><normal>0 0 1</normal><size>100 100</size></plane></geometry>
+          <material><ambient>0.6 0.6 0.6 1</ambient><diffuse>0.6 0.6 0.6 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+    <include>
+      <uri>model://marv</uri>
+      <name>marv</name>
+      <pose>0 0 {g(h_rest)} 0 0 0</pose>
+    </include>
+  </world>
+</sdf>
+"""
+
+
+main()
