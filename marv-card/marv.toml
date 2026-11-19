@@ -53,8 +53,8 @@ time_constant_up = { v = 0.045, unit = "s", tag = "placeholder", range = [0.030,
 time_constant_down = { v = 0.06, unit = "s", tag = "placeholder", range = [0.030, 0.060], src = "CAD:model/drone_params.yaml:60, ESTIMATED 'typical for a 7-inch prop'; range: owner, handoff:196" }
 level_min = { v = 1, unit = "level", tag = "datasheet", src = "dshot Throttle::MIN_LEVEL, DRV:dshot/src/value.rs:37" }
 level_max = { v = 2000, unit = "level", tag = "datasheet", src = "dshot Throttle::MAX_LEVEL, DRV:dshot/src/value.rs:39" }
-# The lowest level the allocator sends while armed. No source yet: the owner names a starting value before step 5.
-idle_level = { v = "ask", unit = "level", tag = "placeholder", range = "ask", src = "none: ask owner; the thrust test (step 6) replaces it" }
+# The lowest level the allocator sends while armed. A starting value; the thrust test (step 6) replaces it.
+idle_level = { v = 111, unit = "level", tag = "placeholder", range = [100, 201], src = "owner 2026-11-19 took the recommendation: 5.5 % of the 1..2000 range, as Betaflight motorIdle 550 and PX4 DSHOT_MIN 0.055; range up to ArduPilot MOT_SPIN_ARM 0.10 (PLAN:facts-flight-references-20261119.md section 1)" }
 # Speed command is linear in level from (level_min, speed_at_level_min) to (level_max, max_rotor_speed).
 speed_at_level_min = { v = 0.0, unit = "rad/s", tag = "placeholder", range = "ask", src = "none; owner 2026-11-19 took the recommendation: 0 with a linear map until the thrust test" }
 

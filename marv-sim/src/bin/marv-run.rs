@@ -121,6 +121,13 @@ fn firmware_text() -> String {
 fn go(args: &Args) -> Result<(), String> {
     let join = |errs: Vec<String>| errs.join("\n");
     let card = Card::load(&args.card).map_err(join)?;
+    // The constants compiled into the flight code and the card the plant reads must be the same file.
+    if marv_card::CARD_SHA256 != card.sha256 {
+        return Err(format!(
+            "card {} (sha256 {}) is not the card compiled into the firmware constants (sha256 {}); rebuild",
+            args.card.display(), card.sha256, marv_card::CARD_SHA256
+        ));
+    }
     let env = Env::load(&args.env).map_err(join)?;
     let scenario = Scenario::load(&args.scenario)?;
 

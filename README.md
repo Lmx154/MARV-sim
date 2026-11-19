@@ -14,6 +14,7 @@ step, which today holds stand-ins (no estimator, no controller, no allocator) an
 |---|---|
 | `marv-card/marv.toml` | The vehicle card: the only source of the vehicle's physical numbers. Every number is a record with a value, a unit, a tag (`measured`, `datasheet`, `cad`, `derived`, `placeholder`) and a source. |
 | `marv-card/src/` | The loader and the checks (`schema.rs`) and the `card-check` program. |
+| `marv-card/build.rs` | Compiles the card into `const` data for the firmware (`no_std`, without feature `std`): rotor positions and spins, the mixer matrix, coefficients, levels, mass, the card's sha256. `marv-run` refuses a card whose sha256 differs. An `"ask"` in a number the firmware needs fails the build; placeholders show as cargo warnings. |
 | `marv-sim/src/` | `plant.rs` (motor levels to a wrench), `backend.rs` (wrench to truth, RK4), `sensors.rs` (the IMU model), `rng.rs` (seeded noise), `scenario.rs`, `log.rs` (DataFlash), `math.rs`. |
 | `marv-sim/src/bin/marv-run.rs` | The runner. |
 | `marv-sim/tests/invariants.rs` | The three plant invariants. |

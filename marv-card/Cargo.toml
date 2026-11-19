@@ -6,6 +6,18 @@ rust-version = "1.99"
 publish = false
 license = "MIT"
 
+[features]
+# The loader, the checks and card-check; without it the crate is no_std and holds only the build.rs constants.
+std = ["dep:toml", "dep:sha2"]
+
 [dependencies]
+toml = { version = "0.9", optional = true }
+sha2 = { version = "0.10", optional = true }
+
+[build-dependencies]
 toml = "0.9"
 sha2 = "0.10"
+
+[[bin]]
+name = "card-check"
+required-features = ["std"]

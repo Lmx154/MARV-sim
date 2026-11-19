@@ -7,7 +7,7 @@ publish = false
 license = "MIT"
 
 [dependencies]
-marv-card = { path = "../marv-card" }
+marv-card = { path = "../marv-card", features = ["std"] }
 # The firmware by path: an edit to the flight code runs in the sim at once (build.rs records which commit).
 fw-flight = { path = "../../MARV-V2-firmware/crates/fw-flight" }
 fw-core = { path = "../../MARV-V2-firmware/crates/fw-core" }
