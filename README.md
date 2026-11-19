@@ -192,15 +192,25 @@ flipped 5.83; both accel signs flipped 2.89.
 
 ## The log
 
-The log is an ArduPilot DataFlash `.BIN`. It holds the firmware's records `MSG` (at time 0: sim version, firmware
-commit with `-dirty` if the checkout has uncommitted changes, card hash, scenario name, seed, and the spread point if
-one is used; a spread or matrix cell adds `cell`, `map`, `air` and `ground` lines with its name and axis values), `IMU` (instance 0 and 1: exactly what the flight step was given) and, for every flight step, `NAV`,
-`SETP`, `DMD` and `MOT` (written by the firmware's `encode_step`); and three sim-only records: `TRU` (truth:
-position, velocity, attitude quaternion, body rates), `ROT` (the levels the plant used and the true rotor speeds, by
-DShot line) and `RCS` (at every report time: the sticks, the switch, and `Lost` = 1 inside a lost interval). A
+The log is an ArduPilot DataFlash `.BIN`. Its header is the firmware's own (`fw_core::dflog::write_header`: the FMTs of
+all 18 firmware record types), followed by the FMTs of the sim-only records. It holds the firmware's records `MSG` (at
+time 0: sim version, firmware commit with `-dirty` if the checkout has uncommitted changes, card hash, scenario name,
+seed, and the spread point if one is used; a spread or matrix cell adds `cell`, `map`, `air` and `ground` lines with
+its name and axis values), `IMU` (instance 0 and 1: exactly what the flight step was given), `RCS` (the firmware's
+`encode_rcs`: one record for each stick report that reaches the flight step, with its own time, the sticks and the
+switch; none for a lost report) and, for every flight step, `NAV`, `SETP`, `DMD` and `MOT` (written by the firmware's
+`encode_step`); and two sim-only records: `TRU` (truth: position, velocity, attitude quaternion, body rates) and
+`ROT` (the levels the plant used and the true rotor speeds, by DShot line). The sim writes nothing for `ESC` (the
+firmware's id 143; its FMT is in the header): the pole count of the motors is not in the card or in `fw-core` or
+`fw-flight`. Every step is logged, no decimation. A
 phase-form scenario adds `GND` (every flight step: contact flag, normal force N, roll/pitch reaction torque) and `PIL`
 (every report: phase index, mode 0 zero / 1 ramp / 2 height / 3 descend, h_ref or v_ref, throttle stick, integrator,
-drift correction in roll and pitch after the cap, and its integral term before the cap); the script-form logs are unchanged.
+drift correction in roll and pitch after the cap, and its integral term before the cap); the script-form logs are
+unchanged. The sim-only ids are 200 (`TRU`), 201 (`ROT`), 203 (`GND`) and 204 (`PIL`), none in the firmware's 128 to
+145; 202 is free (it was the sim's own `RCS`).
+
+The sim does not model the boot: the runner sets the arming permit once, before the first flight step, in place of
+core 0 (the pre-arm rule is checked on the board).
 
 ## Check the plant
 

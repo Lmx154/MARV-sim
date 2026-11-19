@@ -201,8 +201,6 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
     let mut newest = (0, MotorCommand::STOP);
     let mut levels = [0u16; 4];
     let mut pending: Option<RcSample> = None;
-    let none = RcRow { t_us: 0, roll: 0.0, pitch: 0.0, yaw: 0.0, throttle: 0.0, arm: false };
-    let mut given = scenario.rc_script.first().copied().unwrap_or(none);
     let mut trace = Trace::default();
     let mut flight_steps = 0;
     let mut ran = 0;
@@ -230,12 +228,12 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             // Only the newest report reaches the next flight step, once.
             let lost = scenario.rc_lost.iter().any(|&(from, to)| now >= from && now < to);
             if !lost {
-                given = row;
+                let given = row;
                 let sticks = Sticks { roll: given.roll, pitch: given.pitch, throttle: given.throttle, yaw: given.yaw };
                 pending = Some(RcSample { sticks, arm: given.arm, t_us: now });
                 trace.rc_us.push(now);
+                log.rc(now, [given.roll, given.pitch, given.throttle, given.yaw], given.arm);
             }
-            log.rc(now, [given.roll, given.pitch, given.throttle, given.yaw], given.arm, lost);
         }
         let mut wrench = world.plant.step(levels, world.backend.truth(), world.wind_ned_ms, TICK_US);
         for d in scenario.disturbances.iter().filter(|d| now >= d.from_us && now < d.to_us) {
@@ -377,6 +375,10 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
     let ticks = (scenario.duration_s * 1e6 / TICK_US as f64).round() as u64;
     // The flight code with the compiled card and the default tuning, as on the board.
     let handshake: &'static Handshake = Box::leak(Box::new(Handshake::new()));
+    // The sim has no boot sequence and no core 0, so the runner plays core 0's part: it sets the arming permit once,
+    // before the first flight step (the board sets it after its boot, when IMU1 and the ESCs are healthy and nothing
+    // is running; the pre-arm rule is checked on the board, not here).
+    handshake.set_permit(true);
     let tuning = Tuning::DEFAULT;
     let flight = Flight::new(Mahony::new(&tuning), CascadedPid::new(&tuning), CardAllocator::new(), &tuning, handshake);
     let mut world = World { plant, backend, imu1, imu2, wind_ned_ms: wind };

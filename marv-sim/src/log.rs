@@ -1,7 +1,7 @@
-//! The sim's DataFlash log: the firmware's own records (header, MSG, IMU, and the flight step's NAV, SETP, DMD, MOT)
-//! through `fw_core::dflog` and `fw_flight::step::encode_step`, and the sim-only truth (TRU), rotor (ROT) and stick
-//! (RCS) records, written by hand with their FMT; for a phase-form scenario also the ground (GND) and pilot (PIL)
-//! records.
+//! The sim's DataFlash log: the firmware's own records (the 18-type header, MSG, IMU, RCS, and the flight step's NAV,
+//! SETP, DMD, MOT) through `fw_core::dflog` and `fw_flight::step::encode_step`, and the sim-only truth (TRU) and rotor
+//! (ROT) records, written by hand with their FMT; for a phase-form scenario also the ground (GND) and pilot (PIL)
+//! records. Ids 200 to 204 are sim-only (the firmware's are 128 to 145); 202 is unused.
 
 use crate::backend::Truth;
 use crate::pilot::Report;
@@ -12,7 +12,6 @@ use std::path::Path;
 
 const ID_TRU: u8 = 200;
 const ID_ROT: u8 = 201;
-const ID_RCS: u8 = 202;
 const ID_GND: u8 = 203;
 const ID_PIL: u8 = 204;
 
@@ -39,11 +38,6 @@ fn tru_def() -> RecordDef {
 
 fn rot_def() -> RecordDef {
     sim_def(ID_ROT, "ROT", "QHHHHffff", "TimeUS,L0,L1,L2,L3,W0,W1,W2,W3")
-}
-
-/// The sticks as the flight step was given them: one record per RC sample time (decision-first-pair-wiring A6).
-fn rcs_def() -> RecordDef {
-    sim_def(ID_RCS, "RCS", "QffffBB", "TimeUS,R,P,T,Y,Arm,Lost")
 }
 
 /// The ground contact at every flight step (phase-form scenarios only): the contact flag, the normal force N and the
@@ -117,13 +111,12 @@ pub struct Log {
 }
 
 impl Log {
-    /// The header: the firmware's 11 FMTs, the sim-only TRU and ROT, the four flight-step types, then RCS.
+    /// The header: the firmware's 18 FMTs (`write_header`), then the sim-only TRU and ROT.
     pub fn with_header() -> Log {
         let mut bytes = vec![0u8; dflog::HEADER_SEQUENCE_LEN];
         let n = dflog::write_header(&mut bytes);
         assert_eq!(n, dflog::HEADER_SEQUENCE_LEN);
-        let [nav, setp, dmd, mot] = dflog::FLIGHT_TYPES;
-        for def in [tru_def(), rot_def(), nav, setp, dmd, mot, rcs_def()] {
+        for def in [tru_def(), rot_def()] {
             let mut fmt = [0u8; 128];
             let n = dflog::fmt_record(&def, &mut fmt);
             assert!(n > 0, "FMT does not fit its buffer");
@@ -194,13 +187,12 @@ impl Log {
         self.counts.step += 1;
     }
 
-    /// Sticks in the order of the columns R, P, T, Y; `lost` = 1 inside a lost interval (the sticks are then the last
-    /// ones given).
-    pub fn rc(&mut self, t_us: u64, roll_pitch_throttle_yaw: [f32; 4], arm: bool, lost: bool) {
-        let mut fields = vec![Field::Q(t_us)];
-        fields.extend(roll_pitch_throttle_yaw.map(Field::F));
-        fields.extend([Field::B(u8::from(arm)), Field::B(u8::from(lost))]);
-        put(&mut self.bytes, &rcs_def(), &fields);
+    /// One stick report that reaches the flight step, in the order of the columns R, P, T, Y; `t_us` is the report's
+    /// own time. Written by the firmware's `encode_rcs`.
+    pub fn rc(&mut self, t_us: u64, roll_pitch_throttle_yaw: [f32; 4], arm: bool) {
+        let mut buf = [0u8; 128];
+        let n = dflog::encode_rcs(&mut buf, t_us, roll_pitch_throttle_yaw, arm);
+        self.append(&buf, n);
         self.counts.rcs += 1;
     }
 
