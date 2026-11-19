@@ -325,7 +325,7 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
         on_ground: false,
         reaction: Reaction::default(),
     };
-    let backend = NativeBackend::with_start(&plant_card, initial, scenario.start)?;
+    let backend = NativeBackend::with_start(&plant_card, initial, scenario.start)?.with_settle(scenario.settle_s);
     // The cell's fixed IMU1 bias replaces the card's vector; IMU2 and the flight code are untouched.
     let mut imu1_profile = card.imu1.clone();
     if let Some(b) = ground.imu1_gyro_bias_rads {

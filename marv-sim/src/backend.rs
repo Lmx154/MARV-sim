@@ -74,7 +74,42 @@ pub struct NativeBackend {
     inertia_inv: Mat3,
     truth: Truth,
     plane: bool,
+    /// The ground plane's roll and pitch (Z-Y-X), rad: level unless the vehicle starts on a sloped plane.
+    plane_roll_pitch: [f64; 2],
     touchdown: Option<Touchdown>,
+    /// How long a settle onto the ground plane takes after a touchdown, us; 0 holds the touchdown attitude.
+    settle_us: u64,
+    settle: Option<Settle>,
+}
+
+/// A settle in progress: from the touchdown attitude `from`, about the body axis `axis` by `angle` rad, at a constant
+/// rate, over `NativeBackend::settle_us`.
+#[derive(Debug, Clone, Copy)]
+struct Settle {
+    from: [f64; 4],
+    axis: Vec3,
+    angle: f64,
+    elapsed_us: u64,
+}
+
+/// Body to world for Z-Y-X roll, pitch, yaw (rad), `w >= 0`.
+fn quat_zyx(roll: f64, pitch: f64, yaw: f64) -> [f64; 4] {
+    let [roll, pitch, yaw] = [roll, pitch, yaw].map(|a| a * 0.5);
+    let qx = [roll.cos(), roll.sin(), 0.0, 0.0];
+    let qy = [pitch.cos(), 0.0, pitch.sin(), 0.0];
+    let qz = [yaw.cos(), 0.0, 0.0, yaw.sin()];
+    let q = quat_mul(qz, quat_mul(qy, qx));
+    let sign = if q[0] < 0.0 { -1.0 } else { 1.0 };
+    q.map(|x| sign * x)
+}
+
+/// `q * exp(axis * angle / 2)`, with `w >= 0`.
+fn rotate_body(q: [f64; 4], axis: Vec3, angle: f64) -> [f64; 4] {
+    let (s, c) = (0.5 * angle).sin_cos();
+    let r = quat_mul(q, [c, s * axis[0], s * axis[1], s * axis[2]]);
+    let len = quat_norm(r);
+    let sign = if r[0] < 0.0 { -1.0 } else { 1.0 };
+    r.map(|x| sign * x / len)
 }
 
 /// The integrated state as one flat array: position 0..3, velocity 3..6, quaternion 6..10, rates 10..13.
@@ -87,15 +122,11 @@ impl NativeBackend {
     }
 
     pub fn with_start(card: &Card, mut initial: Truth, start: Start) -> Result<Self, String> {
+        let mut plane_roll_pitch = [0.0; 2];
         if let Start::Ground { roll_pitch_rad, yaw_rad } = start {
             // Yaw, then pitch, then roll (conventions 7c): q = qz(yaw) * qy(pitch) * qx(roll).
-            let [roll, pitch, yaw] = [roll_pitch_rad[0], roll_pitch_rad[1], yaw_rad].map(|a| a * 0.5);
-            let qx = [roll.cos(), roll.sin(), 0.0, 0.0];
-            let qy = [pitch.cos(), 0.0, pitch.sin(), 0.0];
-            let qz = [yaw.cos(), 0.0, 0.0, yaw.sin()];
-            let q = quat_mul(qz, quat_mul(qy, qx));
-            let sign = if q[0] < 0.0 { -1.0 } else { 1.0 };
-            initial.attitude = q.map(|x| sign * x);
+            initial.attitude = quat_zyx(roll_pitch_rad[0], roll_pitch_rad[1], yaw_rad);
+            plane_roll_pitch = roll_pitch_rad;
             initial.position_m[2] = 0.0;
             initial.velocity_ms = [0.0; 3];
             initial.rates_rads = [0.0; 3];
@@ -114,13 +145,46 @@ impl NativeBackend {
             inertia_inv: mat_inv(&inertia),
             truth: initial,
             plane: start != Start::Air,
+            plane_roll_pitch,
             touchdown: None,
+            settle_us: 0,
+            settle: None,
         })
+    }
+
+    /// After a touchdown, settle onto the ground plane over `seconds` (take-off decision, Amendment B6): from the tick
+    /// after the touchdown the attitude turns at a constant body rate, shown in truth, from the touchdown attitude to
+    /// the plane's roll and pitch with the touchdown's yaw. 0 (the default) holds the touchdown attitude.
+    pub fn with_settle(mut self, seconds: f64) -> Self {
+        self.settle_us = (seconds * 1e6).round() as u64;
+        self
     }
 
     /// The most recent touchdown, if any: the state before its hold.
     pub fn touchdown(&self) -> Option<&Touchdown> {
         self.touchdown.as_ref()
+    }
+
+    /// The settle that takes `q` to the ground plane with its yaw kept; `None` without a settle time or when already
+    /// there.
+    fn settle_from(&self, q: [f64; 4]) -> Option<Settle> {
+        if self.settle_us == 0 {
+            return None;
+        }
+        let [w, x, y, z] = q;
+        let yaw = (2.0 * (w * z + x * y)).atan2(1.0 - 2.0 * (y * y + z * z));
+        let target = quat_zyx(self.plane_roll_pitch[0], self.plane_roll_pitch[1], yaw);
+        // delta = q^-1 * target, in the body frame; its axis is fixed, so a constant body rate gets there.
+        let mut d = quat_mul([w, -x, -y, -z], target);
+        if d[0] < 0.0 {
+            d = d.map(|v| -v);
+        }
+        let s = (d[1] * d[1] + d[2] * d[2] + d[3] * d[3]).sqrt();
+        if s == 0.0 {
+            return None;
+        }
+        let angle = 2.0 * s.atan2(d[0]);
+        Some(Settle { from: q, axis: [d[1] / s, d[2] / s, d[3] / s], angle, elapsed_us: 0 })
     }
 
     /// `J^-1 * (tau - w x (J w))`
@@ -185,9 +249,23 @@ impl Backend for NativeBackend {
                 self.truth.accel_ms2 = [0.0; 3];
                 self.truth.ang_accel_rads2 = [0.0; 3];
                 self.truth.reaction = hold_reaction(force_ned, wrench);
+                if let Some(mut st) = self.settle {
+                    // Settling: the centre of mass stays put, the attitude turns at the constant rate.
+                    st.elapsed_us = (st.elapsed_us + dt_us).min(self.settle_us);
+                    let fraction = st.elapsed_us as f64 / self.settle_us as f64;
+                    self.truth.attitude = rotate_body(st.from, st.axis, st.angle * fraction);
+                    if st.elapsed_us < self.settle_us {
+                        let rate = st.angle / (self.settle_us as f64 * 1e-6);
+                        self.truth.rates_rads = st.axis.map(|a| a * rate);
+                        self.settle = Some(st);
+                    } else {
+                        self.settle = None;
+                    }
+                }
                 return &self.truth;
             }
-            // AIR again: this tick integrates normally.
+            // AIR again: this tick integrates normally, from the state shown (a settle stops where it is).
+            self.settle = None;
             self.truth.on_ground = false;
             self.truth.reaction = Reaction::default();
         }
@@ -226,6 +304,7 @@ impl Backend for NativeBackend {
                 rates_rads: rates,
             });
             let force_ned = mat_vec(&rot, wrench.force_n);
+            self.settle = self.settle_from(q);
             self.truth = Truth {
                 t_us: self.truth.t_us + dt_us,
                 position_m: [n[0], n[1], 0.0],

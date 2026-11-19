@@ -30,6 +30,9 @@ pub struct PilotView {
     /// Contact at any tick since the last report, or now (decision Amendment B1: a human sees a touchdown that a
     /// 4 ms sample of a 125 us contact would miss).
     pub touched: bool,
+    /// Truth heading (yaw about down), rad: where the nose points, as a human sees it. The pilot uses it only to keep
+    /// its drift trim fixed to the ground across a turn (decision, approval of Amendment B).
+    pub heading_rad: f64,
 }
 
 impl PilotView {
@@ -44,6 +47,7 @@ impl PilotView {
             v_heading_ms: [vn * yaw.cos() + ve * yaw.sin(), -vn * yaw.sin() + ve * yaw.cos()],
             on_ground: truth.on_ground,
             touched: touched_since || truth.on_ground,
+            heading_rad: yaw,
         }
     }
 }
@@ -114,8 +118,11 @@ pub struct Pilot {
     sticks: [f64; 4],
     integrator: f64,
     /// The drift integral: the integral of the seen velocity, right and forward, m. It runs only in xy = "hold"
-    /// phases and is kept (frozen) through the others, so the trim against a steady wind survives fwd and back.
+    /// phases and is kept (frozen) through the others, so the trim against a steady wind survives fwd and back. It
+    /// is kept fixed to the ground: every report turns it by the heading change since the previous report.
     xy_int: [f64; 2],
+    /// The heading of the view the previous report acted on.
+    last_heading: Option<f64>,
     /// The thrust ratio commanded at the first report whose delayed view shows contact = false.
     c_lift: Option<f64>,
     /// The thrust ratio the stick stood for at the ramp-to-height switch.
@@ -150,6 +157,7 @@ impl Pilot {
             sticks: [0.0; 4],
             integrator: 0.0,
             xy_int: [0.0; 2],
+            last_heading: None,
             c_lift: None,
             switch_ratio: None,
             timeline,
@@ -253,6 +261,12 @@ impl Pilot {
         };
         // Drift (Amendment B2): tilt_cmd = -(xy_k v + xy_ki * integral of v) / g, capped in length; the integral
         // is frozen while the cap is reached.
+        // A ground-fixed vector seen in the heading frame turns by -d when the heading turns by d.
+        let d = self.last_heading.map_or(0.0, |h| v.heading_rad - h);
+        self.last_heading = Some(v.heading_rad);
+        let [right, fwd] = self.xy_int;
+        let (sd, cd) = d.sin_cos();
+        self.xy_int = [-fwd * sd + right * cd, fwd * cd + right * sd];
         let k = self.gravity * ANGLE_MAX_RAD;
         let xy_trim = self.xy_int.map(|i| -self.p.xy_ki * i / k);
         let xy = if ph.xy_hold {

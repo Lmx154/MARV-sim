@@ -59,7 +59,11 @@ The native backend has an optional ground plane at down = 0 for the centre of ma
 angular accel are 0, so the IMU model reads gravity only. The vehicle lifts off at the start of a tick when the applied
 force in NED (weight included) points up, and that tick integrates normally. It touches down at the end of a tick with
 down >= 0: the velocity, tilt and rates from before the hold go to `NativeBackend::touchdown()`, then down, velocity and
-rates are set to 0 and the attitude is kept. `Truth` carries `on_ground` and `reaction` (normal force, horizontal force,
+rates are set to 0 and the attitude is kept for that tick. With a settle time (`with_settle`; `[initial] settle_s`,
+0.08 s in `takeoff-land`, decision Amendment B6) the vehicle then turns at a constant body rate, shown in truth so the
+gyro sees it, from the touchdown attitude to the ground plane's roll and pitch with its yaw kept; the centre of mass
+stays put and accel is 0. A lift-off during the settle ends it where it is and integrates from the state shown.
+`Truth` carries `on_ground` and `reaction` (normal force, horizontal force,
 roll/pitch torque: minus the applied wrench). No friction, spring or pivot. `[initial] contact = "ground"` starts a
 scenario held on it.
 
@@ -108,7 +112,8 @@ ended.
 
 The pilot (`pilot.rs`) is a test device in the harness, NOT flight code: the flight code has no height hold, so the
 harness flies the throttle as a human would by eye. It is given only a `PilotView` (truth height, vertical speed,
-horizontal velocity in the heading frame, contact flag, and contact at any tick since the last report) delayed by
+horizontal velocity in the heading frame, contact flag, contact at any tick since the last report, and heading)
+delayed by
 `delay_s`, and makes one stick report per 4 ms
 through the RC path. It never sees the estimate, the allocator flags, the spread point or the level-to-speed map, and
 never arms or disarms. Throttle: "zero" moves the stick to 0; "ramp" raises the throttle STICK from 0 at
@@ -120,16 +125,17 @@ smoothing (decision Amendment A1). The ratio becomes a stick by the inverse of t
 1 -> min(`stick_thrust_max_g`, 4 k_F w_max^2 / m g) x m g, computed from the nominal card (2.0: one straight line, as
 the flight code's cap `pilot_thrust_max_g`; another value gives the two-slope map). Drift:
 roll and pitch sticks `-(xy_k v_h + xy_ki * integral of v_h) / g / ANGLE_MAX` (30 deg), at most `xy_stick_max` in
-length; the integral runs only in xy = "hold" phases, is kept through the others and is frozen while the cap is
-reached (Amendment B2; `xy_ki` provisional). Every stick moves at most
+length; the integral is kept fixed to the ground (turned by the heading change at every report, so the wind trim
+survives a turn), runs only in xy = "hold" phases, is kept through the others and is frozen while the cap is
+reached (Amendment B2). Every stick moves at most
 `stick_rate_per_s` and stays in its range.
 
 `check = "takeoff_land"` judges the table of the decision's section 3: Stop before switch-on, armed within 6.5 ms, idle
 level exactly through "idle", the stance margin `tau_xy / (N r_stance)` while armed in contact with N above the floor,
 the tilt for 1 s after lift-off (first tick off the ground), no contact between lift-off and the first rise through
 `airborne_m` (`liftoff_recontacts`), a single flight (one rise, never above `airborne_m` after the touchdown; backend
-touchdowns, hops below `airborne_m` included, are printed), the peak height and climb speed from lift-off to touchdown
-(provisional limits), the time from the touchdown until N >= 0.5 m g for good (`light_after_td_s`), no timeout, the height band, the
+touchdowns, hops below `airborne_m` included, are printed), the peak height and climb speed from lift-off to touchdown,
+the time from the touchdown until N >= 0.5 m g for good (`light_after_td_s`), no timeout, the height band, the
 largest tilt in the air, horizontal speed, the angle between estimated and true down, no allocator flag from lift-off
 to touchdown, the touchdown state before the hold (vertical and horizontal speed, tilt, rate; the worst over every
 contact), idle level after the

@@ -25,6 +25,9 @@ pub struct Scenario {
     pub rotors: Rotors,
     /// `[initial] contact`: `Start::Air` ("air", the default) or `Start::Ground` ("ground").
     pub start: Start,
+    /// `[initial] settle_s` (ground contact only, required there): the settle onto the ground plane after a touchdown,
+    /// s (take-off decision, Amendment B6); 0 in the air form.
+    pub settle_s: f64,
     /// The stick script, by time; each row holds until the next. The first row is at 0. Empty in the phase form.
     pub rc_script: Vec<RcRow>,
     /// `[rc] phase`: each phase starts when the previous one ends. Empty in the script form.
@@ -604,7 +607,7 @@ impl Scenario {
             Some(_) => return Err("initial.contact: must be \"air\" or \"ground\"".to_string()),
         };
         let i = if ground {
-            table(&root, "initial", &["contact", "ground_roll_pitch_deg", "yaw_deg", "rotors"])?
+            table(&root, "initial", &["contact", "ground_roll_pitch_deg", "yaw_deg", "rotors", "settle_s"])?
         } else {
             table(
                 &root,
@@ -651,6 +654,15 @@ impl Scenario {
             let to_us = if row.contains_key("to_s") { micros(row, &name, "to_s")? } else { u64::MAX };
             disturbances.push(Disturbance { from_us: micros(row, &name, "from_s")?, to_us, torque_nm: vec3(row, &name, "torque_nm")? });
         }
+        let settle_s = if ground {
+            let x = scalar(i, "initial", "settle_s")?;
+            if x < 0.0 {
+                return Err("initial.settle_s: must be >= 0".to_string());
+            }
+            x
+        } else {
+            0.0
+        };
         let (position_ned_m, velocity_ned_ms, attitude, rates_rads, start) = if ground {
             let bad = || "initial.ground_roll_pitch_deg: must be two numbers".to_string();
             let a = get(i, "initial", "ground_roll_pitch_deg")?.as_array().ok_or_else(bad)?;
@@ -677,6 +689,7 @@ impl Scenario {
             rates_rads,
             rotors,
             start,
+            settle_s,
             rc_script,
             phases,
             pilot,

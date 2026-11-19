@@ -10,6 +10,9 @@ contact = "ground"                # "air" (default; the four old scenarios uncha
 ground_roll_pitch_deg = [0.0, 0.0]  # the ground plane; the matrix overrides it (slope)
 yaw_deg = 0.0
 rotors = "stopped"
+settle_s = 0.08                   # after a touchdown, settle onto the ground plane in 0.08 s (Amendment B6, owner
+                                  # 2026-11-19): a free pivot onto its feet takes 4 deg in about 0.08 s (I_edge
+                                  # 0.00627 kg.m^2, alpha = 7.342 x 0.020 / 0.00627 = 23 rad/s^2)
 
 [pilot]                           # the test device; every number section 10, approved
 delay_s = 0.20
@@ -24,7 +27,7 @@ v_up_ms = 0.5
 v_dn_ms = 0.5
 xy_k = 1.0                        # 1/s
 xy_stick_max = 0.25               # 7.5 deg
-xy_ki = 0.25                      # 1/s^2, drift integral (Amendment B2): PROVISIONAL until the owner approves it
+xy_ki = 0.25                      # 1/s^2, drift integral (Amendment B2; owner 2026-11-19)
 stick_thrust_max_g = 2.0          # the documented stick map's top point (flight code's cap, rulings Amendment C)
 
 [rc]                              # phases instead of a timed script; each starts when the last ends
@@ -51,8 +54,8 @@ arm_bound_s = 0.0065              # armed_on_ground: first non-Stop after switch
 r_stance_m = 0.020                # stance_margin: bottom-plate screw heads, abs(y) <= 20.0 mm
 stance_floor_weight = 0.5         # stance_margin: judged while N >= 0.5 m g
 max_stance_ratio = 1.0            # stance_margin: tau_xy / (N r_stance)
-max_peak_height_m = 2.5           # peak_height_m, lift-off to touchdown (Amendment B4): PROVISIONAL, owner to approve
-max_peak_climb_ms = 1.5           # peak_climb_ms, lift-off to touchdown (Amendment B4): PROVISIONAL, owner to approve
+max_peak_height_m = 2.5           # peak_height_m, lift-off to touchdown (Amendment B4; owner 2026-11-19)
+max_peak_climb_ms = 1.5           # peak_climb_ms, lift-off to touchdown (Amendment B4; owner 2026-11-19)
 max_light_after_td_s = 0.6        # light_after_td_s: first touchdown until N >= 0.5 m g for good (Amendment A3(b))
 liftoff_window_s = 1.0            # liftoff_tilt: over [lift-off, + 1 s]
 max_liftoff_tilt_deg = 6.0        # liftoff_tilt: the hover disturbance peak
@@ -62,7 +65,8 @@ max_speed_h_ms = 0.5              # speed_h: in hover, yaw, steady, descend, lan
 max_nav_gap_deg = 5.0             # nav_gap: 1.15 + 1.60 + 1.88 = 4.63 deg, below
 max_td_vz_ms = 0.5                # td_vz
 max_td_vh_ms = 0.3                # td_vh
-max_td_tilt_deg = 5.0             # td_tilt
+max_td_tilt_deg = 8.0             # td_tilt: the 6.33 deg lean needed to hold position in the matrix's 2 m/s wind at
+                                  # the upper drag, plus margin; owner 2026-11-19 (was 5)
 max_td_rate_dps = 20.0            # td_rate
 idle_after_s = 0.010              # idle_after: from stick at 0 + 0.010 s to switch-off
 stop_bound_s = 0.0065             # stop_after: within 0.0065 s of switch-off and after
