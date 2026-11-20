@@ -6,7 +6,7 @@
     <link name="body">
       <inertial>
         <pose>0 0 0 0 0 0</pose>
-        <mass>0.74872</mass>
+        <mass>0.914</mass>
         <inertia><ixx>0.005154679857046977</ixx><ixy>-2.4833027020082455e-07</ixy><ixz>-3.7419240430837696e-05</ixz><iyy>0.004953419958023371</iyy><iyz>-5.230716206177631e-08</iyz><izz>0.009219341614679171</izz></inertia>
       </inertial>
       <visual name="frame_carbon">
