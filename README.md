@@ -159,7 +159,7 @@ missing axis has one default value that changes nothing; a missing `seeds` means
 
 | axis | key | values |
 |---|---|---|
-| map | `speed_at_level_min` (plant only) | A: card (0); B: 128.9 rad/s |
+| map | `speed_at_level_min` (plant only) | A: card (94.8); B: 128.9 rad/s |
 | air | `drag` N/(m/s), `wind_ned` m/s | 1: drag 0, calm; 2: drag 0.407, calm; 3: drag 0.407, wind [0, 2, 0] |
 | ground | `imu1_gyro_bias_rads`, `imu1_accel_bias_ms2`, `roll_pitch_deg` | 1: level; 2: IMU1 bias corner; 3: 5 deg roll slope |
 
