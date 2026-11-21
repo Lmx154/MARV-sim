@@ -8,6 +8,7 @@ pub mod log;
 pub mod math;
 pub mod pilot;
 pub mod plant;
+pub mod replay;
 pub mod rng;
 pub mod scenario;
 pub mod sensors;

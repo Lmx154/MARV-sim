@@ -260,6 +260,24 @@ unchanged. The sim-only ids are 200 (`TRU`), 201 (`ROT`), 203 (`GND`) and 204 (`
 The sim does not model the boot: the runner sets the arming permit once, before the first flight step, in place of
 core 0 (the pre-arm rule is checked on the board).
 
+## Replay a flown log
+
+`marv-replay` feeds a flight log written by the board (a `.BIN`, self-describing by its FMT records) through the
+flight code's own estimators (`Mahony`, `MahonyBaro`, `Eskf`, all `Tuning::DEFAULT`; one line each in `table()` of
+`marv-sim/src/bin/marv-replay.rs`) and checks them against the log's own NAV and NKF1 records. The log reader and the
+rebuilding of the `Sensors` stream are in `marv-sim/src/replay.rs`.
+
+    cargo run -q --release -p marv-sim --bin marv-replay -- <log.BIN> <outdir> [--every N] [--imu-period-us US] \
+        [--mag-expected UT,INC_DEG,STR_PCT,TOL_DEG]
+
+One step per logged IMU1 sample; the board logs only every 8th sample while disarmed, so in those gaps the last logged
+sample is repeated at the nominal IMU period (the real and filled step counts are printed). The armed state is
+`MOT.Arm`; the compass's expected field comes from the log's `PARM` records (the `--mag-expected` option is only for
+a log without `MAG_CAL_TYPE`). GNSS epochs are rebuilt from GPS, GPA and GPV (GPA keeps only sqrt(lat^2+lon^2), which
+is split equally into the latitude and longitude deviation). It writes one CSV per estimator (a row every N-th step,
+default 8), prints the final `EskfStats` and a validation table per armed interval. A log holds GPS coordinates: write
+the CSVs outside the repo and do not commit them.
+
 ## Check the plant
 
     cargo test -p marv-sim
