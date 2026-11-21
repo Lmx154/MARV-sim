@@ -635,6 +635,8 @@ struct Steer {
     /// steps that both spin.
     dm2: f64,
     dm_n: u64,
+    /// Every valid step's time and tilt error (rad), for the per-touchdown figures.
+    hist: Vec<(u64, f64)>,
 }
 
 impl Steer {
@@ -643,6 +645,7 @@ impl Steer {
             let e = tilt_err(out.nav.attitude.map(f64::from), truth.attitude);
             let t0 = *self.t0.get_or_insert(out.t_us);
             let k = usize::from(out.t_us >= t0 + 5_000_000);
+            self.hist.push((out.t_us, e));
             let t = &mut self.tilt[k];
             *t = (t.0 + 1, t.1 + e * e, t.2.max(e));
         }
@@ -1033,7 +1036,23 @@ every row's time is scenario time (the flight code's clock was scenario time + {
             && same3(ground.imu1_accel_bias_ms2, card.imu1.accel_bias.v)
             && ground.roll_pitch_deg.is_none_or(|rp| rp == [0.0, 0.0]);
     }
-    let (checks, notes) = judge(&scenario.verdict, &trace);
+    let (checks, mut notes) = judge(&scenario.verdict, &trace);
+    if let Some(st) = &steer {
+        // One note per backend touchdown (the verdict's touchdown is the first after its first rise through
+        // airborne_m: verdict.rs takeoff_land, t_td; the INFO note names it): the truth state before the hold
+        // (backend.rs Touchdown) and the steering estimator's tilt error over the 2 s before it.
+        for d in &trace.touchdowns {
+            let w: Vec<f64> = st.hist.iter().filter(|(t, _)| *t <= d.t_us && *t + 2_000_000 > d.t_us).map(|h| h.1).collect();
+            let deg = f64::to_degrees;
+            notes.push(format!(
+                "TD t_s {:.4} tilt_err_max_2s_deg {:.4} tilt_err_mean_2s_deg {:.4} n {} truth_rate_dps {:.3} truth_tilt_deg {:.3} \
+vh_ms {:.4} vz_ms {:.4}",
+                d.t_us as f64 * 1e-6, deg(w.iter().copied().fold(0.0, f64::max)),
+                deg(w.iter().sum::<f64>() / w.len().max(1) as f64), w.len(),
+                deg(d.rates_rads.iter().map(|r| r * r).sum::<f64>().sqrt()), deg(d.tilt_rad),
+                d.velocity_ms[0].hypot(d.velocity_ms[1]), d.velocity_ms[2]));
+        }
+    }
     let kept = keep || checks.iter().any(|c| !c.pass);
     if kept {
         log.write(out)?;
