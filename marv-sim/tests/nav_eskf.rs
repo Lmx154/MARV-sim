@@ -62,6 +62,9 @@ struct Score {
     hdg_worst_deg: f64,
     ne_valid_s: f64,
     ne_out3: u64,
+    /// R3 (lead, 2026-11-21, reported only): steps outside 3 sigma with the position error taken against truth plus the
+    /// GNSS model's own slow (Gauss-Markov) error, the principle approved for the barometer's drift.
+    ne_out3_slow: u64,
     ne_steps: u64,
     ne_pmax: f64,
     aligned_before_takeoff: bool,
@@ -241,6 +244,13 @@ fn fly(card: &Card, env: &Env, t: &Tuning, edit: MagEdit) -> Score {
             s.ne_valid_s += step_s;
             s.ne_steps += 1;
             s.ne_out3 += u64::from(out);
+            // The slow error of the fix fused at this horizon: the model's state now (the fix of this horizon is made now,
+            // and the error's time constant is 60 s against the 0.43 s delay).
+            let slow_e = slow.gnss.slow_m();
+            let pe_slow = [pe[0] - slow_e[0], pe[1] - slow_e[1]];
+            s.ne_out3_slow += u64::from(
+                (0..2).any(|i| pe_slow[i].abs() > SIGMAS * f64::from(sig[6 + i]) || ve[i].abs() > SIGMAS * f64::from(sig[3 + i])),
+            );
             s.ne_pmax = s.ne_pmax.max(pe[0].hypot(pe[1]));
         }
     }

@@ -364,8 +364,8 @@ struct EskfShadow {
     est: Eskf,
     armed: bool,
     sim_origin: Origin,
-    /// Truth of the recent steps: t_us, attitude, velocity, position.
-    hist: std::collections::VecDeque<(u64, [f64; 4], [f64; 3], [f64; 3])>,
+    /// Truth of the recent steps: t_us, attitude, velocity, position, contact since the previous step.
+    hist: std::collections::VecDeque<(u64, [f64; 4], [f64; 3], [f64; 3], bool)>,
     dt_s: f64,
     last_t: Option<u64>,
     // heading
@@ -390,12 +390,23 @@ struct EskfShadow {
     vd2: f64,
     vd_max: f64,
     vd_3sigma: u64,
+    /// The a2 rule's window (5 s after the initialisation to the first touchdown, both at the horizon): steps judged and
+    /// 3-sigma vD steps; airborne seen, landed.
+    pre_td_n: u64,
+    pre_td_v3: u64,
+    airborne: bool,
+    landed: bool,
     // tilt: Eskf (at the horizon) and Mahony (at the step) on the same steps
     t_n: u64,
     te2: f64,
     te_max: f64,
     tm2: f64,
     tm_max: f64,
+    /// Tilt alignment time, and the tilt sums split at 5 s after it: (n, Eskf^2, Mahony^2) for the first 5 s and after;
+    /// and the Eskf against the truth of the current step (not the horizon), for contrast.
+    t_align: Option<u64>,
+    split: [(u64, f64, f64); 2],
+    te_now2: f64,
 }
 
 impl EskfShadow {
@@ -408,26 +419,27 @@ impl EskfShadow {
         Ok(EskfShadow { est, armed: false, sim_origin: Origin::from_env(env)?, hist: Default::default(), dt_s: 0.0, last_t: None,
             h_valid_s: 0.0, h_bad_s: 0.0, h_first_s: None, h_worst: 0.0, ne_valid_s: 0.0, ne_out3_s: 0.0, ne_n: 0, ne_p2: 0.0,
             ne_pmax: 0.0, ne_vmax: 0.0, init: None, drift0: 0.0, v_n: 0, d2: 0.0, d_max: 0.0, d_max_nodrift: 0.0, vd2: 0.0,
-            vd_max: 0.0, vd_3sigma: 0, t_n: 0, te2: 0.0, te_max: 0.0, tm2: 0.0, tm_max: 0.0 })
+            vd_max: 0.0, vd_3sigma: 0, pre_td_n: 0, pre_td_v3: 0, airborne: false, landed: false, t_n: 0, te2: 0.0, te_max: 0.0,
+            tm2: 0.0, tm_max: 0.0, t_align: None, split: [(0, 0.0, 0.0); 2], te_now2: 0.0 })
     }
 }
 
 impl Slot for EskfShadow {
-    fn feed(&mut self, sensors: &Sensors, out: &StepOut, truth: &Truth, drift_m: f64, _ground: bool) {
+    fn feed(&mut self, sensors: &Sensors, out: &StepOut, truth: &Truth, drift_m: f64, ground: bool) {
         self.est.set_armed(self.armed);
         self.armed = out.armed;
         let r = &sensors.imu1.reading;
         if !r.gyro_rads.iter().chain(&r.accel_ms2).all(|v| v.is_finite()) {
             return;
         }
-        self.hist.push_back((truth.t_us, truth.attitude, truth.velocity_ms, truth.position_m));
+        self.hist.push_back((truth.t_us, truth.attitude, truth.velocity_ms, truth.position_m, ground));
         while self.hist.len() > 1_000 {
             self.hist.pop_front();
         }
         let nav = self.est.update(sensors);
         self.dt_s = self.last_t.map_or(0.0, |t| (nav.t_us.saturating_sub(t)) as f64 * 1e-6);
         self.last_t = Some(nav.t_us);
-        let Some(&(_, q, v, p)) = self.hist.iter().rev().find(|h| h.0 == nav.t_us) else { return };
+        let Some(&(_, q, v, p, h_ground)) = self.hist.iter().rev().find(|h| h.0 == nav.t_us) else { return };
         let dt = self.dt_s;
         let qe = nav.attitude.map(f64::from);
         let sig = self.est.sigmas();
@@ -438,6 +450,11 @@ impl Slot for EskfShadow {
             self.te_max = self.te_max.max(e);
             self.tm2 += m * m;
             self.tm_max = self.tm_max.max(m);
+            let t_al = *self.t_align.get_or_insert(nav.t_us);
+            let k = usize::from(nav.t_us >= t_al + 5_000_000);
+            self.split[k] = (self.split[k].0 + 1, self.split[k].1 + e * e, self.split[k].2 + m * m);
+            let now = tilt_err(qe, truth.attitude);
+            self.te_now2 += now * now;
         }
         if nav.valid.heading {
             let e = wrap_pi(yaw_of(qe) - yaw_of(q)).abs();
@@ -477,6 +494,12 @@ impl Slot for EskfShadow {
         self.vd2 += ev * ev;
         self.vd_max = self.vd_max.max(ev.abs());
         self.vd_3sigma += u64::from(ev.abs() > 3.0 * f64::from(sig[5]));
+        self.airborne |= !h_ground;
+        self.landed |= self.airborne && h_ground;
+        if !self.landed {
+            self.pre_td_n += 1;
+            self.pre_td_v3 += u64::from(ev.abs() > 3.0 * f64::from(sig[5]));
+        }
     }
 
     /// One line, `key value` pairs after `shadow eskf`.
@@ -487,13 +510,17 @@ impl Slot for EskfShadow {
         format!(
             "shadow eskf hdg_valid_s {:.2} hdg_bad15_s {:.2} hdg_first_s {} hdg_worst_deg {:.2} ne_valid_s {:.2} ne_out3_s {:.2} \
 ne_p_rms {:.3} ne_p_max {:.3} ne_v_max {:.3} init_s {} judged {} d_rms {:.4} d_max {:.4} d_max_nodrift {:.4} v_rms {:.4} v_max {:.4} \
-v_3sigma {} tilt_rms_deg {:.3} tilt_max_deg {:.3} mahony_tilt_rms_deg {:.3} mahony_tilt_max_deg {:.3} mag_refused {} \
+v_3sigma {} v_3sigma_pre_td {} v_3sigma_pre_td_judged {} tilt_rms_deg {:.3} tilt_max_deg {:.3} mahony_tilt_rms_deg {:.3} mahony_tilt_max_deg {:.3} tilt_rms_first5_deg {:.3} \
+mahony_tilt_rms_first5_deg {:.3} tilt_rms_after5_deg {:.3} mahony_tilt_rms_after5_deg {:.3} tilt_rms_vs_current_truth_deg {:.3} mag_refused {} \
 screens {} gated {} resets_height {} resets_yaw {} resets_gps {} reinits {} yaw_aligned {} multi_job {}",
             self.h_valid_s, self.h_bad_s, self.h_first_s.map_or("none".to_string(), |t| format!("{t:.3}")), d(self.h_worst),
             self.ne_valid_s, self.ne_out3_s, rms(self.ne_p2, self.ne_n), self.ne_pmax, self.ne_vmax,
             self.init.map_or("none".to_string(), |(t, _)| format!("{:.3}", t as f64 * 1e-6)), self.v_n, rms(self.d2, self.v_n),
-            self.d_max, self.d_max_nodrift, rms(self.vd2, self.v_n), self.vd_max, self.vd_3sigma, d(rms(self.te2, self.t_n)),
-            d(self.te_max), d(rms(self.tm2, self.t_n)), d(self.tm_max), s.mag_refused, s.gps_e1s + s.gps_e3b,
+            self.d_max, self.d_max_nodrift, rms(self.vd2, self.v_n), self.vd_max, self.vd_3sigma, self.pre_td_v3, self.pre_td_n,
+            d(rms(self.te2, self.t_n)), d(self.te_max), d(rms(self.tm2, self.t_n)), d(self.tm_max),
+            d(rms(self.split[0].1, self.split[0].0)), d(rms(self.split[0].2, self.split[0].0)),
+            d(rms(self.split[1].1, self.split[1].0)), d(rms(self.split[1].2, self.split[1].0)),
+            d(rms(self.te_now2, self.t_n)), s.mag_refused, s.gps_e1s + s.gps_e3b,
             s.baro_gated + s.mag_gated + s.gps_pos_gated + s.gps_vel_gated, s.height_resets, s.yaw_resets, s.gps_resets,
             s.reinits, self.est.yaw_aligned(), if s.max_jobs_per_step > 1 { "yes" } else { "no" }
         )
