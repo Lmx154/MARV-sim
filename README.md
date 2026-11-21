@@ -23,7 +23,7 @@ scenarios and a five-point parameter spread. `takeoff-land` takes off from the g
 | `marv-sim/src/bin/marv-run.rs` | The runner. |
 | `marv-sim/tests/invariants.rs` | The plant invariants and the ground contact. |
 | `marv-sim/tests/slow_sensors.rs` | The barometer, compass and GNSS models against their definitions. |
-| `scenarios/*.toml` | The four scenarios (`hover`, `steps`, `stick-sign`, `rc-loss`), `takeoff-land`, the spread (`spread.toml`) and the take-off and landing matrix (`takeoff-land-matrix.toml`). |
+| `scenarios/*.toml` | The four scenarios (`hover`, `steps`, `stick-sign`, `rc-loss`), `alt-hold` (Amendment F, F9), `takeoff-land`, the spread (`spread.toml`) and the take-off and landing matrix (`takeoff-land-matrix.toml`). |
 | `env/default.toml` | Gravity, atmosphere, origin, magnetic field, wind. Its origin is a public reference point, never home: the Royal Observatory, Greenwich (51.47783 N, 0.00139 W, 68 m), with the WMM2025 field there for 2026-11-20 (19.561, 0.434, 45.067 uT NED; declination 1.271 deg, inclination 66.532 deg). |
 | `env/home.local.toml` | The real home location, if you create it: records of `[origin]` and `[magnetic_field]` that replace the default's under `--home`. Git-ignored; never commit it. |
 
@@ -123,16 +123,18 @@ load. Times are seconds; each script row holds until the next.
     gnss_rate_hz = 5              # optional: 1, 5 or 10 (default 5)
     mag_expected = true           # optional: false leaves MagSample.expected None (default true)
     gnss_velocity = true          # optional: false leaves GnssReading.vel_ned_mm_s None (default true)
+    baro_lost = [[46.0, 51.5]]    # optional: no barometer sample reaches the flight code in [from, to) (the model keeps running)
     [initial]                     # position, velocity, roll_pitch_yaw_deg (Z-Y-X), rates, rotors = "hover" | "stopped"
     ...
     [rc]
     script = [ { t_s = 0.0, roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.0, arm = false }, ... ]
+                                  # a row may add mode = "low" (Angle, the default) | "middle" (Altitude) | "high" (Position, capped to Altitude): the channel-6 switch
     lost = [ { from_s = 3.0, to_s = 5.0 } ]          # optional: no report in [from, to)
     [[disturbance]]                                  # optional: body torque from from_s (to to_s if given)
     from_s = 5.0
     torque_nm = [0.046, 0.0, 0.0]
     [verdict]
-    check = "hover"                                  # "hover" | "steps" | "stick_sign" | "rc_loss"
+    check = "hover"                                  # "hover" | "steps" | "stick_sign" | "rc_loss" | "alt_hold"
     max_tilt_deg = 1.5                               # ... that check's thresholds, each with its decision section
 
 The four scenarios (all start level in the air with the rotors at hover speed; switch on at 0.020 s, throttle 0.5 at
@@ -146,6 +148,20 @@ The four scenarios (all start level in the air with the rotors at hover speed; s
   2 x weight cap); truth must move the conventions-7b way, with little movement on the other axes.
 - `rc-loss.toml`: arming rules, the RC-loss Stop within 2.5 ms of the 1.0 s timeout, no re-arm without a switch
   cycle, switch-off Stop; judged at the levels the plant is given.
+- `alt-hold.toml` (Amendment F, F9; run with `--estimator eskf2 --preroll 2.0`, the sim's flight step on the GPS-less
+  ESKF2): the same air start, mode middle at 3.0 s, the hover roll torque from 12 s, a climb stick (throttle 0.8) at
+  23-24 s, a descent stick (0.2) at 34-36 s, and `baro_lost = [[46.0, 51.5]]`; 56 s. Judged over [8, 23], [29, 34],
+  [41, 46] s: truth height against the target (SPN.PD) <= 0.5 m; estimate against truth with the barometer model's own
+  drift taken out <= 0.3 m (the raw figure is printed, not judged; the owner's ruling on a2); the effective mode never
+  Altitude on a step whose velocity_d or position_d flag is false (I6); the mode goes Angle -> Altitude at 3.0 s,
+  Altitude -> Angle within one step of the flags dropping (`nav_aid_timeout_us` after the last barometer aid) and back
+  to Altitude within one step of their return; every logged number finite; armed at the end. Printed, not judged: the
+  climb and descent heights, the truth height excursion in the Angle fallback, the thrust over weight around each mode
+  change, and a table every 2 s (with `--only`). It is in the spread (25 cells) and has no meaning on `--estimator mahony`
+  (no height: the mode stays Angle and the mode checks fail). Negative controls, not in the spread:
+  `scenarios/negative/alt-hold-switch-low.toml` (the switch never moved) and `marv-run --tuning-override psc_velz_i=0`
+  (also `psc_velz_p`, `psc_posz_p`); the verdict's I6 and mode-sequence checks are also shown to fail on synthetic traces
+  (`marv-sim/tests/althold_verdict.rs`).
 - `takeoff-land.toml`: starts on the ground, motors stopped; phases instead of a script (below).
 
 ## Phases and the sim pilot
@@ -220,7 +236,7 @@ nothing changes.
     cargo run -q --release -p marv-sim --bin marv-run -- --card marv-card/marv.toml --env env/default.toml \
         --spread scenarios/spread.toml --seed 1 --out-dir logs/spread
 
-Runs the four scenarios at the five points of `spread.toml` (nominal; k_F x0.7 or x1.3 with the inertia x1.25 or
+Runs the five scenarios (the four, and `alt-hold`) at the five points of `spread.toml` (nominal; k_F x0.7 or x1.3 with the inertia x1.25 or
 x0.75, each with both motor time constants 0.060 or 0.030 s). Only the plant and the backend take a point; the flight
 code keeps the compiled card.
 
@@ -265,13 +281,13 @@ flipped 5.83; both accel signs flipped 2.89.
 ## The log
 
 The log is an ArduPilot DataFlash `.BIN`. Its header is the firmware's own (`fw_core::dflog::write_header`: the FMTs of
-all 18 firmware record types), followed by the FMTs of the sim-only records. It holds the firmware's records `MSG` (at
+all 25 firmware record types), followed by the FMTs of the sim-only records. It holds the firmware's records `MSG` (at
 time 0: sim version, firmware commit with `-dirty` if the checkout has uncommitted changes, card hash, scenario name,
 seed, and the spread point if one is used; a spread or matrix cell adds `cell`, `map`, `air` and `ground` lines with
 its name and axis values), `IMU` (instance 0 and 1: exactly what the flight step was given), `RCS` (the firmware's
 `encode_rcs`: one record for each stick report that reaches the flight step, with its own time, the sticks and the
 switch; none for a lost report) and, for every flight step, `NAV`, `SETP`, `DMD` and `MOT` (written by the firmware's
-`encode_step`); and two sim-only records: `TRU` (truth: position, velocity, attitude quaternion, body rates) and
+`encode_step`), `MODE` (the selected and the effective mode: at the first logged step and at every change) and `SPN` (the altitude target, with the step block's cadence, only while the setpoint is Altitude), both as the board writes them; and two sim-only records: `TRU` (truth: position, velocity, attitude quaternion, body rates) and
 `ROT` (the levels the plant used and the true rotor speeds, by DShot line). The sim writes nothing for `ESC` (the
 firmware's id 143; its FMT is in the header): the pole count of the motors is not in the card or in `fw-core` or
 `fw-flight`. Every step is logged, no decimation. A

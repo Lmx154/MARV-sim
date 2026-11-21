@@ -334,11 +334,19 @@ pub fn alt_hold(verdict: &Verdict, trace: &Trace) -> (Vec<Check>, Vec<String>) {
     checks.push(Check { name: "alt_armed_at_end".into(), measured: armed.to_string(), limit: "=true".into(), pass: armed });
 
     let at = |t: Option<u64>| t.map_or(f64::NAN, secs);
+    let by_window: Vec<String> = windows
+        .iter()
+        .map(|&(a, b)| format!("[{a}, {b}] {:.4}", largest(window(trace, a, b).map(|s| (s.truth_pos[2] - s.target_d).abs()))))
+        .collect();
+    let above_mark = trace.steps.iter().filter(|s| s.mode == MODE_ALTITUDE && (s.truth_pos[2] - s.target_d).abs() > max_height_error_m);
+    let last_above = above_mark.filter(|s| windows.first().is_some_and(|w| s.t_us < us(w.1))).map(|s| s.t_us).max();
     let target_at = |s: f64| sample_at(trace, s).map_or(f64::NAN, |x| x.target_d);
     let truth_at = |s: f64| sample_at(trace, s).map_or(f64::NAN, |x| x.truth_pos[2]);
     let mut notes = vec![
         format!("INFO alt raw |nav D - truth D| over the windows {:.4} m (not judged; barometer drift taken out above)",
             largest(judged().map(|s| (s.nav_d - s.truth_pos[2]).abs()))),
+        format!("INFO alt |truth D - target D| by window: {} m; last step in Altitude above the mark before the first window's end: {:.4} s",
+            by_window.join(", "), last_above.map_or(f64::NAN, secs)),
         format!("INFO alt barometer-model drift: at the first barometer sample {:.4} m, largest since then over the windows {:.4} m",
             trace.baro_drift0_m, largest(judged().map(|s| (s.baro_drift_m - trace.baro_drift0_m).abs()))),
         format!("INFO alt climb: target rose {:.4} m over {climb_from_s}..{climb_to_s} s, truth rose {:.4} m (not judged)",
