@@ -275,7 +275,13 @@ vehicle is still in every scenario) and of vD (`v_rms`, `v_max`, m/s), `v_3sigma
 VertKf's sigmas), the final `bd` (earth-down accelerometer bias, m/s^2), the barometer samples `gated` out and
 `fused`, `resets`, `flags_lost` (judged steps without velocity_d or position_d), `identity_breaks` (steps whose
 attitude, rates or tilt/rates flags differ from the flight step's Mahony, bit for bit: invariant I9), and the largest
-errors and 3-sigma count before the first touchdown after lift-off (`*_pre_td`).
+errors and 3-sigma count before the first touchdown after lift-off (`*_pre_td`). Measurement columns for the owner
+(they judge nothing): `d_max_nodrift` (|D error| with the barometer model's drift since the initialisation taken out),
+`air_judged` and `v_3sigma_air` (judged airborne steps, airborne meaning `Truth::on_ground` false at every 125 us tick
+since the previous step, and their 3-sigma count), `air_v3_first_s`/`air_v3_last_s` (time of those since the last
+lift-off), `air_v3_ratio_max` (largest |vD error|/sigma), `air_v3_within_half_s`, `air_v3_within_2s`, `liftoffs`, and
+at the first touchdown after lift-off `td_s`, the D error there (`d_td`, `d_td_nodrift`) and 2 s later (`d_td2`,
+`d_td2_nodrift`).
 
 ## Not built yet
 

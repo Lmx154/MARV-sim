@@ -181,6 +181,28 @@ struct Shadow {
     airborne: bool,
     landed: bool,
     pre_td: (f64, f64, u64),
+    /// The barometer model's drift state at the initialisation, m, and the largest |D error| with the drift since then
+    /// taken out (the model's h = true height + drift, so D - truth = -(drift - drift0) + the filter's own error).
+    drift0: f64,
+    d_max_nodrift: f64,
+    /// Airborne = the plant's `Truth::on_ground` false at every 125 us tick since the previous step (a touchdown that
+    /// lifts off at the next tick shows). The step of the last lift-off (contact in the previous step's ticks, none in
+    /// this one's); before any, the run start. Lift-offs counted.
+    was_ground: Option<bool>,
+    liftoff_us: u64,
+    liftoffs: u64,
+    /// Judged airborne steps; of them, |vD error| above 3 sigma: count, first and last time since lift-off (s), the
+    /// largest |error|/sigma, and how many within 2 s of lift-off.
+    air_n: u64,
+    air_v3: u64,
+    air_v3_since: (f64, f64),
+    air_v3_ratio: f64,
+    air_v3_2s: u64,
+    air_v3_half_s: u64,
+    /// The first touchdown after lift-off: its step, and the D error (raw, drift taken out) there and 2 s later.
+    td_us: Option<u64>,
+    d_td: Option<(f64, f64)>,
+    d_td2: Option<(f64, f64)>,
     /// Steps whose attitude, rates or tilt/rates flags differ from the flight step's estimator, bit for bit (I9).
     identity_breaks: u64,
 }
@@ -191,11 +213,13 @@ const SHADOW_SETTLE_US: u64 = 5_000_000;
 impl Shadow {
     fn new(tuning: &Tuning) -> Shadow {
         Shadow { est: MahonyBaro::new(tuning), armed: false, init: None, n: 0, d2: 0.0, d_max: 0.0, v2: 0.0, v_max: 0.0,
-            v_3sigma: 0, flags_lost: 0, airborne: false, landed: false, pre_td: (0.0, 0.0, 0), identity_breaks: 0 }
+            v_3sigma: 0, flags_lost: 0, airborne: false, landed: false, pre_td: (0.0, 0.0, 0), drift0: 0.0, d_max_nodrift: 0.0,
+            was_ground: None, liftoff_us: 0, liftoffs: 0, air_n: 0, air_v3: 0, air_v3_since: (f64::NAN, f64::NAN), air_v3_ratio: 0.0,
+            air_v3_2s: 0, air_v3_half_s: 0, td_us: None, d_td: None, d_td2: None, identity_breaks: 0 }
     }
 
     /// After each flight step, as `Flight::step` runs its estimator (a non-finite IMU sample never reaches it).
-    fn feed(&mut self, sensors: &Sensors, out: &StepOut, truth: &Truth) {
+    fn feed(&mut self, sensors: &Sensors, out: &StepOut, truth: &Truth, drift_m: f64, ground: bool) {
         self.est.set_armed(self.armed);
         self.armed = out.armed;
         let r = &sensors.imu1.reading;
@@ -210,16 +234,42 @@ impl Shadow {
         self.identity_breaks += u64::from(!same);
         if self.init.is_none() && self.est.vert().initialised() {
             self.init = Some((nav.t_us, truth.position_m[2]));
+            self.drift0 = drift_m;
         }
+        if self.was_ground == Some(true) && !ground {
+            self.liftoff_us = nav.t_us;
+            self.liftoffs += 1;
+        }
+        self.was_ground = Some(ground);
         let Some((t0, d0)) = self.init else { return };
-        self.airborne |= !truth.on_ground;
-        self.landed |= self.airborne && truth.on_ground;
+        let ed = f64::from(nav.position_m[2]) - (truth.position_m[2] - d0);
+        let ed_nd = ed + (drift_m - self.drift0);
+        let ev = f64::from(nav.velocity_ms[2]) - truth.velocity_ms[2];
+        let sigma_v = nav.sigma.map_or(f64::INFINITY, |s| f64::from(s.velocity_d_ms));
+        self.airborne |= !ground;
+        if self.airborne && ground && !self.landed {
+            self.td_us = Some(nav.t_us);
+            self.d_td = Some((ed, ed_nd));
+        }
+        self.landed |= self.airborne && ground;
+        if self.d_td2.is_none() && self.td_us.is_some_and(|t| nav.t_us >= t + 2_000_000) {
+            self.d_td2 = Some((ed, ed_nd));
+        }
         if nav.t_us < t0 + SHADOW_SETTLE_US {
             return;
         }
-        let ed = f64::from(nav.position_m[2]) - (truth.position_m[2] - d0);
-        let ev = f64::from(nav.velocity_ms[2]) - truth.velocity_ms[2];
-        let sigma_v = nav.sigma.map_or(f64::INFINITY, |s| f64::from(s.velocity_d_ms));
+        self.d_max_nodrift = self.d_max_nodrift.max(ed_nd.abs());
+        if !ground {
+            self.air_n += 1;
+            if ev.abs() > 3.0 * sigma_v {
+                let since = (nav.t_us - self.liftoff_us) as f64 * 1e-6;
+                self.air_v3 += 1;
+                self.air_v3_since = (self.air_v3_since.0.min(since), self.air_v3_since.1.max(since));
+                self.air_v3_ratio = self.air_v3_ratio.max(ev.abs() / sigma_v);
+                self.air_v3_2s += u64::from(since < 2.0);
+                self.air_v3_half_s += u64::from(since < 0.5);
+            }
+        }
         self.n += 1;
         self.d2 += ed * ed;
         self.d_max = self.d_max.max(ed.abs());
@@ -239,11 +289,19 @@ impl Shadow {
         let n = self.n.max(1) as f64;
         format!(
             "shadow mahony-baro init_s {} judged {} d_rms {:.4} d_max {:.4} v_rms {:.4} v_max {:.4} v_3sigma {} bd {:.4} \
-gated {} fused {} resets {} flags_lost {} identity_breaks {} d_max_pre_td {:.4} v_max_pre_td {:.4} v_3sigma_pre_td {}",
+gated {} fused {} resets {} flags_lost {} identity_breaks {} d_max_pre_td {:.4} v_max_pre_td {:.4} v_3sigma_pre_td {} \
+d_max_nodrift {:.4} air_judged {} v_3sigma_air {} air_v3_first_s {:.3} air_v3_last_s {:.3} air_v3_ratio_max {:.2} \
+air_v3_within_2s {} air_v3_within_half_s {} liftoffs {} td_s {} d_td {} d_td_nodrift {} d_td2 {} d_td2_nodrift {}",
             self.init.map_or("none".to_string(), |(t, _)| format!("{:.3}", t as f64 * 1e-6)),
             self.n, (self.d2 / n).sqrt(), self.d_max, (self.v2 / n).sqrt(), self.v_max, self.v_3sigma, v.bias_d(),
             v.rejected(), v.fused(), v.resets(), self.flags_lost, self.identity_breaks, self.pre_td.0, self.pre_td.1,
-            self.pre_td.2
+            self.pre_td.2, self.d_max_nodrift, self.air_n, self.air_v3, self.air_v3_since.0, self.air_v3_since.1,
+            self.air_v3_ratio, self.air_v3_2s, self.air_v3_half_s, self.liftoffs,
+            self.td_us.map_or("none".to_string(), |t| format!("{:.3}", t as f64 * 1e-6)),
+            self.d_td.map_or("none".to_string(), |d| format!("{:.4}", d.0)),
+            self.d_td.map_or("none".to_string(), |d| format!("{:.4}", d.1)),
+            self.d_td2.map_or("none".to_string(), |d| format!("{:.4}", d.0)),
+            self.d_td2.map_or("none".to_string(), |d| format!("{:.4}", d.1))
         )
     }
 }
@@ -313,6 +371,8 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
     let mut ran = 0;
     // Contact at any tick since the last stick report: what the pilot's eye catches between reports (Amendment B1).
     let mut touched = false;
+    // Contact at any tick since the last flight step, for the shadow's airborne time.
+    let mut contact = false;
     for k in 0..ticks {
         let now = world.backend.truth().t_us;
         if k.is_multiple_of(ESC_TICKS) {
@@ -352,6 +412,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
         let truth = world.backend.step(&wrench, TICK_US).clone();
         ran += 1;
         touched |= truth.on_ground;
+        contact |= truth.on_ground;
         world.slow.tick(&truth);
         if truth.on_ground && !was_on_ground {
             trace.touchdowns.extend(world.backend.touchdown().copied());
@@ -365,9 +426,10 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             let (baro, mag, gnss) = world.slow.take();
             let sensors = Sensors { imu1: s1, imu2: Some(s2), baro, mag, gnss, external: None };
             let out = flight.step(&FlightInputs { sensors, rc: pending.take() });
+            let ground = std::mem::replace(&mut contact, false);
             newest = (out.t_us, out.motors);
             if let Some(sh) = shadow.as_deref_mut() {
-                sh.feed(&sensors, &out, &truth);
+                sh.feed(&sensors, &out, &truth, world.slow.baro.drift_m(), ground);
             }
             flight_steps += 1;
 
