@@ -13,7 +13,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 const HELP: &str = "\
-marv-replay <log.BIN> <outdir> [--every N] [--imu-period-us US] [--mag-expected UT,INC_DEG,STR_PCT,TOL_DEG] [--noaid-sigma M]
+marv-replay <log.BIN> <outdir> [--every N] [--imu-period-us US] [--mag-expected UT,INC_DEG,STR_PCT,TOL_DEG] [--noaid-sigma M] [--no-baro-from-armed N]
 
 Replays a flight log through the flight code's estimators (the real Rust code, Tuning::DEFAULT) and prints a
 validation table against the log's own NAV and NKF1 records. One CSV per estimator goes into <outdir>
@@ -88,12 +88,15 @@ struct Args {
     opts: StreamOpts,
     /// `--noaid-sigma`: replaces `Tuning::nav_noaid_sigma_m` (the armed no-aid position hold's sigma) in every estimator.
     noaid: Option<f32>,
+    /// `--no-baro-from-armed N`: from the N-th arming on, no barometer sample reaches any estimator.
+    no_baro_from_armed: Option<usize>,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut pos = Vec::new();
     let mut every = 8usize;
     let mut noaid = None;
+    let mut no_baro_from_armed = None;
     let mut opts = StreamOpts { imu_period_us: None, expected_cli: None };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -104,6 +107,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "--noaid-sigma" => {
                 noaid = Some(it.next().and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite() && *v > 0.0).ok_or("--noaid-sigma M")?)
+            }
+            "--no-baro-from-armed" => {
+                no_baro_from_armed = Some(it.next().and_then(|v| v.parse::<usize>().ok()).filter(|&v| v > 0).ok_or("--no-baro-from-armed N (N >= 1)")?)
             }
             "--every" => every = it.next().and_then(|v| v.parse().ok()).filter(|&v| v > 0).ok_or("--every N")?,
             "--imu-period-us" => {
@@ -123,7 +129,7 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     let [log, out]: [String; 2] = pos.try_into().map_err(|_| "usage: marv-replay <log.BIN> <outdir> [options]; --help")?;
-    Ok(Args { log: log.into(), out: out.into(), every, opts, noaid })
+    Ok(Args { log: log.into(), out: out.into(), every, opts, noaid, no_baro_from_armed })
 }
 
 fn bits(v: &Valid) -> [u8; 7] {
@@ -305,7 +311,29 @@ fn run() -> Result<(), String> {
     let log = Log::parse(&bytes)?;
     drop(bytes);
     std::fs::create_dir_all(&args.out).map_err(|e| format!("{}: {e}", args.out.display()))?;
-    let stream = build_stream(&log, &args.opts)?;
+    let mut stream = build_stream(&log, &args.opts)?;
+    if let Some(n) = args.no_baro_from_armed {
+        let (mut seen, mut prev, mut from) = (0usize, false, None);
+        for (k, s) in stream.steps.iter().enumerate() {
+            if s.armed && !prev {
+                seen += 1;
+                if seen == n {
+                    from = Some(k);
+                    break;
+                }
+            }
+            prev = s.armed;
+        }
+        let from = from.ok_or_else(|| format!("--no-baro-from-armed {n}: the log has only {seen} armings"))?;
+        let mut withheld = 0usize;
+        for s in &mut stream.steps[from..] {
+            withheld += usize::from(s.sensors.baro.take().is_some());
+        }
+        println!(
+            "barometer withheld from the arming {n} (step time {:.3} s) to the end: {withheld} samples not handed to any estimator",
+            stream.steps[from].sensors.imu1.t_us as f64 * 1e-6
+        );
+    }
 
     println!("log: {} bytes skipped between records: {}", args.log.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned()), log.bad_bytes);
     println!(
