@@ -13,7 +13,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 const HELP: &str = "\
-marv-replay <log.BIN> <outdir> [--every N] [--imu-period-us US] [--mag-expected UT,INC_DEG,STR_PCT,TOL_DEG] [--noaid-sigma M] [--no-baro-from-armed N]
+marv-replay <log.BIN> <outdir> [--every N] [--imu-period-us US] [--mag-expected UT,INC_DEG,STR_PCT,TOL_DEG] [--noaid-sigma M] [--no-baro-from-armed N] [--steering mahony-baro|eskf2]
 
 Replays a flight log through the flight code's estimators (the real Rust code, Tuning::DEFAULT) and prints a
 validation table against the log's own NAV and NKF1 records. One CSV per estimator goes into <outdir>
@@ -71,12 +71,13 @@ fn row(name: &'static str, armed_at: ArmedAt, est: Box<dyn Replayed>) -> Row {
 }
 
 /// The estimators to run: one line each.
-fn table(t: &Tuning) -> Vec<Row> {
+/// `steer_eskf2`: eskf2 steers (the state after the previous step, as `Flight::step` sets it); else it is a shadow.
+fn table(t: &Tuning, steer_eskf2: bool) -> Vec<Row> {
     vec![
         row("Mahony", ArmedAt::Before, Box::new(Mahony::new(t))),
         row("MahonyBaro", ArmedAt::Before, Box::new(MahonyBaro::new(t))),
         row("eskf1", ArmedAt::After, Box::new(Eskf::with_aiding(t, Aiding::Imu).expect("Tuning::DEFAULT is accepted"))),
-        row("eskf2", ArmedAt::After, Box::new(Eskf::with_aiding(t, Aiding::ImuBaro).expect("Tuning::DEFAULT is accepted"))),
+        row("eskf2", if steer_eskf2 { ArmedAt::Before } else { ArmedAt::After }, Box::new(Eskf::with_aiding(t, Aiding::ImuBaro).expect("Tuning::DEFAULT is accepted"))),
         row("eskf3", ArmedAt::After, Box::new(Eskf::new(t).expect("Tuning::DEFAULT is accepted"))),
     ]
 }
@@ -90,6 +91,8 @@ struct Args {
     noaid: Option<f32>,
     /// `--no-baro-from-armed N`: from the N-th arming on, no barometer sample reaches any estimator.
     no_baro_from_armed: Option<usize>,
+    /// `--steering mahony-baro|eskf2`: which estimator steered on the board (default: read from the log).
+    steering: Option<bool>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -97,6 +100,7 @@ fn parse_args() -> Result<Args, String> {
     let mut every = 8usize;
     let mut noaid = None;
     let mut no_baro_from_armed = None;
+    let mut steering = None;
     let mut opts = StreamOpts { imu_period_us: None, expected_cli: None };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -110,6 +114,13 @@ fn parse_args() -> Result<Args, String> {
             }
             "--no-baro-from-armed" => {
                 no_baro_from_armed = Some(it.next().and_then(|v| v.parse::<usize>().ok()).filter(|&v| v > 0).ok_or("--no-baro-from-armed N (N >= 1)")?)
+            }
+            "--steering" => {
+                steering = Some(match it.next().as_deref() {
+                    Some("eskf2") => true,
+                    Some("mahony-baro") => false,
+                    _ => return Err("--steering mahony-baro|eskf2".into()),
+                })
             }
             "--every" => every = it.next().and_then(|v| v.parse().ok()).filter(|&v| v > 0).ok_or("--every N")?,
             "--imu-period-us" => {
@@ -129,7 +140,7 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     let [log, out]: [String; 2] = pos.try_into().map_err(|_| "usage: marv-replay <log.BIN> <outdir> [options]; --help")?;
-    Ok(Args { log: log.into(), out: out.into(), every, opts, noaid, no_baro_from_armed })
+    Ok(Args { log: log.into(), out: out.into(), every, opts, noaid, no_baro_from_armed, steering })
 }
 
 fn bits(v: &Valid) -> [u8; 7] {
@@ -261,7 +272,7 @@ struct Comparison {
     samples: Vec<(u64, Vec<f64>)>,
 }
 
-fn report(c: &Comparison, iv: &[(u64, u64)]) -> String {
+fn report(c: &Comparison, iv: &[(u64, u64)], settle: bool) -> String {
     let mut out = format!("{}\n", c.title);
     let _ = write!(out, "  {:>3} {:>7} {:>7} {:>7}", "int", "from s", "to s", "window");
     let _ = write!(out, " {:>7}", "n");
@@ -270,7 +281,7 @@ fn report(c: &Comparison, iv: &[(u64, u64)]) -> String {
     }
     out.push('\n');
     for (k, &(t0, t1)) in iv.iter().enumerate() {
-        for (label, from) in [("whole", t0), ("+10s", t0 + SETTLE_US)] {
+        for (label, from) in [("whole", t0), ("+10s", t0 + SETTLE_US)].into_iter().take(if settle { 2 } else { 1 }) {
             let sel: Vec<&Vec<f64>> =
                 c.samples.iter().filter(|(t, _)| *t >= from && *t <= t1).map(|(_, d)| d).collect();
             let _ = write!(
@@ -369,7 +380,21 @@ fn run() -> Result<(), String> {
     }
     gnss_diagnostics(&stream, &tuning);
 
-    let mut rows = table(&tuning);
+    let (steer, why) = match args.steering {
+        Some(v) => (v, "given on the command line".to_string()),
+        None => {
+            let t = log.table("NKF2")?;
+            let (ci, cg) = (t.col("I")?, t.col("GBX")?);
+            let (mut n, mut nz) = (0usize, 0usize);
+            for k in (0..t.rows()).filter(|&k| t.u8(k, ci) == 0) {
+                n += 1;
+                nz += usize::from((0..3).any(|c| t.f32(k, cg + c) != 0.0));
+            }
+            (nz > 0, format!("read from the log: NKF2 I=0 has a non-zero gyro bias in {nz} of {n} records (MahonyBaro logs gyro bias 0)"))
+        }
+    };
+    println!("steering estimator: {} ({why})", if steer { "eskf2" } else { "mahony-baro" });
+    let mut rows = table(&tuning, steer);
     for r in &mut rows {
         r.nav.reserve(stream.steps.len());
     }
@@ -408,7 +433,7 @@ fn run() -> Result<(), String> {
     let cnq = nav_t.col("Q1")?;
     let quat = |t: &Table, r: usize, c: usize| [t.f32(r, c), t.f32(r, c + 1), t.f32(r, c + 2), t.f32(r, c + 3)];
 
-    for name in ["Mahony", "MahonyBaro"] {
+    for name in if steer { vec![] } else { vec!["Mahony", "MahonyBaro"] } {
         if let Some(r) = find(name) {
             let idx = by_time(&r.nav);
             let samples = (0..nav_t.rows())
@@ -422,12 +447,12 @@ fn run() -> Result<(), String> {
                 "{}",
                 report(
                     &Comparison { title: format!("{name} attitude vs logged NAV (same TimeUS)"), names: &["angle", "tilt", "yaw"], units: "deg; tilt: gravity direction in the body frame, yaw: the rest", samples },
-                    &iv
+                    &iv, true
                 )
             );
         }
     }
-    if let Some(r) = find("MahonyBaro") {
+    if let Some(r) = find("MahonyBaro").filter(|_| !steer) {
         let idx = by_time(&r.nav);
         let samples = (0..nkf.rows())
             .filter(|&k| nkf.u8(k, ci) == 0)
@@ -450,7 +475,7 @@ fn run() -> Result<(), String> {
                     units: "m, m/s",
                     samples,
                 },
-                &iv
+                &iv, true
             )
         );
     }
@@ -485,10 +510,201 @@ fn run() -> Result<(), String> {
                     units: "deg (att, tilt, yaw as above), m, m/s",
                     samples,
                 },
-                &iv
+                &iv, true
             )
         );
         println!("  NKF1 I=1 records inside an armed interval with no replayed NavState at their TimeUS: {unmatched}");
     }
+    steering_report(&log, &rows, &iv, steer)?;
+    log_figures(&log, &iv)?;
+    Ok(())
+}
+
+/// The steering estimator is the replayed eskf2: its output against the logged NAV, NKF1 I=0 and NKF2 I=0, per armed
+/// interval and over the 60 s before each arming (disarmed).
+fn steering_report(log: &Log, rows: &[Row], iv: &[(u64, u64)], steer: bool) -> Result<(), String> {
+    if !steer {
+        return Ok(());
+    }
+    let r = rows.iter().find(|r| r.name == "eskf2").ok_or("no eskf2 row")?;
+    let idx: HashMap<u64, usize> = r.nav.iter().enumerate().map(|(k, n)| (n.t_us, k)).collect();
+    let pre: Vec<(u64, u64)> = iv.iter().map(|&(a, _)| (a.saturating_sub(60_000_000), a.saturating_sub(1))).collect();
+    let nav_t = log.table("NAV")?;
+    let cnq = nav_t.col("Q1")?;
+    let att: Vec<(u64, Vec<f64>)> = (0..nav_t.rows())
+        .filter_map(|k| {
+            let t = nav_t.time(k);
+            let n = &r.nav[*idx.get(&t)?];
+            let q = [nav_t.f32(k, cnq), nav_t.f32(k, cnq + 1), nav_t.f32(k, cnq + 2), nav_t.f32(k, cnq + 3)];
+            Some((t, att_diff(n.attitude, q).to_vec()))
+        })
+        .collect();
+    let nkf1 = log.table("NKF1")?;
+    let (ci, cvn, cpn) = (nkf1.col("I")?, nkf1.col("VN")?, nkf1.col("PN")?);
+    let hv: Vec<(u64, Vec<f64>)> = (0..nkf1.rows())
+        .filter(|&k| nkf1.u8(k, ci) == 0)
+        .filter_map(|k| {
+            let t = nkf1.time(k);
+            let n = &r.nav[*idx.get(&t)?];
+            Some((t, vec![
+                f64::from(n.position_m[2]) - f64::from(nkf1.f32(k, cpn + 2)),
+                f64::from(n.velocity_ms[2]) - f64::from(nkf1.f32(k, cvn + 2)),
+            ]))
+        })
+        .collect();
+    let nkf2 = log.table("NKF2")?;
+    let (ci2, cg) = (nkf2.col("I")?, nkf2.col("GBX")?);
+    let bias: Vec<(u64, Vec<f64>)> = (0..nkf2.rows())
+        .filter(|&k| nkf2.u8(k, ci2) == 0)
+        .filter_map(|k| {
+            let t = nkf2.time(k);
+            let b = r.bias.get(*idx.get(&t)?)?;
+            Some((t, (0..6).map(|c| {
+                let d = f64::from(b[c]) - f64::from(nkf2.f32(k, cg + c));
+                if c < 3 { d.to_degrees() } else { d }
+            }).collect()))
+        })
+        .collect();
+    println!("\nSteering estimator = replayed eskf2 (armed state: after the previous step). Windows: armed intervals, and the 60 s before each arming (disarmed; the log keeps every 8th disarmed IMU sample, so the replay cannot match there exactly).");
+    for (title, names, units, samples) in [
+        ("eskf2 attitude vs logged NAV (same TimeUS)", &["angle", "tilt", "yaw"][..], "deg; angle = full attitude, tilt = body-frame down axes, yaw = the rest", att),
+        ("eskf2 D and VD vs logged NKF1 I=0", &["PD", "VD"][..], "m, m/s", hv),
+        ("eskf2 biases vs logged NKF2 I=0 (gyro bias x y z, accel bias x y z)", &["gbx", "gby", "gbz", "abx", "aby", "abz"][..], "deg/s, m/s^2", bias),
+    ] {
+        let c = Comparison { title: title.into(), names, units, samples };
+        println!("\n[armed intervals]");
+        print!("{}", report(&c, iv, true));
+        println!("[60 s disarmed before each arming]");
+        print!("{}", report(&c, &pre, false));
+    }
+    Ok(())
+}
+
+fn down_of(q: [f32; 4]) -> [f64; 3] {
+    let [w, x, y, z] = q.map(f64::from);
+    [2.0 * (x * z - w * y), 2.0 * (y * z + w * x), 1.0 - 2.0 * (x * x + y * y)]
+}
+
+/// Roll and pitch (deg) of a body-frame down vector.
+fn roll_pitch(d: [f64; 3]) -> (f64, f64) {
+    (d[1].atan2(d[2]).to_degrees(), (-d[0]).atan2(d[1].hypot(d[2])).to_degrees())
+}
+
+fn angle3(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let n = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    let c = ((a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (n(a) * n(b))).clamp(-1.0, 1.0);
+    c.acos().to_degrees()
+}
+
+/// Figures straight from the log: the arming edges, the record rates, the steering height against the pressure.
+fn log_figures(log: &Log, iv: &[(u64, u64)]) -> Result<(), String> {
+    let nav = log.table("NAV")?;
+    let cq = nav.col("Q1")?;
+    let imu = log.table("IMU")?;
+    let (cii, cax) = (imu.col("I")?, imu.col("AccX")?);
+    let nki = log.table("NKI")?;
+    let (cki, csrc, cok) = (nki.col("I")?, nki.col("Src")?, nki.col("Ok")?);
+    let nkf1 = log.table("NKF1")?;
+    let (c1i, cpn) = (nkf1.col("I")?, nkf1.col("PN")?);
+    println!("\nArming edges, from the log's own records (no replay). Tilt = roll / pitch in deg of the down axis.");
+    println!("  edge s      NAV 0.5 s before   NAV 0.5 s after    accel mean 1 s before   angle NAV-before vs accel   NAV-after vs accel   NAV before->after");
+    let us = 1_000_000u64;
+    for &(a, _) in iv {
+        let mut nb = ([0.0f64; 3], 0usize);
+        let mut na = ([0.0f64; 3], 0usize);
+        for k in 0..nav.rows() {
+            let t = nav.time(k);
+            let d = down_of([nav.f32(k, cq), nav.f32(k, cq + 1), nav.f32(k, cq + 2), nav.f32(k, cq + 3)]);
+            let tgt = if t + us / 2 >= a && t < a {
+                &mut nb
+            } else if t >= a && t < a + us / 2 {
+                &mut na
+            } else {
+                continue;
+            };
+            for c in 0..3 {
+                tgt.0[c] += d[c];
+            }
+            tgt.1 += 1;
+        }
+        let mut f = ([0.0f64; 3], 0usize);
+        for k in 0..imu.rows() {
+            let t = imu.time(k);
+            if imu.u8(k, cii) == 0 && t + us >= a && t < a {
+                for c in 0..3 {
+                    f.0[c] -= f64::from(imu.f32(k, cax + c));
+                }
+                f.1 += 1;
+            }
+        }
+        let fmt = |v: ([f64; 3], usize)| {
+            let (r, p) = roll_pitch(v.0);
+            format!("{r:+7.2} / {p:+7.2} (n={})", v.1)
+        };
+        println!(
+            "  {:>8.2}  {:<26} {:<26} {:<30} {:>8.2} {:>8.2} {:>8.2}",
+            a as f64 * 1e-6,
+            fmt(nb),
+            fmt(na),
+            fmt(f),
+            angle3(nb.0, f.0),
+            angle3(na.0, f.0),
+            angle3(nb.0, na.0)
+        );
+    }
+    println!("\nNKI I=0 records within +-0.2 s of each arming edge (Src code: Ok code = count; Src 4 baro, 5 no-aid, 6 height reset, 7 compass yaw, 8 yaw align/reset, 9 GPS reset; Ok 0 gated, 1 fused, 2 refused, 3 screened)");
+    for &(a, _) in iv {
+        let mut m: std::collections::BTreeMap<(u8, u8), usize> = Default::default();
+        for k in 0..nki.rows() {
+            let t = nki.time(k);
+            if nki.u8(k, cki) == 0 && t + 200_000 >= a && t <= a + 200_000 {
+                *m.entry((nki.u8(k, csrc), nki.u8(k, cok))).or_default() += 1;
+            }
+        }
+        println!("  edge {:.2} s: {}", a as f64 * 1e-6, if m.is_empty() { "none".to_string() } else { m.iter().map(|((s, o), n)| format!("{s}:{o} = {n}")).collect::<Vec<_>>().join(", ") });
+    }
+    // Rates while armed and while disarmed.
+    let t_end = (0..nav.rows()).map(|k| nav.time(k)).max().unwrap_or(0);
+    let t_start = (0..nav.rows()).map(|k| nav.time(k)).min().unwrap_or(0);
+    let armed_s: f64 = iv.iter().map(|&(a, b)| (b - a) as f64 * 1e-6).sum();
+    let dis_s = (t_end - t_start) as f64 * 1e-6 - armed_s;
+    println!("\nRecords per second (armed {armed_s:.1} s, disarmed {dis_s:.1} s):");
+    let inside = |t: u64| iv.iter().any(|&(a, b)| t >= a && t <= b);
+    for (name, t, ic, which) in [("NKF1 I=0", nkf1, c1i, 0u8), ("NKF1 I=1", nkf1, c1i, 1), ("NKI I=0", nki, cki, 0), ("NKI I=1", nki, cki, 1)] {
+        let (mut a, mut d) = (0usize, 0usize);
+        for k in 0..t.rows() {
+            if t.u8(k, ic) == which {
+                if inside(t.time(k)) { a += 1 } else { d += 1 }
+            }
+        }
+        println!("  {name}: armed {:.2}/s ({a}), disarmed {:.2}/s ({d})", a as f64 / armed_s, d as f64 / dis_s);
+    }
+    // Steering D extremes against the barometer.
+    let baro = log.table("BARO")?;
+    let cp = baro.col("Press")?;
+    let (mut hi, mut lo) = ((f32::MIN, 0u64), (f32::MAX, 0u64));
+    for k in (0..nkf1.rows()).filter(|&k| nkf1.u8(k, c1i) == 0) {
+        let d = nkf1.f32(k, cpn + 2);
+        if d.is_finite() {
+            if d > hi.0 { hi = (d, nkf1.time(k)) }
+            if d < lo.0 { lo = (d, nkf1.time(k)) }
+        }
+    }
+    let press = |t: u64| {
+        let k = (0..baro.rows()).min_by_key(|&k| baro.time(k).abs_diff(t)).unwrap_or(0);
+        baro.f32(k, cp)
+    };
+    let (ph, pl) = (press(hi.1), press(lo.1));
+    let h = |p: f32, p0: f32| 44330.77 * (1.0 - (f64::from(p) / f64::from(p0)).powf(0.190263));
+    println!("\nLogged steering D (NKF1 I=0 PD, m, down positive): largest {:.2} at {:.1} s, smallest {:.2} at {:.1} s, span {:.2} m.", hi.0, hi.1 as f64 * 1e-6, lo.0, lo.1 as f64 * 1e-6, hi.0 - lo.0);
+    println!("  Barometer pressure at those times: {ph:.1} Pa (largest D), {pl:.1} Pa (smallest D); the ISA height difference of the two pressures is {:.2} m (D = minus height, so a pressure rise gives a larger D).", h(pl, ph));
+    let mut pmin = (f32::MAX, 0u64);
+    let mut pmax = (f32::MIN, 0u64);
+    for k in 0..baro.rows() {
+        let p = baro.f32(k, cp);
+        if p < pmin.0 { pmin = (p, baro.time(k)) }
+        if p > pmax.0 { pmax = (p, baro.time(k)) }
+    }
+    println!("  Barometer over the whole log: lowest {:.1} Pa at {:.1} s, highest {:.1} Pa at {:.1} s (ISA height difference {:.2} m).", pmin.0, pmin.1 as f64 * 1e-6, pmax.0, pmax.1 as f64 * 1e-6, h(pmin.0, pmax.0));
     Ok(())
 }

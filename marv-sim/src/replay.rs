@@ -275,7 +275,11 @@ pub fn build_stream(log: &Log, opts: &StreamOpts) -> Result<Stream, String> {
         while m < mot.rows() && mot.time(m) < t {
             m += 1;
         }
-        if m >= mot.rows() || mot.time(m) != t {
+        if m >= mot.rows() {
+            // The log ends between an IMU record and its MOT: the last sample has no step block, drop it.
+            break;
+        }
+        if mot.time(m) != t {
             return Err(format!("IMU1 sample at {t} us has no MOT record: the log is not in the flight-step layout"));
         }
         let f3 = |c: usize| [imu.f32(k, c), imu.f32(k, c + 1), imu.f32(k, c + 2)];
