@@ -1,7 +1,7 @@
 //! `marv-replay`: replays a flown flight log (`.BIN`) through the flight code's own estimators and checks them against
 //! what the board logged. See `--help` and the README.
 
-use fw_flight::eskf::{Eskf, EskfStats};
+use fw_flight::eskf::{Aiding, Eskf, EskfStats};
 use fw_flight::gnc::{Estimator, NavState, Valid};
 use fw_flight::mahony::Mahony;
 use fw_flight::mahony_baro::MahonyBaro;
@@ -41,12 +41,19 @@ trait Replayed: Estimator {
     fn eskf_stats(&self) -> Option<EskfStats> {
         None
     }
+    /// Gyro bias (rad/s) and accelerometer bias (m/s^2).
+    fn biases(&self) -> Option<([f32; 3], [f32; 3])> {
+        None
+    }
 }
 impl Replayed for Mahony {}
 impl Replayed for MahonyBaro {}
 impl Replayed for Eskf {
     fn eskf_stats(&self) -> Option<EskfStats> {
         Some(*self.stats())
+    }
+    fn biases(&self) -> Option<([f32; 3], [f32; 3])> {
+        Some(Eskf::biases(self))
     }
 }
 
@@ -55,10 +62,12 @@ struct Row {
     armed_at: ArmedAt,
     est: Box<dyn Replayed>,
     nav: Vec<NavState>,
+    /// Gyro and accelerometer bias after each step, for the estimators that have them.
+    bias: Vec<[f32; 6]>,
 }
 
 fn row(name: &'static str, armed_at: ArmedAt, est: Box<dyn Replayed>) -> Row {
-    Row { name, armed_at, est, nav: Vec::new() }
+    Row { name, armed_at, est, nav: Vec::new(), bias: Vec::new() }
 }
 
 /// The estimators to run: one line each.
@@ -66,7 +75,9 @@ fn table(t: &Tuning) -> Vec<Row> {
     vec![
         row("Mahony", ArmedAt::Before, Box::new(Mahony::new(t))),
         row("MahonyBaro", ArmedAt::Before, Box::new(MahonyBaro::new(t))),
-        row("Eskf", ArmedAt::After, Box::new(Eskf::new(t).expect("Tuning::DEFAULT is accepted"))),
+        row("eskf1", ArmedAt::After, Box::new(Eskf::with_aiding(t, Aiding::Imu).expect("Tuning::DEFAULT is accepted"))),
+        row("eskf2", ArmedAt::After, Box::new(Eskf::with_aiding(t, Aiding::ImuBaro).expect("Tuning::DEFAULT is accepted"))),
+        row("eskf3", ArmedAt::After, Box::new(Eskf::new(t).expect("Tuning::DEFAULT is accepted"))),
     ]
 }
 
@@ -113,11 +124,11 @@ fn bits(v: &Valid) -> [u8; 7] {
     [v.tilt, v.heading, v.rates, v.velocity_ne, v.velocity_d, v.position_ne, v.position_d].map(u8::from)
 }
 
-fn write_csv(path: &std::path::Path, stream: &Stream, nav: &[NavState], every: usize) -> std::io::Result<()> {
+fn write_csv(path: &std::path::Path, stream: &Stream, nav: &[NavState], bias: &[[f32; 6]], every: usize) -> std::io::Result<()> {
     let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
     writeln!(
         w,
-        "t_us,step_t_us,armed,qw,qx,qy,qz,rx,ry,rz,vn,ve,vd,pn,pe,pd,v_tilt,v_heading,v_rates,v_vel_ne,v_vel_d,v_pos_ne,v_pos_d,s_tilt,s_heading,s_vel_ne,s_vel_d,s_pos_ne,s_pos_d"
+        "t_us,step_t_us,armed,qw,qx,qy,qz,rx,ry,rz,vn,ve,vd,pn,pe,pd,v_tilt,v_heading,v_rates,v_vel_ne,v_vel_d,v_pos_ne,v_pos_d,s_tilt,s_heading,s_vel_ne,s_vel_d,s_pos_ne,s_pos_d,gbx,gby,gbz,abx,aby,abz"
     )?;
     for (k, (s, n)) in stream.steps.iter().zip(nav).enumerate() {
         if k % every != 0 {
@@ -133,6 +144,14 @@ fn write_csv(path: &std::path::Path, stream: &Stream, nav: &[NavState], every: u
         match n.sigma {
             Some(g) => {
                 for v in [g.tilt_rad, g.heading_rad, g.velocity_ne_ms, g.velocity_d_ms, g.position_ne_m, g.position_d_m] {
+                    let _ = write!(l, ",{v}");
+                }
+            }
+            None => l.push_str(",,,,,,"),
+        }
+        match bias.get(k) {
+            Some(b) => {
+                for v in b {
                     let _ = write!(l, ",{v}");
                 }
             }
@@ -321,13 +340,16 @@ fn run() -> Result<(), String> {
         for r in &mut rows {
             r.est.set_armed(if r.armed_at == ArmedAt::Before { prev_armed } else { s.armed });
             r.nav.push(r.est.update(&s.sensors));
+            if let Some((g, a)) = r.est.biases() {
+                r.bias.push([g[0], g[1], g[2], a[0], a[1], a[2]]);
+            }
         }
         prev_armed = s.armed;
     }
 
     for r in &rows {
         let path = args.out.join(format!("{}.csv", r.name));
-        write_csv(&path, &stream, &r.nav, args.every).map_err(|e| format!("{}: {e}", path.display()))?;
+        write_csv(&path, &stream, &r.nav, &r.bias, args.every).map_err(|e| format!("{}: {e}", path.display()))?;
         println!("wrote {}", path.display());
     }
     for r in &rows {
@@ -394,7 +416,7 @@ fn run() -> Result<(), String> {
             )
         );
     }
-    if let Some(r) = find("Eskf") {
+    if let Some(r) = find("eskf3") {
         let idx = by_time(&r.nav);
         let mut unmatched = 0usize;
         let samples = (0..nkf.rows())
@@ -420,7 +442,7 @@ fn run() -> Result<(), String> {
             "{}",
             report(
                 &Comparison {
-                    title: "Eskf vs logged NKF1 I=1 (TimeUS = horizon time = replayed NavState t_us)".into(),
+                    title: "eskf3 vs logged NKF1 I=1 (TimeUS = horizon time = replayed NavState t_us)".into(),
                     names: &["att", "tilt", "yaw", "PN", "PE", "PD", "VN", "VE", "VD"],
                     units: "deg (att, tilt, yaw as above), m, m/s",
                     samples,
