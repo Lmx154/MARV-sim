@@ -299,9 +299,27 @@ after the initialisation until the first touchdown (the first tick with ground c
 airborne; a run that never lifts off or never touches down is judged over the whole window), because the plant stops the
 vehicle in one tick at touchdown without the accelerometer seeing it; the raw `v_3sigma` is printed, not judged.
 
+`--shadow eskf` (either form) runs `fw_flight::eskf::Eskf`, the 15-state shadow filter (decision-nav-eskf-20261120
+Amendments C and C-1, packet E1b), in the same slot, with the declination taken from the env's field. Its state refers
+to the horizon (`NavState.t_us`, 0.43 s behind the step), so it is compared with the truth of that step. One line per
+run, `shadow eskf` then `key value` pairs: heading while `heading` is valid (`hdg_valid_s`, `hdg_bad15_s` seconds
+valid with |error| > 15 deg, `hdg_first_s`, `hdg_worst_deg`); north-east while `position_ne` is valid, the offset
+between the filter's origin and the env's removed (`ne_valid_s`, `ne_out3_s` seconds with a position or velocity axis
+outside 3 of the filter's own sigma, `ne_p_rms`, `ne_p_max`, `ne_v_max`); the vertical as `mahony-baro`'s line
+(`init_s`, `judged`, `d_rms`, `d_max`, `d_max_nodrift`, `v_rms`, `v_max`, `v_3sigma`, from 5 s after `position_d` is
+first valid); tilt against truth beside Mahony's on the same steps (`tilt_rms_deg`, `tilt_max_deg`,
+`mahony_tilt_rms_deg`, `mahony_tilt_max_deg`); counts (`mag_refused`, `screens`, `gated`, `resets_height`,
+`resets_yaw`, `resets_gps`, `reinits`), `yaw_aligned` at the end and `multi_job` (whether any step did more than one
+heavy job). Tests in `tests/nav_eskf.rs`: c1 (heading never valid while more than 15 deg wrong; negative control a
+compass turned 30 deg), c2 (log 186's disturbed take-off spot gives no alignment and no GNSS before take-off; negative
+control the health test opened), c4 (north-east within 3 sigma with the GNSS latency 0.43 s; negative control delay 0;
+fails by the specification, see its message) on a synthetic flight through the sensor models, and b2/c1/b3 over the
+suite through `--shadow eskf` (height with the drift removed <= 0.3 m, no heading valid while wrong, one heavy job per
+step; tilt printed only).
+
 ## Not built yet
 
-Wind gusts (phase 2), the logging of the slow samples, the ESKF in the shadow slot and the altitude and position
+Wind gusts (phase 2), the logging of the slow samples, the altitude and position
 holds (step 7), the TCP link and the Gazebo backend (steps 8 and 9).
 
 ## Check the card
