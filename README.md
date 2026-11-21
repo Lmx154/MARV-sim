@@ -290,7 +290,14 @@ errors and 3-sigma count before the first touchdown after lift-off (`*_pre_td`).
 since the previous step, and their 3-sigma count), `air_v3_first_s`/`air_v3_last_s` (time of those since the last
 lift-off), `air_v3_ratio_max` (largest |vD error|/sigma), `air_v3_within_half_s`, `air_v3_within_2s`, `liftoffs`, and
 at the first touchdown after lift-off `td_s`, the D error there (`d_td`, `d_td_nodrift`) and 2 s later (`d_td2`,
-`d_td2_nodrift`).
+`d_td2_nodrift`), and `v_3sigma_pre_td_judged` (the judged steps before the first touchdown, the window of `v_3sigma_pre_td`).
+
+Test a2 judges two columns, by the owner's ruling of 2026-11-21 (decision-nav-eskf-20261120, "Owner's ruling on how test
+a2 of Amendment B is judged"). Height: `d_max_nodrift` against 0.3 m, because the barometer-only filter cannot see its own
+sensor's drift; the raw `d_max` is printed, not judged. Vertical speed: `v_3sigma_pre_td` must be 0, over the steps from 5 s
+after the initialisation until the first touchdown (the first tick with ground contact after the vehicle has been
+airborne; a run that never lifts off or never touches down is judged over the whole window), because the plant stops the
+vehicle in one tick at touchdown without the accelerometer seeing it; the raw `v_3sigma` is printed, not judged.
 
 ## Not built yet
 

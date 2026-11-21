@@ -181,6 +181,9 @@ struct Shadow {
     airborne: bool,
     landed: bool,
     pre_td: (f64, f64, u64),
+    /// Judged steps before the first touchdown: the window of the owner's vertical-speed rule (2026-11-21), whose
+    /// 3-sigma count is `pre_td.2`; a run that never lifts off or never touches down has the whole judged window.
+    pre_td_n: u64,
     /// The barometer model's drift state at the initialisation, m, and the largest |D error| with the drift since then
     /// taken out (the model's h = true height + drift, so D - truth = -(drift - drift0) + the filter's own error).
     drift0: f64,
@@ -213,7 +216,7 @@ const SHADOW_SETTLE_US: u64 = 5_000_000;
 impl Shadow {
     fn new(tuning: &Tuning) -> Shadow {
         Shadow { est: MahonyBaro::new(tuning), armed: false, init: None, n: 0, d2: 0.0, d_max: 0.0, v2: 0.0, v_max: 0.0,
-            v_3sigma: 0, flags_lost: 0, airborne: false, landed: false, pre_td: (0.0, 0.0, 0), drift0: 0.0, d_max_nodrift: 0.0,
+            v_3sigma: 0, flags_lost: 0, airborne: false, landed: false, pre_td: (0.0, 0.0, 0), pre_td_n: 0, drift0: 0.0, d_max_nodrift: 0.0,
             was_ground: None, liftoff_us: 0, liftoffs: 0, air_n: 0, air_v3: 0, air_v3_since: (f64::NAN, f64::NAN), air_v3_ratio: 0.0,
             air_v3_2s: 0, air_v3_half_s: 0, td_us: None, d_td: None, d_td2: None, identity_breaks: 0 }
     }
@@ -279,6 +282,7 @@ impl Shadow {
         self.flags_lost += u64::from(!(nav.valid.velocity_d && nav.valid.position_d));
         if !self.landed {
             let (d, v, n3) = self.pre_td;
+            self.pre_td_n += 1;
             self.pre_td = (d.max(ed.abs()), v.max(ev.abs()), n3 + u64::from(ev.abs() > 3.0 * sigma_v));
         }
     }
@@ -291,7 +295,7 @@ impl Shadow {
             "shadow mahony-baro init_s {} judged {} d_rms {:.4} d_max {:.4} v_rms {:.4} v_max {:.4} v_3sigma {} bd {:.4} \
 gated {} fused {} resets {} flags_lost {} identity_breaks {} d_max_pre_td {:.4} v_max_pre_td {:.4} v_3sigma_pre_td {} \
 d_max_nodrift {:.4} air_judged {} v_3sigma_air {} air_v3_first_s {:.3} air_v3_last_s {:.3} air_v3_ratio_max {:.2} \
-air_v3_within_2s {} air_v3_within_half_s {} liftoffs {} td_s {} d_td {} d_td_nodrift {} d_td2 {} d_td2_nodrift {}",
+air_v3_within_2s {} air_v3_within_half_s {} liftoffs {} td_s {} d_td {} d_td_nodrift {} d_td2 {} d_td2_nodrift {} v_3sigma_pre_td_judged {}",
             self.init.map_or("none".to_string(), |(t, _)| format!("{:.3}", t as f64 * 1e-6)),
             self.n, (self.d2 / n).sqrt(), self.d_max, (self.v2 / n).sqrt(), self.v_max, self.v_3sigma, v.bias_d(),
             v.rejected(), v.fused(), v.resets(), self.flags_lost, self.identity_breaks, self.pre_td.0, self.pre_td.1,
@@ -301,7 +305,7 @@ air_v3_within_2s {} air_v3_within_half_s {} liftoffs {} td_s {} d_td {} d_td_nod
             self.d_td.map_or("none".to_string(), |d| format!("{:.4}", d.0)),
             self.d_td.map_or("none".to_string(), |d| format!("{:.4}", d.1)),
             self.d_td2.map_or("none".to_string(), |d| format!("{:.4}", d.0)),
-            self.d_td2.map_or("none".to_string(), |d| format!("{:.4}", d.1))
+            self.d_td2.map_or("none".to_string(), |d| format!("{:.4}", d.1)), self.pre_td_n
         )
     }
 }

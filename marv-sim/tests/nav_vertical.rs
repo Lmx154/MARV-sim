@@ -182,6 +182,13 @@ fn field(line: &str, key: &str) -> f64 {
     kv[i + 1].parse().expect("number")
 }
 
+/// B4 a2, judged by the owner's ruling of 2026-11-21 (decision-nav-eskf-20261120, "Owner's ruling on how test a2 of
+/// Amendment B is judged"). Height: `d_max_nodrift` (the error with the barometer model's own drift taken out) against
+/// D_LIMIT_M from 5 s after the initialisation, because the barometer-only filter cannot see its own sensor's drift; the
+/// raw `d_max` is printed, not judged. Vertical speed: `v_3sigma_pre_td` (3-sigma steps from 5 s after the
+/// initialisation until the first touchdown) must be 0, because the plant stops the vehicle in one tick at touchdown
+/// without the accelerometer seeing it; the raw `v_3sigma` is printed, not judged. Runs that never touch down are
+/// judged over the whole window.
 #[test]
 fn a2_vertical_error_in_every_scenario_across_the_spread() {
     let out = env!("CARGO_TARGET_TMPDIR");
@@ -200,6 +207,7 @@ fn a2_vertical_error_in_every_scenario_across_the_spread() {
         .map(String::from).to_vec());
     let mut failing = Vec::new();
     let mut runs = 0;
+    let (mut worst_d, mut worst_raw, mut raw_v3, mut judged_v3) = (0.0f64, 0.0f64, 0.0, 0.0);
     for job in jobs {
         let o = Command::new(env!("CARGO_BIN_EXE_marv-run")).current_dir(root()).args(common).args(&job).output()
             .expect("marv-run");
@@ -207,13 +215,21 @@ fn a2_vertical_error_in_every_scenario_across_the_spread() {
         for line in text.lines().filter(|l| l.contains("shadow mahony-baro")) {
             runs += 1;
             let name = if line.starts_with("shadow") { job[1].clone() } else { line.split_whitespace().next().unwrap().to_string() };
-            let (d_max, v3, breaks) = (field(line, "d_max"), field(line, "v_3sigma"), field(line, "identity_breaks"));
-            if d_max > D_LIMIT_M || v3 > 0.0 || breaks > 0.0 {
-                failing.push(format!("{name}: d_max {d_max} v_3sigma {v3} identity_breaks {breaks}"));
+            let (d_raw, d_nd, v3_raw, v3, v3_n, breaks) = (field(line, "d_max"), field(line, "d_max_nodrift"),
+                field(line, "v_3sigma"), field(line, "v_3sigma_pre_td"), field(line, "v_3sigma_pre_td_judged"),
+                field(line, "identity_breaks"));
+            worst_d = worst_d.max(d_nd);
+            worst_raw = worst_raw.max(d_raw);
+            raw_v3 += v3_raw;
+            judged_v3 += v3;
+            if d_nd > D_LIMIT_M || v3 > 0.0 || breaks > 0.0 {
+                failing.push(format!("{name}: judged d_max_nodrift {d_nd} (raw d_max {d_raw}) judged v_3sigma_pre_td {v3} of \
+{v3_n} steps (raw v_3sigma {v3_raw}) identity_breaks {breaks}"));
             }
         }
     }
-    println!("a2: {runs} runs, {} failing", failing.len());
+    println!("a2: {runs} runs, {} failing; judged: worst d_max_nodrift {worst_d:.4} m (limit {D_LIMIT_M}), v_3sigma_pre_td total \
+{judged_v3}; raw: worst d_max {worst_raw:.4} m, v_3sigma total {raw_v3}", failing.len());
     for f in &failing {
         println!("  {f}");
     }
