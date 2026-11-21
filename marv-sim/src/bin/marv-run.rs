@@ -47,7 +47,8 @@ const USAGE: &str = "usage: marv-run --card <marv.toml> --env <env.toml> --seed 
 [--only <cell>] [--logs fail|all] [--home <env/home.local.toml>]
 (--seed is given exactly when the spread file has no seeds axis)
 Either form takes --shadow mahony-baro or --shadow eskf: that estimator runs in the shadow slot and one `shadow` line
-reports it, and --estimator mahony|eskf1|eskf2 (the flight step's estimator; one `steer` line reports it) with
+reports it, and --preroll <seconds> (air-start scenarios only, not a ground start: that has its own ground phase; the
+flight code is stepped that long with the plant pinned at the initial state, disarmed, before scenario time 0), and --estimator mahony|eskf1|eskf2 (the flight step's estimator; one `steer` line reports it) with
 --rates native|pt1|pt1-bias (eskf1 and eskf2 only: which body rates the flight step gets).";
 
 struct Args {
@@ -60,6 +61,8 @@ struct Args {
     shadow: Option<ShadowKind>,
     /// `--estimator` and `--rates`: the flight step's estimator; `None` is the default Mahony with no `steer` line.
     steer: Option<SteerCfg>,
+    /// `--preroll <s>`: the runner's pre-roll before scenario time 0 (decision-nav-eskf D5), in base ticks.
+    preroll: Option<u64>,
     job: Job,
 }
 
@@ -104,7 +107,7 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
     let (mut point, mut spread, mut out_dir) = (None, None, None);
     let (mut only, mut logs, mut home) = (None, None, None);
     let mut shadow = None;
-    let (mut estimator, mut rates) = (None, None);
+    let (mut estimator, mut rates, mut preroll) = (None, None, None);
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         if flag == "--help" || flag == "-h" {
@@ -125,6 +128,13 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
             "--shadow" if value == "mahony-baro" => shadow = Some(ShadowKind::MahonyBaro),
             "--shadow" if value == "eskf" => shadow = Some(ShadowKind::Eskf),
             "--shadow" => return Err(format!("--shadow: {value} is not mahony-baro or eskf")),
+            "--preroll" => {
+                let s = value.parse::<f64>().map_err(|_| format!("--preroll: {value} is not a number"))?;
+                if !(s.is_finite() && s > 0.0 && s <= 60.0) {
+                    return Err(format!("--preroll: {value} is not in (0, 60] seconds"));
+                }
+                preroll = Some((s * 1e6 / TICK_US as f64).round() as u64);
+            }
             "--estimator" => {
                 estimator = Some(match value.as_str() {
                     "mahony" => EstKind::Mahony,
@@ -171,6 +181,7 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
     let steer = estimator.map(|est| SteerCfg { est, rates: rates.unwrap_or(Rates::Native) });
     Ok(Some(Args {
         steer,
+        preroll,
         card: card.ok_or("--card is required")?,
         env: env.ok_or("--env is required")?,
         home,
@@ -726,6 +737,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
     log: &mut Log,
     mut shadow: Option<&mut (dyn Slot + 'static)>,
     mut steer: Option<&mut Steer>,
+    preroll_ticks: u64,
 ) -> (u64, u64, Trace) {
     // The newest StepOut's time and command, as the ESC task sees them; none yet counts as (0, Stop).
     let mut newest = (0, MotorCommand::STOP);
@@ -738,6 +750,36 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
     let mut touched = false;
     // Contact at any tick since the last flight step, for the shadow's airborne time.
     let mut contact = false;
+    // The pre-roll (decision-nav-eskf D5): the flight code runs on the board clock 0..off with the plant pinned at the
+    // initial state; the scenario then starts at board time `off`. The flight code, the shadow and the sensors' stamps
+    // see board time = scenario time + off; the log, the verdict trace and the ESC rule see scenario time.
+    let off = preroll_ticks * TICK_US;
+    if preroll_ticks > 0 {
+        let mut pinned = world.backend.truth().clone();
+        let row = row_at(&scenario.rc_script, 0);
+        let mut pending: Option<RcSample> = None;
+        let mut contact = false;
+        for k in 1..=preroll_ticks {
+            pinned.t_us = k * TICK_US;
+            world.slow.tick(&pinned);
+            if (k - 1).is_multiple_of(RC_TICKS) {
+                let sticks = Sticks { roll: row.roll, pitch: row.pitch, throttle: row.throttle, yaw: row.yaw };
+                pending = Some(RcSample { sticks, arm: row.arm, t_us: pinned.t_us - TICK_US });
+            }
+            if pinned.t_us.is_multiple_of(IMU_PERIOD_US) {
+                let s1 = world.imu1.sample(&pinned);
+                let s2 = world.imu2.sample(&pinned);
+                let (baro, mag, gnss) = world.slow.take();
+                let sensors = Sensors { imu1: s1, imu2: Some(s2), baro, mag, gnss, external: None };
+                let out = flight.step(&FlightInputs { sensors, rc: pending.take() });
+                if let Some(sh) = shadow.as_deref_mut() {
+                    sh.feed(&sensors, &out, &pinned, world.slow.baro.drift_m(), std::mem::replace(&mut contact, false));
+                }
+            }
+        }
+        // A sample made at the last pre-roll ticks, not yet taken, would carry a pre-roll stamp into the shifted clock.
+        let _ = world.slow.take();
+    }
     for k in 0..ticks {
         let now = world.backend.truth().t_us;
         if k.is_multiple_of(ESC_TICKS) {
@@ -762,7 +804,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             if !lost {
                 let given = row;
                 let sticks = Sticks { roll: given.roll, pitch: given.pitch, throttle: given.throttle, yaw: given.yaw };
-                pending = Some(RcSample { sticks, arm: given.arm, t_us: now });
+                pending = Some(RcSample { sticks, arm: given.arm, t_us: now + off });
                 trace.rc_us.push(now);
                 log.rc(now, [given.roll, given.pitch, given.throttle, given.yaw], given.arm);
             }
@@ -790,11 +832,30 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             let s2 = world.imu2.sample(&truth);
             let (baro, mag, gnss) = world.slow.take();
             let sensors = Sensors { imu1: s1, imu2: Some(s2), baro, mag, gnss, external: None };
-            let out = flight.step(&FlightInputs { sensors, rc: pending.take() });
+            let mut sensors_f = sensors;
+            sensors_f.imu1.t_us += off;
+            if let Some(i) = sensors_f.imu2.as_mut() {
+                i.t_us += off;
+            }
+            if let Some(b) = sensors_f.baro.as_mut() {
+                b.t_us += off;
+            }
+            if let Some(m) = sensors_f.mag.as_mut() {
+                m.t_us += off;
+            }
+            if let Some(g) = sensors_f.gnss.as_mut() {
+                g.t_us += off;
+            }
+            let out_f = flight.step(&FlightInputs { sensors: sensors_f, rc: pending.take() });
+            let mut out = out_f;
+            out.t_us -= off;
+            out.nav.t_us -= off;
             let ground = std::mem::replace(&mut contact, false);
             newest = (out.t_us, out.motors);
             if let Some(sh) = shadow.as_deref_mut() {
-                sh.feed(&sensors, &out, &truth, world.slow.baro.drift_m(), ground);
+                let mut truth_f = truth.clone();
+                truth_f.t_us += off;
+                sh.feed(&sensors_f, &out_f, &truth_f, world.slow.baro.drift_m(), ground);
             }
             if let Some(st) = steer.as_deref_mut() {
                 st.feed(&out, &truth);
@@ -844,7 +905,7 @@ struct Run<'a> {
 /// when `keep` or when a check fails.
 #[allow(clippy::too_many_arguments)]
 fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option<Point>, cell: Option<&Run>, out: &Path,
-    keep: bool, shadow: Option<ShadowKind>, steer_cfg: Option<SteerCfg>) -> Result<Outcome, String> {
+    keep: bool, shadow: Option<ShadowKind>, steer_cfg: Option<SteerCfg>, preroll: Option<u64>) -> Result<Outcome, String> {
     let (map, air, ground) = cell.map_or((Map::default(), Air::default(), Ground::default()), |r| (r.map, r.air, r.ground));
     let sloped;
     let scenario = match ground.roll_pitch_deg {
@@ -896,6 +957,11 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
     log.msg(0, &format!("card sha256 {}", &card.sha256[..16]));
     log.msg(0, &format!("scenario {}", scenario.name));
     log.msg(0, &format!("seed {}", seed));
+    if let Some(n) = preroll {
+        log.msg(0, &format!(
+            "preroll {} s: flight code stepped with the plant pinned before scenario time 0; its rows are not in this log; \
+every row's time is scenario time (the flight code's clock was scenario time + {} us)", n * TICK_US / 1000 / 1000, n * TICK_US));
+    }
     if let Some(p) = point {
         log.msg(0, &format!("point {}", p.text()));
     }
@@ -939,7 +1005,7 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
     let (ran, flight_steps, mut trace) = match steer_cfg {
         None | Some(SteerCfg { est: EstKind::Mahony, .. }) => {
             let flight = Flight::new(Mahony::new(&tuning), CascadedPid::new(&tuning), CardAllocator::new(), &tuning, handshake);
-            run(flight, &mut world, scenario, pilot.as_mut(), ticks, &mut log, shadow.as_deref_mut(), steer.as_mut())
+            run(flight, &mut world, scenario, pilot.as_mut(), ticks, &mut log, shadow.as_deref_mut(), steer.as_mut(), preroll.unwrap_or(0))
         }
         Some(cfg) => {
             let mut t = tuning;
@@ -949,7 +1015,7 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
             let eskf = Eskf::with_aiding(&t, aiding).map_err(|e| format!("Eskf: {e:?}"))?;
             let est = Steering { eskf, rates: cfg.rates, pt1: Mahony::new(&tuning), info: info.clone() };
             let flight = Flight::new(est, CascadedPid::new(&tuning), CardAllocator::new(), &tuning, handshake);
-            run(flight, &mut world, scenario, pilot.as_mut(), ticks, &mut log, shadow.as_deref_mut(), steer.as_mut())
+            run(flight, &mut world, scenario, pilot.as_mut(), ticks, &mut log, shadow.as_deref_mut(), steer.as_mut(), preroll.unwrap_or(0))
         }
     };
 
@@ -1050,6 +1116,21 @@ impl From<&str> for Failure {
     }
 }
 
+/// What `--preroll` accepts: an air start at rest, with no pilot (the pre-roll's RC is the script's first row).
+fn preroll_ok(sc: &Scenario) -> Result<(), String> {
+    let at = |m: &str| format!("--preroll: scenario {} {m}", sc.name);
+    if !matches!(sc.start, Start::Air | Start::AirOverGround) || sc.pilot.is_some() {
+        return Err(at("is a ground start or has a pilot; it has its own ground phase"));
+    }
+    if sc.velocity_ned_ms != [0.0; 3] || sc.rates_rads != [0.0; 3] {
+        return Err(at("has a non-zero initial velocity or rate"));
+    }
+    if row_at(&sc.rc_script, 0).arm {
+        return Err(at("arms at time 0"));
+    }
+    Ok(())
+}
+
 /// `Ok(true)` when every check passed.
 fn go(args: &Args) -> Result<bool, Failure> {
     let join = |errs: Vec<String>| errs.join("\n");
@@ -1074,7 +1155,10 @@ fn go(args: &Args) -> Result<bool, Failure> {
         Job::One { scenario, out, point } => {
             let seed = args.seed.ok_or(Failure::Usage("--seed is required with --scenario".to_string()))?;
             let scenario = Scenario::load(scenario)?;
-            let o = run_one(&card, &env, &scenario, seed, *point, None, out, true, args.shadow, args.steer)?;
+            if args.preroll.is_some() {
+                preroll_ok(&scenario).map_err(Failure::Usage)?;
+            }
+            let o = run_one(&card, &env, &scenario, seed, *point, None, out, true, args.shadow, args.steer, args.preroll)?;
             for line in o.summary.iter().chain(&o.notes).chain(&o.shadow).chain(&o.steer) {
                 println!("{line}");
             }
@@ -1089,6 +1173,11 @@ fn go(args: &Args) -> Result<bool, Failure> {
             let started = Instant::now();
             let spread = Spread::load(spread_file)?;
             let scenarios = spread.scenarios.iter().map(Scenario::load).collect::<Result<Vec<_>, _>>()?;
+            if args.preroll.is_some() {
+                for sc in &scenarios {
+                    preroll_ok(sc).map_err(Failure::Usage)?;
+                }
+            }
             let names: Vec<String> = scenarios.iter().map(|s| s.name.clone()).collect();
             let mut cells = spread.cells(&names, args.seed).map_err(Failure::Usage)?;
             let refused = refusals(&spread, &scenarios, &cells, &card, &env);
@@ -1129,7 +1218,7 @@ fn go(args: &Args) -> Result<bool, Failure> {
                 let out = out_dir.join(format!("{}.BIN", cell.name));
                 let keep = only.is_some() || *logs == Logs::All;
                 let o = run_one(&card, &env, &scenarios[cell.scenario], cell.seed, Some(spread.points[cell.point]),
-                    Some(&run), &out, keep, args.shadow, args.steer)?;
+                    Some(&run), &out, keep, args.shadow, args.steer, args.preroll)?;
                 if only.is_some() {
                     for line in o.summary.iter().chain(&o.notes) {
                         println!("{line}");

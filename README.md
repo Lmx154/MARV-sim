@@ -200,6 +200,19 @@ motors and over consecutive steps that both spin) and the Eskf's re-initialisati
 runs inside the wrapper for it, so the bits are Mahony's), or that PT1 minus the Eskf's gyro-bias estimate. Without
 `--estimator` nothing changes and no `steer` line is printed.
 
+`--preroll <seconds>` (decision-nav-eskf D5; air-start scenarios with a script only: a ground start or a pilot scenario has
+its own ground phase and is a usage error, as is a non-zero initial velocity or rate) steps the flight code (and the
+shadow, if any) for that long before scenario time 0, with the plant pinned at the scenario's initial state: attitude and
+position as given, velocity and rates 0, rotors at their initial speed whatever the command (the plant is not stepped at
+all), so the sensor models see a vehicle at rest there, noise streams running. RC is the script's t = 0 row (switch
+off), so the gate cannot arm. The scenario then runs as without it: scripts, disturbances, verdict windows and the log's
+time axis are scenario time. The pre-roll's own rows are not written to the log (a MSG record says so); the flight
+code's clock is scenario time + the pre-roll, so it never goes backwards, and the `steer` line counts only scenario
+rows. May be claimed: "ESKF2 steering, after T_pre disarmed at the scenario's initial attitude, passes hover, steps,
+stick-sign and rc-loss across the spread." NOT claimed: air-start or arming without a ground alignment (the gate refuses
+those by design); alignment and the take-off transition are verified only by the take-off matrix. Without `--preroll`
+nothing changes.
+
 ## The parameter spread and the run matrix
 
     cargo run -q --release -p marv-sim --bin marv-run -- --card marv-card/marv.toml --env env/default.toml \
