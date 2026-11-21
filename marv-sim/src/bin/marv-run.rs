@@ -49,7 +49,11 @@ const USAGE: &str = "usage: marv-run --card <marv.toml> --env <env.toml> --seed 
 Either form takes --shadow mahony-baro or --shadow eskf: that estimator runs in the shadow slot and one `shadow` line
 reports it, and --preroll <seconds> (air-start scenarios only, not a ground start: that has its own ground phase; the
 flight code is stepped that long with the plant pinned at the initial state, disarmed, before scenario time 0), and --estimator mahony|eskf1|eskf2 (the flight step's estimator; one `steer` line reports it) with
---rates native|pt1|pt1-bias (eskf1 and eskf2 only: which body rates the flight step gets).";
+--rates native|pt1|pt1-bias (eskf1 and eskf2 only: which body rates the flight step gets), and --noaid-sigma <m> (replaces
+Tuning::nav_noaid_sigma_m, the armed no-aid position hold's sigma).";
+
+/// `--noaid-sigma`: replaces `Tuning::nav_noaid_sigma_m` (the armed no-aid position hold's sigma) for every estimator.
+static NOAID_SIGMA: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
 
 struct Args {
     card: PathBuf,
@@ -128,6 +132,10 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
             "--shadow" if value == "mahony-baro" => shadow = Some(ShadowKind::MahonyBaro),
             "--shadow" if value == "eskf" => shadow = Some(ShadowKind::Eskf),
             "--shadow" => return Err(format!("--shadow: {value} is not mahony-baro or eskf")),
+            "--noaid-sigma" => {
+                let v = value.parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0).ok_or(format!("--noaid-sigma: {value} is not a positive number"))?;
+                let _ = NOAID_SIGMA.set(v);
+            }
             "--preroll" => {
                 let s = value.parse::<f64>().map_err(|_| format!("--preroll: {value} is not a number"))?;
                 if !(s.is_finite() && s > 0.0 && s <= 60.0) {
@@ -996,7 +1004,10 @@ every row's time is scenario time (the flight code's clock was scenario time + {
     // before the first flight step (the board sets it after its boot, when IMU1 and the ESCs are healthy and nothing
     // is running; the pre-arm rule is checked on the board, not here).
     handshake.set_permit(true);
-    let tuning = Tuning::DEFAULT;
+    let mut tuning = Tuning::DEFAULT;
+    if let Some(s) = NOAID_SIGMA.get() {
+        tuning.nav_noaid_sigma_m = *s;
+    }
     let mut world = World { plant, backend, imu1, imu2, slow, wind_ned_ms: wind };
     let mut shadow: Option<Box<dyn Slot>> = match shadow {
         None => None,

@@ -13,7 +13,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 const HELP: &str = "\
-marv-replay <log.BIN> <outdir> [--every N] [--imu-period-us US] [--mag-expected UT,INC_DEG,STR_PCT,TOL_DEG]
+marv-replay <log.BIN> <outdir> [--every N] [--imu-period-us US] [--mag-expected UT,INC_DEG,STR_PCT,TOL_DEG] [--noaid-sigma M]
 
 Replays a flight log through the flight code's estimators (the real Rust code, Tuning::DEFAULT) and prints a
 validation table against the log's own NAV and NKF1 records. One CSV per estimator goes into <outdir>
@@ -86,11 +86,14 @@ struct Args {
     out: PathBuf,
     every: usize,
     opts: StreamOpts,
+    /// `--noaid-sigma`: replaces `Tuning::nav_noaid_sigma_m` (the armed no-aid position hold's sigma) in every estimator.
+    noaid: Option<f32>,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut pos = Vec::new();
     let mut every = 8usize;
+    let mut noaid = None;
     let mut opts = StreamOpts { imu_period_us: None, expected_cli: None };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -98,6 +101,9 @@ fn parse_args() -> Result<Args, String> {
             "-h" | "--help" => {
                 print!("{HELP}");
                 std::process::exit(0);
+            }
+            "--noaid-sigma" => {
+                noaid = Some(it.next().and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite() && *v > 0.0).ok_or("--noaid-sigma M")?)
             }
             "--every" => every = it.next().and_then(|v| v.parse().ok()).filter(|&v| v > 0).ok_or("--every N")?,
             "--imu-period-us" => {
@@ -117,7 +123,7 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     let [log, out]: [String; 2] = pos.try_into().map_err(|_| "usage: marv-replay <log.BIN> <outdir> [options]; --help")?;
-    Ok(Args { log: log.into(), out: out.into(), every, opts })
+    Ok(Args { log: log.into(), out: out.into(), every, opts, noaid })
 }
 
 fn bits(v: &Valid) -> [u8; 7] {
@@ -329,9 +335,13 @@ fn run() -> Result<(), String> {
     }
     let iv = intervals(&stream);
     println!("armed intervals: {}", iv.len());
-    gnss_diagnostics(&stream, &Tuning::DEFAULT);
+    let mut tuning = Tuning::DEFAULT;
+    if let Some(s) = args.noaid {
+        tuning.nav_noaid_sigma_m = s;
+    }
+    gnss_diagnostics(&stream, &tuning);
 
-    let mut rows = table(&Tuning::DEFAULT);
+    let mut rows = table(&tuning);
     for r in &mut rows {
         r.nav.reserve(stream.steps.len());
     }
