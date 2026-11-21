@@ -262,9 +262,24 @@ long seeded runs (noise sd, Gauss-Markov sigma and time constant, drift size, la
 perfect-calibration identity, the GNSS position round trip and the 180 deg wrap, and every sample reaching a flight step
 exactly once.
 
+## The shadow estimator
+
+`--shadow mahony-baro` (either form) runs `fw_flight::mahony_baro::MahonyBaro`, the phase-1 steering estimator
+(Mahony plus the vertical filter `VertKf`, decision-nav-eskf-20261120 Amendment B, B1), in the runner's shadow slot
+(decision-sim-seams 9): after each flight step it gets the same `Sensors` and the gate's armed state the step left.
+The flight step still runs `Mahony`; the log, the verdict and every other output line are the same with and without
+the flag. It adds one line per run (in a spread, after the cell's line), `shadow mahony-baro` then `key value` pairs:
+`init_s` (VertKf's initialisation), then, over the steps from 5 s after it (`judged`), the rms and largest error of
+D against truth (`d_rms`, `d_max`, m; truth down is taken relative to its value at the initialisation, when the
+vehicle is still in every scenario) and of vD (`v_rms`, `v_max`, m/s), `v_3sigma` (steps with |vD error| above 3 of
+VertKf's sigmas), the final `bd` (earth-down accelerometer bias, m/s^2), the barometer samples `gated` out and
+`fused`, `resets`, `flags_lost` (judged steps without velocity_d or position_d), `identity_breaks` (steps whose
+attitude, rates or tilt/rates flags differ from the flight step's Mahony, bit for bit: invariant I9), and the largest
+errors and 3-sigma count before the first touchdown after lift-off (`*_pre_td`).
+
 ## Not built yet
 
-Wind gusts (phase 2), the logging of the slow samples, the shadow estimator, the ESKF and the altitude and position
+Wind gusts (phase 2), the logging of the slow samples, the ESKF in the shadow slot and the altitude and position
 holds (step 7), the TCP link and the Gazebo backend (steps 8 and 9).
 
 ## Check the card
@@ -290,4 +305,11 @@ placeholder and every value or range that is still `"ask"`. Any error exits 1.
     cargo test --workspace
 
 Eight tests in `marv-card` (one card that passes, one broken card per check, the sensor fields, the home override)
-and the thirteen of `marv-sim`.
+and the seventeen of `marv-sim`. Four of them, `tests/nav_vertical.rs`, are MahonyBaro's B4 tests on the sensor
+models: a1 (bit identity with Mahony, with its negative control), a3 (an accelerometer bias at the card's range bound
+is estimated; negative control: bias frozen), a4 (200 ms barometer latency compensated by the delay term; negative
+control: delay 0), and a2, which runs the scenario suite and both spread files through `marv-run --shadow
+mahony-baro` and requires |D error| <= 0.3 m, no vD error above 3 sigma and no identity break in every run (run it
+with `--release`: it runs 295 flights). a2 FAILS today in `takeoff-land` (the barometer model's drift random walk,
+0.77 m over 14 min, reaches 0.29 m within one run, and the touchdown hold zeroes the velocity in one tick, which no
+IMU sample shows).

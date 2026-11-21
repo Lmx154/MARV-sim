@@ -9,7 +9,9 @@ use fw_flight::alloc::CardAllocator;
 use fw_flight::esc::hold;
 use fw_flight::gate::MotorCommand;
 use fw_flight::gnc::{Allocator, Controller, Estimator, Sensors, Setpoint};
+use fw_flight::gnc::NavState;
 use fw_flight::mahony::Mahony;
+use fw_flight::mahony_baro::MahonyBaro;
 use fw_flight::pid::CascadedPid;
 use fw_flight::step::{Flight, FlightInputs, StepOut};
 use fw_flight::tuning::Tuning;
@@ -40,7 +42,8 @@ const USAGE: &str = "usage: marv-run --card <marv.toml> --env <env.toml> --seed 
 [--point <kf_scale>,<inertia_scale>,<lag_s or ->] [--home <env/home.local.toml>]
        marv-run --card <marv.toml> --env <env.toml> [--seed <u64>] --spread <file> --out-dir <dir> \
 [--only <cell>] [--logs fail|all] [--home <env/home.local.toml>]
-(--seed is given exactly when the spread file has no seeds axis)";
+(--seed is given exactly when the spread file has no seeds axis)
+Either form takes --shadow mahony-baro: MahonyBaro runs in the shadow slot and one `shadow` line reports it.";
 
 struct Args {
     card: PathBuf,
@@ -48,6 +51,8 @@ struct Args {
     /// The env's git-ignored `home_override`: its records replace the env file's (origin and field).
     home: Option<PathBuf>,
     seed: Option<u64>,
+    /// `--shadow mahony-baro`: run `MahonyBaro` in the shadow slot.
+    shadow: bool,
     job: Job,
 }
 
@@ -68,6 +73,7 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
     let (mut card, mut env, mut scenario, mut seed, mut out) = (None, None, None, None, None);
     let (mut point, mut spread, mut out_dir) = (None, None, None);
     let (mut only, mut logs, mut home) = (None, None, None);
+    let mut shadow = false;
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         if flag == "--help" || flag == "-h" {
@@ -85,6 +91,8 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
             "--spread" => spread = Some(PathBuf::from(value)),
             "--out-dir" => out_dir = Some(PathBuf::from(value)),
             "--only" => only = Some(value.clone()),
+            "--shadow" if value == "mahony-baro" => shadow = true,
+            "--shadow" => return Err(format!("--shadow: {value} is not mahony-baro")),
             "--logs" => {
                 logs = Some(match value.as_str() {
                     "fail" => Logs::Fail,
@@ -113,6 +121,7 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
         card: card.ok_or("--card is required")?,
         env: env.ok_or("--env is required")?,
         home,
+        shadow,
         seed,
         job,
     }))
@@ -146,6 +155,97 @@ fn plant_card(card: &Card, point: Option<Point>, map: &Map, air: &Air) -> Card {
         c.drag_rotor_linear.v = Some(d);
     }
     c
+}
+
+/// The shadow slot (decision-sim-seams 9): `MahonyBaro` fed the same sensors as the flight step and the gate's armed
+/// state the step left, compared with the flight step's estimator (I9) and with truth (B4 a2). Nothing it does
+/// reaches the flight step, the log or the verdict.
+struct Shadow {
+    est: MahonyBaro,
+    /// The gate's state after the previous step, as `Flight::step` gives its own estimator.
+    armed: bool,
+    /// Step time and truth down at VertKf's initialisation (the vehicle is still then in every scenario).
+    init: Option<(u64, f64)>,
+    /// Steps judged (from 5 s after the initialisation), sums of squares and largest errors, D (m) and vD (m/s).
+    n: u64,
+    d2: f64,
+    d_max: f64,
+    v2: f64,
+    v_max: f64,
+    /// Judged steps with |vD error| above 3 sigma (B3's test-only sigma check).
+    v_3sigma: u64,
+    /// Judged steps with velocity_d or position_d false.
+    flags_lost: u64,
+    /// Airborne seen since the initialisation, then the first touchdown after it; the largest errors and 3-sigma count
+    /// before that touchdown (the touchdown hold zeroes the velocity in one tick, which no IMU sample shows).
+    airborne: bool,
+    landed: bool,
+    pre_td: (f64, f64, u64),
+    /// Steps whose attitude, rates or tilt/rates flags differ from the flight step's estimator, bit for bit (I9).
+    identity_breaks: u64,
+}
+
+/// The judged window starts this long after the initialisation, us (B4 a2: "from 5 s after initialisation").
+const SHADOW_SETTLE_US: u64 = 5_000_000;
+
+impl Shadow {
+    fn new(tuning: &Tuning) -> Shadow {
+        Shadow { est: MahonyBaro::new(tuning), armed: false, init: None, n: 0, d2: 0.0, d_max: 0.0, v2: 0.0, v_max: 0.0,
+            v_3sigma: 0, flags_lost: 0, airborne: false, landed: false, pre_td: (0.0, 0.0, 0), identity_breaks: 0 }
+    }
+
+    /// After each flight step, as `Flight::step` runs its estimator (a non-finite IMU sample never reaches it).
+    fn feed(&mut self, sensors: &Sensors, out: &StepOut, truth: &Truth) {
+        self.est.set_armed(self.armed);
+        self.armed = out.armed;
+        let r = &sensors.imu1.reading;
+        if !r.gyro_rads.iter().chain(&r.accel_ms2).all(|v| v.is_finite()) {
+            return;
+        }
+        let nav: NavState = self.est.update(sensors);
+        let same = nav.attitude.map(f32::to_bits) == out.nav.attitude.map(f32::to_bits)
+            && nav.rates_rads.map(f32::to_bits) == out.nav.rates_rads.map(f32::to_bits)
+            && nav.valid.tilt == out.nav.valid.tilt
+            && nav.valid.rates == out.nav.valid.rates;
+        self.identity_breaks += u64::from(!same);
+        if self.init.is_none() && self.est.vert().initialised() {
+            self.init = Some((nav.t_us, truth.position_m[2]));
+        }
+        let Some((t0, d0)) = self.init else { return };
+        self.airborne |= !truth.on_ground;
+        self.landed |= self.airborne && truth.on_ground;
+        if nav.t_us < t0 + SHADOW_SETTLE_US {
+            return;
+        }
+        let ed = f64::from(nav.position_m[2]) - (truth.position_m[2] - d0);
+        let ev = f64::from(nav.velocity_ms[2]) - truth.velocity_ms[2];
+        let sigma_v = nav.sigma.map_or(f64::INFINITY, |s| f64::from(s.velocity_d_ms));
+        self.n += 1;
+        self.d2 += ed * ed;
+        self.d_max = self.d_max.max(ed.abs());
+        self.v2 += ev * ev;
+        self.v_max = self.v_max.max(ev.abs());
+        self.v_3sigma += u64::from(ev.abs() > 3.0 * sigma_v);
+        self.flags_lost += u64::from(!(nav.valid.velocity_d && nav.valid.position_d));
+        if !self.landed {
+            let (d, v, n3) = self.pre_td;
+            self.pre_td = (d.max(ed.abs()), v.max(ev.abs()), n3 + u64::from(ev.abs() > 3.0 * sigma_v));
+        }
+    }
+
+    /// One line, `key value` pairs after `shadow mahony-baro`.
+    fn line(&self) -> String {
+        let v = self.est.vert();
+        let n = self.n.max(1) as f64;
+        format!(
+            "shadow mahony-baro init_s {} judged {} d_rms {:.4} d_max {:.4} v_rms {:.4} v_max {:.4} v_3sigma {} bd {:.4} \
+gated {} fused {} resets {} flags_lost {} identity_breaks {} d_max_pre_td {:.4} v_max_pre_td {:.4} v_3sigma_pre_td {}",
+            self.init.map_or("none".to_string(), |(t, _)| format!("{:.3}", t as f64 * 1e-6)),
+            self.n, (self.d2 / n).sqrt(), self.d_max, (self.v2 / n).sqrt(), self.v_max, self.v_3sigma, v.bias_d(),
+            v.rejected(), v.fused(), v.resets(), self.flags_lost, self.identity_breaks, self.pre_td.0, self.pre_td.1,
+            self.pre_td.2
+        )
+    }
 }
 
 /// The simulated world: what the flight step is run against.
@@ -202,6 +302,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
     mut pilot: Option<&mut Pilot>,
     ticks: u64,
     log: &mut Log,
+    mut shadow: Option<&mut Shadow>,
 ) -> (u64, u64, Trace) {
     // The newest StepOut's time and command, as the ESC task sees them; none yet counts as (0, Stop).
     let mut newest = (0, MotorCommand::STOP);
@@ -265,6 +366,9 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             let sensors = Sensors { imu1: s1, imu2: Some(s2), baro, mag, gnss, external: None };
             let out = flight.step(&FlightInputs { sensors, rc: pending.take() });
             newest = (out.t_us, out.motors);
+            if let Some(sh) = shadow.as_deref_mut() {
+                sh.feed(&sensors, &out, &truth);
+            }
             flight_steps += 1;
 
             log.imu(truth.t_us, 0, &s1.reading);
@@ -292,6 +396,8 @@ struct Outcome {
     summary: Vec<String>,
     checks: Vec<Check>,
     notes: Vec<String>,
+    /// The shadow's line, with `--shadow`.
+    shadow: Option<String>,
 }
 
 /// The cell of a matrix run: its name and the values of its axes, for the plant, the sensors and the log.
@@ -306,7 +412,7 @@ struct Run<'a> {
 /// when `keep` or when a check fails.
 #[allow(clippy::too_many_arguments)]
 fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option<Point>, cell: Option<&Run>, out: &Path,
-    keep: bool) -> Result<Outcome, String> {
+    keep: bool, shadow: bool) -> Result<Outcome, String> {
     let (map, air, ground) = cell.map_or((Map::default(), Air::default(), Ground::default()), |r| (r.map, r.air, r.ground));
     let sloped;
     let scenario = match ground.roll_pitch_deg {
@@ -391,7 +497,9 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
     let tuning = Tuning::DEFAULT;
     let flight = Flight::new(Mahony::new(&tuning), CascadedPid::new(&tuning), CardAllocator::new(), &tuning, handshake);
     let mut world = World { plant, backend, imu1, imu2, slow, wind_ned_ms: wind };
-    let (ran, flight_steps, mut trace) = run(flight, &mut world, scenario, pilot.as_mut(), ticks, &mut log);
+    let mut shadow = shadow.then(|| Shadow::new(&tuning));
+    let (ran, flight_steps, mut trace) =
+        run(flight, &mut world, scenario, pilot.as_mut(), ticks, &mut log, shadow.as_mut());
 
     if let Some(p) = &pilot {
         trace.phases = p.timeline().to_vec();
@@ -446,7 +554,7 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
             summary.push(format!("PHASE {i:>2} {:<8} start {:>7.3} s  {how}", ph.name, ph.start_us as f64 * 1e-6));
         }
     }
-    Ok(Outcome { summary, checks, notes })
+    Ok(Outcome { summary, checks, notes, shadow: shadow.map(|s| s.line()) })
 }
 
 /// What `--spread` refuses before any run: a value outside a card range, or a slope on a scenario in the air. The
@@ -511,8 +619,8 @@ fn go(args: &Args) -> Result<bool, Failure> {
         Job::One { scenario, out, point } => {
             let seed = args.seed.ok_or(Failure::Usage("--seed is required with --scenario".to_string()))?;
             let scenario = Scenario::load(scenario)?;
-            let o = run_one(&card, &env, &scenario, seed, *point, None, out, true)?;
-            for line in o.summary.iter().chain(&o.notes) {
+            let o = run_one(&card, &env, &scenario, seed, *point, None, out, true, args.shadow)?;
+            for line in o.summary.iter().chain(&o.notes).chain(&o.shadow) {
                 println!("{line}");
             }
             for c in &o.checks {
@@ -566,7 +674,7 @@ fn go(args: &Args) -> Result<bool, Failure> {
                 let out = out_dir.join(format!("{}.BIN", cell.name));
                 let keep = only.is_some() || *logs == Logs::All;
                 let o = run_one(&card, &env, &scenarios[cell.scenario], cell.seed, Some(spread.points[cell.point]),
-                    Some(&run), &out, keep)?;
+                    Some(&run), &out, keep, args.shadow)?;
                 if only.is_some() {
                     for line in o.summary.iter().chain(&o.notes) {
                         println!("{line}");
@@ -590,6 +698,9 @@ fn go(args: &Args) -> Result<bool, Failure> {
                 passed += usize::from(failing.is_empty());
                 cell_pass.push(failing.is_empty());
                 println!("{:<width$}  {}  {}", cell.name, if failing.is_empty() { "PASS" } else { "FAIL" }, failing.join(", "));
+                if let Some(line) = &o.shadow {
+                    println!("{:<width$}  {line}", cell.name);
+                }
                 let _ = std::io::stdout().flush();
             }
             println!("failures by check (cells failing / cells judged):");
