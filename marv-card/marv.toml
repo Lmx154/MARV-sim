@@ -1,6 +1,7 @@
 # MARV vehicle card: the only source of the vehicle's physical numbers.
 # Schema and rules: MARV-V2-drivers/_plan/decision-sim-card-20261119.md. SI units; body frame FRD at the centre of mass.
-# Every number is a record: { v = value, unit, tag, src, range }. Tags: measured, datasheet, cad, derived, placeholder.
+# Every number is a record: { v = value, unit, tag, src, range }. Tags: measured, datasheet, cad, derived, placeholder,
+# proposed (put to the owner, not yet approved).
 # Check it with: cargo run -q -p marv-card --bin card-check -- marv-card/marv.toml env/default.toml
 
 [card]
@@ -98,16 +99,26 @@ latency = { v = 0.0, unit = "s", tag = "placeholder", range = "ask", src = "none
 pressure_noise_sd = { v = 0.179, unit = "Pa", tag = "measured", src = "at rest on the board, 60 s, 2026-11-17, a 1 s moving mean removed, sampled at 25/s (HANDOFF:88; PRESETS:491-492); the datasheet gives 0.21" }
 pressure_bias = { v = 0.0, unit = "Pa", tag = "placeholder", range = [-30.0, 30.0], src = "none; range: absolute accuracy +/-30 Pa, 300 to 1100 hPa (DS BMP581.txt:407)" }
 latency = { v = 0.0115, unit = "s", tag = "derived", src = "pressure conversion x16 10.4 ms + temperature conversion x2 1.1 ms, typical (DS BMP581.txt:650, 655; PRESETS:81-83)" }
+airborne_height_noise_sd = { v = 0.11, unit = "m", tag = "measured", src = "log 186, airborne below 1.5 m/s, added to the at-rest noise in the air (PLAN:decision-nav-eskf-20261120.md section 9a, 9e; owner approved 2026-11-20)" }
+# Drift: a random walk in height whose 1-sigma size after drift_time is drift_sd.
+drift_sd = { v = 0.77, unit = "m", tag = "measured", src = "log 186: 0.77 m over 14 min (PLAN:decision-nav-eskf-20261120.md section 9a, 9e; owner approved 2026-11-20)" }
+drift_time = { v = 840.0, unit = "s", tag = "measured", src = "the 14 min of drift_sd (same source)" }
 
 # Compass, BMM350, the firmware default (100 Hz, averaging 2; FW:crates/fw-settings/src/mag.rs:37-38).
 [compass]
 field_noise_sd = { v = [0.148, 0.150, 0.338], unit = "uT", tag = "measured", src = "at rest on the board, 60 s, 2026-11-17, sampled at 25/s (HANDOFF:95; PRESETS:493-494); the datasheet gives 0.190 and 0.450" }
 hard_iron_bias = { v = [0.0, 0.0, 0.0], unit = "uT", tag = "placeholder", range = "ask", src = "none: the residual after the firmware's compass calibration is not known; the datasheet's own offset is +/-2 uT typical after Bosch's calibration (DS BMM350.txt:408-414)" }
+# The board's distortion that the firmware's calibration leaves (sensor-frame field = soft_iron x field + hard_iron_bias).
+soft_iron = { v = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], unit = "1", tag = "placeholder", range = "ask", src = "none: identity until a calibration's residual is measured (PLAN:decision-nav-eskf-20261120.md section 9b, 9e)" }
 latency = { v = 0.005, unit = "s", tag = "placeholder", range = [0.0, 0.005], src = "a bound, not a datasheet figure: at most averaging x 2.5 ms (PRESETS:89-90)" }
 
-# GNSS, Quectel LC76G. No datasheet for it is on disk: every field waits for the owner (before step 7).
+# GNSS, Quectel LC76G. Values from flight log 186 (PLAN:decision-nav-eskf-20261120.md section 9c, 9e); owner approved
+# 2026-11-20 except the three slow_* numbers, which are proposed.
 [gnss]
-horizontal_sd = { v = "ask", unit = "m", tag = "placeholder", range = "ask", src = "none: ask owner (module datasheet)" }
-vertical_sd = { v = "ask", unit = "m", tag = "placeholder", range = "ask", src = "none: ask owner (module datasheet)" }
-velocity_sd = { v = "ask", unit = "m/s", tag = "placeholder", range = "ask", src = "none: ask owner (module datasheet)" }
-latency = { v = "ask", unit = "s", tag = "placeholder", range = "ask", src = "none: ask owner; a bench note in DRV:lc76g/docs/device.md is to be checked in step 7" }
+horizontal_sd = { v = 0.18, unit = "m", tag = "measured", src = "log 186 rest scatter, per horizontal axis" }
+vertical_sd = { v = 0.41, unit = "m", tag = "measured", src = "log 186 rest scatter" }
+velocity_sd = { v = 0.15, unit = "m/s", tag = "derived", src = "the reconstruction's raw GPS velocity innovations, std 0.12-0.19 (recon_summary.txt:67)" }
+latency = { v = 0.43, unit = "s", tag = "measured", range = [0.40, 0.46], src = "log 186 delay scan at 1 Hz, +-3 scan sigma" }
+slow_horizontal_sd = { v = 0.3, unit = "m", tag = "proposed", src = "decision-nav-eskf section 9c (offline filter settings); Gauss-Markov sigma per horizontal axis" }
+slow_vertical_sd = { v = 1.0, unit = "m", tag = "proposed", src = "decision-nav-eskf section 9c (offline filter settings); Gauss-Markov sigma, vertical" }
+slow_time_constant = { v = 60.0, unit = "s", tag = "proposed", src = "decision-nav-eskf section 9c (offline filter settings); Gauss-Markov time constant, all three axes" }

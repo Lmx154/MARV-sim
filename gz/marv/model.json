@@ -1,6 +1,6 @@
 {
  "cad_commit": "72199d6c35cb57ab2039940e2f682e9041ff1dd1",
- "card_sha256": "4d3b581a14d7f8bf8e7e5fad092e9fd9bf6614bb172c2ad0d619a8392b2ae013",
+ "card_sha256": "16b269538cf9ecb66b3383f3245db86b507f0da9cc6be5bd7bdc8ad98620e81a",
  "h_rest": 0.03343273317428403,
  "mesh_dir_relative_to_model": "../../../../Projects/CAD/drone/model/marv_quad/meshes",
  "meshes": [

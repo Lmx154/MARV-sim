@@ -21,6 +21,8 @@ pub enum Tag {
     Cad,
     Derived,
     Placeholder,
+    /// A number put to the owner and not yet approved; listed by card-check until it is.
+    Proposed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -112,6 +114,40 @@ pub struct ImuProfile {
     pub latency: Record<f64>,
 }
 
+/// The barometer's model numbers (decision-nav-eskf section 9a).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BaroProfile {
+    pub pressure_noise_sd: Record<f64>,
+    pub pressure_bias: Record<f64>,
+    pub latency: Record<f64>,
+    pub airborne_height_noise_sd: Record<f64>,
+    /// The drift random walk reaches `drift_sd` (1 sigma) after `drift_time`.
+    pub drift_sd: Record<f64>,
+    pub drift_time: Record<f64>,
+}
+
+/// The compass's model numbers (section 9b): body FRD, uT.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompassProfile {
+    pub field_noise_sd: Record<[f64; 3]>,
+    pub hard_iron_bias: Record<[f64; 3]>,
+    pub soft_iron: Record<[[f64; 3]; 3]>,
+    pub latency: Record<f64>,
+}
+
+/// The GNSS receiver's model numbers (section 9c).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GnssProfile {
+    pub horizontal_sd: Record<f64>,
+    pub vertical_sd: Record<f64>,
+    pub velocity_sd: Record<f64>,
+    pub latency: Record<f64>,
+    /// The slow (Gauss-Markov) position error: sigma per horizontal axis, vertical sigma, time constant.
+    pub slow_horizontal_sd: Record<f64>,
+    pub slow_vertical_sd: Record<f64>,
+    pub slow_time_constant: Record<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Card {
     pub name: String,
@@ -126,6 +162,9 @@ pub struct Card {
     pub battery_voltage: Record<f64>,
     pub imu1: ImuProfile,
     pub imu2: ImuProfile,
+    pub baro: BaroProfile,
+    pub compass: CompassProfile,
+    pub gnss: GnssProfile,
     /// Lowercase hex SHA-256 of the file bytes.
     pub sha256: String,
     open: Vec<String>,
@@ -256,9 +295,10 @@ fn parse_raw(path: &str, val: &Value) -> Result<Record<Value>, Vec<String>> {
             "cad" => Some(Tag::Cad),
             "derived" => Some(Tag::Derived),
             "placeholder" => Some(Tag::Placeholder),
+            "proposed" => Some(Tag::Proposed),
             _ => {
                 errs.push(format!(
-                    "{path}: tag must be one of measured, datasheet, cad, derived, placeholder (got \"{s}\")"
+                    "{path}: tag must be one of measured, datasheet, cad, derived, placeholder, proposed (got \"{s}\")"
                 ));
                 None
             }
@@ -345,6 +385,9 @@ fn walk(root: &Table, exempt: &[&str], errs: &mut Vec<String>, open: &mut Vec<St
                     let mut why = Vec::new();
                     if r.tag == Tag::Placeholder {
                         why.push("placeholder");
+                    }
+                    if r.tag == Tag::Proposed {
+                        why.push("proposed");
                     }
                     if r.v.is_none() {
                         why.push("v = \"ask\"");
@@ -631,6 +674,38 @@ fn imu_profile(root: &Table, table: &str, errs: &mut Vec<String>) -> Option<ImuP
     })
 }
 
+fn baro_profile(root: &Table, errs: &mut Vec<String>) -> Option<BaroProfile> {
+    Some(BaroProfile {
+        pressure_noise_sd: rec(root, "baro", "pressure_noise_sd", errs)?,
+        pressure_bias: rec(root, "baro", "pressure_bias", errs)?,
+        latency: rec(root, "baro", "latency", errs)?,
+        airborne_height_noise_sd: rec(root, "baro", "airborne_height_noise_sd", errs)?,
+        drift_sd: rec(root, "baro", "drift_sd", errs)?,
+        drift_time: rec(root, "baro", "drift_time", errs)?,
+    })
+}
+
+fn compass_profile(root: &Table, errs: &mut Vec<String>) -> Option<CompassProfile> {
+    Some(CompassProfile {
+        field_noise_sd: rec(root, "compass", "field_noise_sd", errs)?,
+        hard_iron_bias: rec(root, "compass", "hard_iron_bias", errs)?,
+        soft_iron: rec(root, "compass", "soft_iron", errs)?,
+        latency: rec(root, "compass", "latency", errs)?,
+    })
+}
+
+fn gnss_profile(root: &Table, errs: &mut Vec<String>) -> Option<GnssProfile> {
+    Some(GnssProfile {
+        horizontal_sd: rec(root, "gnss", "horizontal_sd", errs)?,
+        vertical_sd: rec(root, "gnss", "vertical_sd", errs)?,
+        velocity_sd: rec(root, "gnss", "velocity_sd", errs)?,
+        latency: rec(root, "gnss", "latency", errs)?,
+        slow_horizontal_sd: rec(root, "gnss", "slow_horizontal_sd", errs)?,
+        slow_vertical_sd: rec(root, "gnss", "slow_vertical_sd", errs)?,
+        slow_time_constant: rec(root, "gnss", "slow_time_constant", errs)?,
+    })
+}
+
 fn parse_motors(root: &Table, errs: &mut Vec<String>) -> Option<Motors> {
     let Some(t) = root.get("motors").and_then(Value::as_table) else {
         errs.push("motors: missing table".into());
@@ -740,6 +815,9 @@ impl Card {
         let battery_voltage = rec::<f64>(&root, "battery", "voltage", &mut errs);
         let imu1 = imu_profile(&root, "imu1", &mut errs);
         let imu2 = imu_profile(&root, "imu2", &mut errs);
+        let baro = baro_profile(&root, &mut errs);
+        let compass = compass_profile(&root, &mut errs);
+        let gnss = gnss_profile(&root, &mut errs);
 
         // Generated region (check 3) and the tables inside it. An empty region reports one
         // error; the missing tables behind it are not reported again.
@@ -807,6 +885,9 @@ impl Card {
                 battery_voltage: battery_voltage?,
                 imu1: imu1?,
                 imu2: imu2?,
+                baro: baro?,
+                compass: compass?,
+                gnss: gnss?,
                 sha256: sha256_hex(text.as_bytes()),
                 open,
             })
@@ -836,7 +917,44 @@ impl Env {
 
     /// Checks 1 and 2 on the text of an environment file.
     pub fn parse(text: &str) -> Result<Env, Vec<String>> {
-        let root = parse_toml(text)?;
+        Env::from_root(&parse_toml(text)?)
+    }
+
+    /// The environment file at `path` with each record of the override file at `home` (the owner's
+    /// `home_override`, git-ignored) put in place of the same record; then checks 1 and 2 on the result.
+    pub fn load_with_home(path: impl AsRef<Path>, home: impl AsRef<Path>) -> Result<Env, Vec<String>> {
+        let read = |p: &Path| {
+            std::fs::read_to_string(p).map_err(|e| vec![format!("{}: cannot read: {e}", p.display())])
+        };
+        Env::parse_with_home(&read(path.as_ref())?, &read(home.as_ref())?)
+    }
+
+    /// `load_with_home` on texts. The override may hold only tables of records that the file also has.
+    pub fn parse_with_home(text: &str, home: &str) -> Result<Env, Vec<String>> {
+        let mut root = parse_toml(text)?;
+        let over = parse_toml(home)?;
+        let mut errs = Vec::new();
+        for (name, val) in &over {
+            match (root.get_mut(name).and_then(Value::as_table_mut), val.as_table()) {
+                (Some(base), Some(table)) if name != "env" => {
+                    for (key, rec) in table {
+                        if base.contains_key(key) {
+                            base.insert(key.clone(), rec.clone());
+                        } else {
+                            errs.push(format!("home override: {name}.{key} is not in the environment file"));
+                        }
+                    }
+                }
+                _ => errs.push(format!("home override: [{name}] cannot be overridden")),
+            }
+        }
+        if !errs.is_empty() {
+            return Err(errs);
+        }
+        Env::from_root(&root)
+    }
+
+    fn from_root(root: &Table) -> Result<Env, Vec<String>> {
         let mut errs = Vec::new();
         let mut open = Vec::new();
         walk(&root, &ENV_EXEMPT, &mut errs, &mut open);
@@ -1005,6 +1123,29 @@ accel_noise_sd = { v = [1.0, 1.0, 1.0], unit = "m/s^2", tag = "derived", src = "
 gyro_bias = { v = [0.0, 0.0, 0.0], unit = "rad/s", tag = "derived", src = "fake" }
 accel_bias = { v = [0.0, 0.0, 0.0], unit = "m/s^2", tag = "derived", src = "fake" }
 latency = { v = 0.0, unit = "s", tag = "derived", src = "fake" }
+
+[baro]
+pressure_noise_sd = { v = 1.0, unit = "Pa", tag = "derived", src = "fake" }
+pressure_bias = { v = 0.0, unit = "Pa", tag = "derived", src = "fake" }
+latency = { v = 0.0, unit = "s", tag = "derived", src = "fake" }
+airborne_height_noise_sd = { v = 1.0, unit = "m", tag = "derived", src = "fake" }
+drift_sd = { v = 1.0, unit = "m", tag = "derived", src = "fake" }
+drift_time = { v = 1.0, unit = "s", tag = "derived", src = "fake" }
+
+[compass]
+field_noise_sd = { v = [1.0, 1.0, 1.0], unit = "uT", tag = "derived", src = "fake" }
+hard_iron_bias = { v = [0.0, 0.0, 0.0], unit = "uT", tag = "derived", src = "fake" }
+soft_iron = { v = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], unit = "1", tag = "placeholder", range = "ask", src = "fake" }
+latency = { v = 0.0, unit = "s", tag = "derived", src = "fake" }
+
+[gnss]
+horizontal_sd = { v = 1.0, unit = "m", tag = "derived", src = "fake" }
+vertical_sd = { v = 1.0, unit = "m", tag = "derived", src = "fake" }
+velocity_sd = { v = 1.0, unit = "m/s", tag = "derived", src = "fake" }
+latency = { v = 0.5, unit = "s", tag = "derived", range = [0.4, 0.6], src = "fake" }
+slow_horizontal_sd = { v = 1.0, unit = "m", tag = "proposed", src = "fake" }
+slow_vertical_sd = { v = 1.0, unit = "m", tag = "derived", src = "fake" }
+slow_time_constant = { v = 1.0, unit = "s", tag = "derived", src = "fake" }
 "#;
 
     const ENV: &str = r#"
@@ -1055,7 +1196,11 @@ gust_sd = { v = 0.0, unit = "m/s", tag = "placeholder", range = "ask", src = "fa
     #[test]
     fn fixture_passes() {
         let card = Card::parse(&hashed(CARD)).unwrap();
-        assert_eq!(card.open_items().len(), 5);
+        // The five of before, compass.soft_iron (placeholder, range "ask") and gnss.slow_horizontal_sd (proposed).
+        assert_eq!(card.open_items().len(), 7);
+        assert!(card.open_items().iter().any(|l| l.starts_with("gnss.slow_horizontal_sd: proposed")));
+        assert_eq!(card.gnss.slow_horizontal_sd.tag, Tag::Proposed);
+        assert_eq!(card.compass.soft_iron.v, Some([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]));
         let env = Env::parse(ENV).unwrap();
         assert_eq!(env.open_items().len(), 5);
     }
@@ -1116,5 +1261,33 @@ gust_sd = { v = 0.0, unit = "m/s", tag = "placeholder", range = "ask", src = "fa
         assert!(has(&errs, "motors: dshot_line values must be 0, 1, 2, 3 once each"), "{errs:?}");
         let errs = errors(&edited("rear_right = \"cw\"", "rear_right = \"ccw\""));
         assert!(has(&errs, "rotor_spin_cad.rear_right"), "{errs:?}");
+    }
+
+    #[test]
+    fn sensor_fields_are_typed_and_range_checked() {
+        let errs = errors(&edited("latency = { v = 0.5,", "latency = { v = 0.7,"));
+        assert!(has(&errs, "gnss.latency: v is outside range [0.4, 0.6]"), "{errs:?}");
+        let errs = errors(&edited("drift_time = { v = 1.0, unit = \"s\", tag = \"derived\", src = \"fake\" }\n", ""));
+        assert!(has(&errs, "baro.drift_time: missing"), "{errs:?}");
+        let errs = errors(&edited("tag = \"proposed\"", "tag = \"guessed\""));
+        assert!(has(&errs, "gnss.slow_horizontal_sd: tag must be one of"), "{errs:?}");
+        let errs = errors(&edited("v = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], unit = \"1\"", "v = [1.0, 0.0, 0.0], unit = \"1\""));
+        assert!(has(&errs, "compass.soft_iron: v must be a 3x3 matrix"), "{errs:?}");
+    }
+
+    #[test]
+    fn home_override_replaces_records_only() {
+        // A synthetic origin: obviously fake numbers.
+        let home = "[origin]\nlatitude = { v = 10.0, unit = \"deg\", tag = \"measured\", src = \"fake\" }\n\
+                    [magnetic_field]\nned = { v = [2.0, 0.0, 3.0], unit = \"uT\", tag = \"derived\", src = \"fake\" }\n";
+        let env = Env::parse_with_home(ENV, home).unwrap();
+        assert_eq!(env.origin_latitude.v, Some(10.0));
+        assert_eq!(env.origin_longitude.v, None);
+        assert_eq!(env.magnetic_field_ned.v, Some([2.0, 0.0, 3.0]));
+        assert_eq!(env.gravity.v, Some(1.0));
+        let errs = Env::parse_with_home(ENV, "[origin]\nheight = { v = 1.0, unit = \"m\", tag = \"measured\", src = \"fake\" }\n").unwrap_err();
+        assert!(has(&errs, "home override: origin.height is not in the environment file"), "{errs:?}");
+        let errs = Env::parse_with_home(ENV, "[env]\nname = \"x\"\n").unwrap_err();
+        assert!(has(&errs, "home override: [env] cannot be overridden"), "{errs:?}");
     }
 }

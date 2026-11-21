@@ -15,13 +15,19 @@ sea_level_pressure = { v = 101325.0, unit = "Pa", tag = "datasheet", src = "ISA,
 sea_level_temperature = { v = 288.15, unit = "K", tag = "datasheet", src = "ISA, ISO 2533" }
 lapse_rate = { v = 0.0065, unit = "K/m", tag = "datasheet", src = "ISA, ISO 2533" }
 
+# A public landmark: the Royal Observatory, Greenwich (published position 51 deg 28' 40" N, 0 deg 00' 05" W, altitude 68 m;
+# Wikipedia, "Royal Observatory, Greenwich").
 [origin]
-latitude = { v = "ask", unit = "deg", tag = "placeholder", range = "ask", src = "none: a public point the owner names" }
-longitude = { v = "ask", unit = "deg", tag = "placeholder", range = "ask", src = "none: a public point the owner names" }
-altitude = { v = "ask", unit = "m", tag = "placeholder", range = "ask", src = "none: above mean sea level, same point" }
+latitude = { v = 51.47783, unit = "deg", tag = "datasheet", src = "Royal Observatory, Greenwich: published position (Wikipedia), north positive" }
+longitude = { v = -0.00139, unit = "deg", tag = "datasheet", src = "Royal Observatory, Greenwich: published position (Wikipedia), east positive" }
+altitude = { v = 68.0, unit = "m", tag = "datasheet", src = "Royal Observatory, Greenwich: published altitude above mean sea level (Wikipedia)" }
 
+# World Magnetic Model at [origin] (height 68 m) for 2026.886 (2026-11-20): MARV-GCS gcs-magcal example wmm, which is
+# checked against NOAA's tables. derived (WMM2025).
 [magnetic_field]
-ned = { v = "ask", unit = "uT", tag = "placeholder", range = "ask", src = "none: a field model at [origin], once the owner names the point" }
+ned = { v = [19.561, 0.434, 45.067], unit = "uT", tag = "derived", src = "WMM2025 at [origin], 2026.886 (total 49.131 uT)" }
+declination = { v = 1.271, unit = "deg", tag = "derived", src = "WMM2025 at [origin], 2026.886, east positive" }
+inclination = { v = 66.532, unit = "deg", tag = "derived", src = "WMM2025 at [origin], 2026.886, down positive" }
 
 # The wind scenario sets its own.
 [wind]
