@@ -307,13 +307,17 @@ valid with |error| > 15 deg, `hdg_first_s`, `hdg_worst_deg`); north-east while `
 between the filter's origin and the env's removed (`ne_valid_s`, `ne_out3_s` seconds with a position or velocity axis
 outside 3 of the filter's own sigma, `ne_p_rms`, `ne_p_max`, `ne_v_max`); the vertical as `mahony-baro`'s line
 (`init_s`, `judged`, `d_rms`, `d_max`, `d_max_nodrift`, `v_rms`, `v_max`, `v_3sigma`, from 5 s after `position_d` is
-first valid); tilt against truth beside Mahony's on the same steps (`tilt_rms_deg`, `tilt_max_deg`,
-`mahony_tilt_rms_deg`, `mahony_tilt_max_deg`); counts (`mag_refused`, `screens`, `gated`, `resets_height`,
+first valid, and the a2 rule's `v_3sigma_pre_td` with `v_3sigma_pre_td_judged`, up to the first touchdown at the
+horizon); tilt against the truth of the horizon step beside Mahony's on the same steps (`tilt_rms_deg`,
+`tilt_max_deg`, `mahony_tilt_rms_deg`, `mahony_tilt_max_deg`), split at 5 s after the tilt alignment
+(`tilt_rms_first5_deg`, `mahony_tilt_rms_first5_deg`, `tilt_rms_after5_deg`, `mahony_tilt_rms_after5_deg`), and the
+Eskf against the truth of the current step for contrast (`tilt_rms_vs_current_truth_deg`); counts (`mag_refused`, `screens`, `gated`, `resets_height`,
 `resets_yaw`, `resets_gps`, `reinits`), `yaw_aligned` at the end and `multi_job` (whether any step did more than one
 heavy job). Tests in `tests/nav_eskf.rs`: c1 (heading never valid while more than 15 deg wrong; negative control a
 compass turned 30 deg), c2 (log 186's disturbed take-off spot gives no alignment and no GNSS before take-off; negative
 control the health test opened), c4 (north-east within 3 sigma with the GNSS latency 0.43 s; negative control delay 0;
-fails by the specification, see its message) on a synthetic flight through the sensor models, and b2/c1/b3 over the
+fails its pass rule by the specification, see its message; it also reports the count with the GNSS model's slow error
+removed, for the owner) on a synthetic flight through the sensor models, and b2/c1/b3 over the
 suite through `--shadow eskf` (height with the drift removed <= 0.3 m, no heading valid while wrong, one heavy job per
 step; tilt printed only).
 
