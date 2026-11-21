@@ -315,9 +315,11 @@ Eskf against the truth of the current step for contrast (`tilt_rms_vs_current_tr
 `resets_yaw`, `resets_gps`, `reinits`), `yaw_aligned` at the end and `multi_job` (whether any step did more than one
 heavy job). Tests in `tests/nav_eskf.rs`: c1 (heading never valid while more than 15 deg wrong; negative control a
 compass turned 30 deg), c2 (log 186's disturbed take-off spot gives no alignment and no GNSS before take-off; negative
-control the health test opened), c4 (north-east within 3 sigma with the GNSS latency 0.43 s; negative control delay 0;
-fails its pass rule by the specification, see its message; it also reports the count with the GNSS model's slow error
-removed, for the owner) on a synthetic flight through the sensor models, and b2/c1/b3 over the
+control the health test opened), c4 (north-east within 3 sigma with the GNSS latency 0.43 s; negative control delay 0),
+judged by the owner's ruling of 2026-11-21 (decision-nav-eskf-20261120, "Owner's answers, 2026-11-21 (after the session
+break)") against truth plus the simulated GNSS's own slow (Gauss-Markov) error at the measurement's time, because the
+filter cannot see its sensor's slow error (as with the barometer's drift in a2); the count against plain truth is printed,
+not judged, and the delay-0 run must have a judged count above 0, on a synthetic flight through the sensor models, and b2/c1/b3 over the
 suite through `--shadow eskf` (height with the drift removed <= 0.3 m, no heading valid while wrong, one heavy job per
 step; tilt printed only).
 

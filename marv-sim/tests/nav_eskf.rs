@@ -284,6 +284,11 @@ fn c2_a_disturbed_take_off_spot_gives_no_alignment_and_no_gps_and_its_negative_c
     assert!(off.aligned_before_takeoff && off.hdg_bad_s > 0.0, "negative control: heading valid while wrong");
 }
 
+/// c4, judged by the owner's ruling of 2026-11-21 (decision-nav-eskf-20261120, "Owner's answers, 2026-11-21 (after the
+/// session break)"): the error is taken against truth plus the simulated GNSS's own slow (Gauss-Markov) error at the
+/// measurement's time (`ne_out3_slow`, must be 0), because the filter cannot see its sensor's slow error, as with the
+/// barometer's drift in a2. The raw count against plain truth (`ne_out3`) is printed, not judged. Negative control:
+/// with the GNSS delay 0 the judged count must be greater than 0 (it is 24 826 against 0).
 #[test]
 fn c4_gps_fused_at_its_own_time_stays_within_3_sigma_and_delay_0_fails() {
     let (card, env) = load();
@@ -293,14 +298,23 @@ fn c4_gps_fused_at_its_own_time_stays_within_3_sigma_and_delay_0_fails() {
     let ok = fly(&card, &env, &t, MagEdit::None);
     let zero = fly(&card, &env, &Tuning { nav_gps_delay_us: 0, ..t }, MagEdit::None);
     println!("c4: {ok:?}\nc4 negative control (nav_gps_delay_us 0): {zero:?}");
+    println!(
+        "c4 summary: raw (plain truth, not judged) {} of {}; judged (truth plus the GNSS slow error) {} of {}; \
+         negative control raw {} judged {}",
+        ok.ne_out3, ok.ne_steps, ok.ne_out3_slow, ok.ne_steps, zero.ne_out3, zero.ne_out3_slow
+    );
     assert!(ok.ne_valid_s > 30.0);
-    assert!(zero.ne_out3 > 0, "negative control: delay 0 must fail the 3-sigma bound");
+    assert!(
+        zero.ne_out3_slow > 0,
+        "negative control: delay 0 must fail the judged 3-sigma bound (judged {} of {}, raw {})",
+        zero.ne_out3_slow, zero.ne_steps, zero.ne_out3
+    );
     assert_eq!(
-        ok.ne_out3, 0,
-        "SPECIFICATION (C7 c4 against sections 1a and C-1 finding N): {} of {} north-east valid steps outside {SIGMAS} sigma; \
-         the GNSS model's slow error (Gauss-Markov 0.3 m, 60 s, approved) is not a filter state, and the position sigma \
-         sits near the 0.3 m floor, so position against truth leaves 3 sigma (largest {:.2} m); delay 0 is worse",
-        ok.ne_out3, ok.ne_steps, ok.ne_pmax
+        ok.ne_out3_slow, 0,
+        "c4 (owner's ruling 2026-11-21): {} of {} north-east valid steps outside {SIGMAS} sigma against truth plus the GNSS \
+         model's slow error (judged); raw against plain truth {} (not judged, largest {:.2} m); negative control delay 0: \
+         judged {} raw {}",
+        ok.ne_out3_slow, ok.ne_steps, ok.ne_out3, ok.ne_pmax, zero.ne_out3_slow, zero.ne_out3
     );
 }
 
