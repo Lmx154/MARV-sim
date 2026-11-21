@@ -1,8 +1,12 @@
-# NEGATIVE CONTROL n2 (Amendment F, F9; not in the spread, must FAIL the alt-hold verdict): scenarios/alt-hold.toml with the mode switch never moved (low throughout).
+# NEGATIVE CONTROL n2 (Amendment F, F9; not in the spread, must FAIL the alt-hold verdict): scenarios/alt-hold.toml with the
+# mode switch never moved (low throughout). Original header follows.
 # Altitude hold (decision-nav-eskf-20261120, Amendment F, F9; run with `--estimator eskf2 --preroll 2.0`): the hover
-# preamble ("arm in the air"), switch to the middle (Altitude) at 3 s, a roll torque step at 12 s, a climb stick at
-# 23..24 s, a descent stick at 34..36 s, and a barometer loss at 46..51.5 s (the flight code falls back to Angle when
-# its vertical flags drop, and returns to Altitude when the barometer is fused again).
+# preamble ("arm in the air"), Altitude selected from the throttle-0.5 row (0.04 s), a roll torque step at 12 s, a climb
+# stick at 23..24 s, a descent stick at 34..36 s, and a barometer loss at 46..51.5 s (the flight code falls back to
+# Angle when its vertical flags drop, and returns to Altitude when the barometer is fused again).
+# Lead's ruling 2026-11-21: F9 selected Altitude at 3.0 s; entered from a 3 s Angle preamble at kF x0.7 the hold was
+# caught from a 9 m/s fall and was inside 0.5 m from 10.9 s. The approved mark (9g: height error within 0.5 m from 5 s
+# after entry) is about holding height, so Altitude is selected from 0.04 s and the first window starts at 5.05 s.
 [scenario]
 name = "alt-hold-n2-switch-low"
 duration_s = 56.0
@@ -20,8 +24,7 @@ rotors = "hover"
 script = [
   { t_s = 0.0,   roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.0, arm = false },                      # F9: switch off, throttle 0
   { t_s = 0.020, roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.0, arm = true },                       # F9: arm
-  { t_s = 0.040, roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.5, arm = true },                       # F9: throttle 0.5
-  { t_s = 3.0,   roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.5, arm = true },      # F9: mode middle
+  { t_s = 0.040, roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.5, arm = true },     # F9: throttle 0.5; lead's ruling: mode middle from here on
   { t_s = 23.0,  roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.8, arm = true },      # F2: 3.0 x (0.8 - 0.6)/0.4 = 1.5 m/s up
   { t_s = 24.0,  roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.5, arm = true },
   { t_s = 34.0,  roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.2, arm = true },      # F2: 1.5 x (0.4 - 0.2)/0.4 = 0.75 m/s down
@@ -35,14 +38,14 @@ torque_nm = [0.046, 0.0, 0.0]
 
 [verdict]
 check = "alt_hold"
-windows = [[8.0, 23.0], [29.0, 34.0], [41.0, 46.0]]   # F9: judged over [8, 23], [29, 34], [41, 46] s
+windows = [[5.05, 23.0], [29.0, 34.0], [41.0, 46.0]]   # F9 [8, 23], first window moved to 5 s after entry by the lead's ruling (9g mark); [29, 34], [41, 46] as F9
 max_height_error_m = 0.5      # F9: |truth D - target D (SPN.PD)| <= 0.5 m
 max_nav_gap_m = 0.3           # F9 and the owner's ruling on a2: |nav D - truth D - barometer-model drift| <= 0.3 m (raw reported)
 climb_from_s = 23.0           # F9: climb height = the target's change over 23..24 s (reported, not judged)
 climb_to_s = 24.0
 descent_from_s = 34.0         # F9: descent height = the target's change over 34..36 s (reported, not judged)
 descent_to_s = 36.0
-enter_s = 3.0                 # F9: the effective mode goes Angle -> Altitude at 3.0 s
+enter_s = 0.04                # lead's ruling (F9 had 3.0 s): the effective mode goes Angle -> Altitude from the first step after the 0.04 s row
 enter_bound_s = 0.01          # lead's reading: within 10 ms (one 4 ms stick report plus a 1.25 ms flight step, with margin)
 baro_lost_from_s = 46.0       # F9: the loss begins; Altitude -> Angle within one step of the vertical flags dropping
 baro_lost_to_s = 51.5         # F9: the loss ends; Angle -> Altitude within one step of the flags returning

@@ -347,7 +347,8 @@ fn b2_c1_b3_over_the_scenario_suite() {
     for job in jobs {
         let o = Command::new(env!("CARGO_BIN_EXE_marv-run")).current_dir(root()).args(common).args(&job).output().expect("marv-run");
         let text = String::from_utf8_lossy(&o.stdout);
-        for line in text.lines().filter(|l| l.contains("shadow eskf")) {
+        // alt-hold is a steering scenario with its own verdict (Amendment F, F9; lead 2026-11-21): not judged by b2.
+        for line in text.lines().filter(|l| l.contains("shadow eskf") && !l.starts_with("alt-hold-")) {
             runs += 1;
             let num = |k: &str| field(line, k).parse::<f64>().unwrap_or(f64::NAN);
             let (d, bad, multi) = (num("d_max_nodrift"), num("hdg_bad15_s"), field(line, "multi_job"));

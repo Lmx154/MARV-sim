@@ -149,11 +149,11 @@ The four scenarios (all start level in the air with the rotors at hover speed; s
 - `rc-loss.toml`: arming rules, the RC-loss Stop within 2.5 ms of the 1.0 s timeout, no re-arm without a switch
   cycle, switch-off Stop; judged at the levels the plant is given.
 - `alt-hold.toml` (Amendment F, F9; run with `--estimator eskf2 --preroll 2.0`, the sim's flight step on the GPS-less
-  ESKF2): the same air start, mode middle at 3.0 s, the hover roll torque from 12 s, a climb stick (throttle 0.8) at
-  23-24 s, a descent stick (0.2) at 34-36 s, and `baro_lost = [[46.0, 51.5]]`; 56 s. Judged over [8, 23], [29, 34],
-  [41, 46] s: truth height against the target (SPN.PD) <= 0.5 m; estimate against truth with the barometer model's own
+  ESKF2): the same air start, mode middle from the throttle-0.5 row (0.04 s; F9 had 3.0 s, the lead's ruling of 2026-11-21 moved it: a 3 s Angle preamble at kF x0.7 is a free fall), the hover roll torque from 12 s, a climb stick (throttle 0.8) at
+  23-24 s, a descent stick (0.2) at 34-36 s, and `baro_lost = [[46.0, 51.5]]`; 56 s. Judged over [5.05, 23] (5 s after entry),
+  [29, 34], [41, 46] s: truth height against the target (SPN.PD) <= 0.5 m; estimate against truth with the barometer model's own
   drift taken out <= 0.3 m (the raw figure is printed, not judged; the owner's ruling on a2); the effective mode never
-  Altitude on a step whose velocity_d or position_d flag is false (I6); the mode goes Angle -> Altitude at 3.0 s,
+  Altitude on a step whose velocity_d or position_d flag is false (I6); the mode goes Angle -> Altitude on the first step after the 0.04 s row,
   Altitude -> Angle within one step of the flags dropping (`nav_aid_timeout_us` after the last barometer aid) and back
   to Altitude within one step of their return; every logged number finite; armed at the end. Printed, not judged: the
   climb and descent heights, the truth height excursion in the Angle fallback, the thrust over weight around each mode

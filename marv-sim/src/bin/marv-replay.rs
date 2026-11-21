@@ -602,10 +602,7 @@ fn log_figures(log: &Log, iv: &[(u64, u64)]) -> Result<(), String> {
     let cq = nav.col("Q1")?;
     let imu = log.table("IMU")?;
     let (cii, cax) = (imu.col("I")?, imu.col("AccX")?);
-    let nki = log.table("NKI")?;
-    let (cki, csrc, cok) = (nki.col("I")?, nki.col("Src")?, nki.col("Ok")?);
-    let nkf1 = log.table("NKF1")?;
-    let (c1i, cpn) = (nkf1.col("I")?, nkf1.col("PN")?);
+    let nkf = log.table("NKI").ok().zip(log.table("NKF1").ok()).filter(|(a, b)| a.rows() > 0 && b.rows() > 0);
     println!("\nArming edges, from the log's own records (no replay). Tilt = roll / pitch in deg of the down axis.");
     println!("  edge s      NAV 0.5 s before   NAV 0.5 s after    accel mean 1 s before   angle NAV-before vs accel   NAV-after vs accel   NAV before->after");
     let us = 1_000_000u64;
@@ -652,6 +649,13 @@ fn log_figures(log: &Log, iv: &[(u64, u64)]) -> Result<(), String> {
             angle3(nb.0, na.0)
         );
     }
+    // A sim log has no NKF1 or NKI records (the board writes them): the figures that need them are skipped.
+    let Some((nki, nkf1)) = nkf else {
+        println!("\nno NKF records in this log: the NKI and NKF1 figures are skipped.");
+        return Ok(());
+    };
+    let (cki, csrc, cok) = (nki.col("I")?, nki.col("Src")?, nki.col("Ok")?);
+    let (c1i, cpn) = (nkf1.col("I")?, nkf1.col("PN")?);
     println!("\nNKI I=0 records within +-0.2 s of each arming edge (Src code: Ok code = count; Src 4 baro, 5 no-aid, 6 height reset, 7 compass yaw, 8 yaw align/reset, 9 GPS reset; Ok 0 gated, 1 fused, 2 refused, 3 screened)");
     for &(a, _) in iv {
         let mut m: std::collections::BTreeMap<(u8, u8), usize> = Default::default();

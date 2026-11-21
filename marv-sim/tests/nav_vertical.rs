@@ -212,7 +212,8 @@ fn a2_vertical_error_in_every_scenario_across_the_spread() {
         let o = Command::new(env!("CARGO_BIN_EXE_marv-run")).current_dir(root()).args(common).args(&job).output()
             .expect("marv-run");
         let text = String::from_utf8_lossy(&o.stdout);
-        for line in text.lines().filter(|l| l.contains("shadow mahony-baro")) {
+        // alt-hold is a steering scenario with its own verdict (Amendment F, F9; lead 2026-11-21): not judged by a2.
+        for line in text.lines().filter(|l| l.contains("shadow mahony-baro") && !l.starts_with("alt-hold-")) {
             runs += 1;
             let name = if line.starts_with("shadow") { job[1].clone() } else { line.split_whitespace().next().unwrap().to_string() };
             let (d_raw, d_nd, v3_raw, v3, v3_n, breaks) = (field(line, "d_max"), field(line, "d_max_nodrift"),
