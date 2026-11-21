@@ -295,7 +295,7 @@ impl Pilot {
         }
         let [roll, pitch, throttle, yaw] = self.sticks.map(|x| x as f32);
         Some(Report {
-            row: RcRow { t_us: now_us, roll, pitch, yaw, throttle, arm: self.arm },
+            row: RcRow { t_us: now_us, roll, pitch, yaw, throttle, arm: self.arm, mode: fw_core::rc::Switch3::Low },
             phase: self.index,
             mode,
             reference,

@@ -2,6 +2,7 @@
 
 use crate::backend::Start;
 use crate::math::{Quat, quat_mul};
+use fw_core::rc::Switch3;
 use marv_card::{Card, Env, Range};
 use std::path::{Path, PathBuf};
 use toml::{Table, Value};
@@ -44,11 +45,15 @@ pub struct Scenario {
     pub pilot: Option<PilotParams>,
     /// `[from_us, to_us)` intervals in which no stick report is made.
     pub rc_lost: Vec<(u64, u64)>,
+    /// `[scenario] baro_lost = [[from_s, to_s], ...]`: `[from_us, to_us)` intervals in which no barometer sample reaches
+    /// the flight code (the model keeps running).
+    pub baro_lost: Vec<(u64, u64)>,
     pub disturbances: Vec<Disturbance>,
     pub verdict: Verdict,
 }
 
-/// One row of `[rc] script`. Roll, pitch, yaw -1..1 (right, forward, clockwise +); throttle 0..1; arm = the switch.
+/// One row of `[rc] script`. Roll, pitch, yaw -1..1 (right, forward, clockwise +); throttle 0..1; arm = the switch;
+/// `mode` = the channel-6 switch ("low", the default, "middle" or "high").
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RcRow {
     pub t_us: u64,
@@ -57,6 +62,7 @@ pub struct RcRow {
     pub yaw: f32,
     pub throttle: f32,
     pub arm: bool,
+    pub mode: Switch3,
 }
 
 /// `[pilot]`: the sim pilot's limits and gains (decision-sim-takeoff-landing, sections 2 and 10).
@@ -319,7 +325,7 @@ fn ranged(t: &Table, table: &str, key: &str, lo: f64, hi: f64) -> Result<f32, St
 }
 
 fn rc_script(rc: &Table) -> Result<Vec<RcRow>, String> {
-    let keys = ["t_s", "roll", "pitch", "yaw", "throttle", "arm"];
+    let keys = ["t_s", "roll", "pitch", "yaw", "throttle", "arm", "mode"];
     let mut script: Vec<RcRow> = Vec::new();
     for (i, row) in rows(rc, "rc", "script", &keys)?.into_iter().enumerate() {
         let name = format!("rc.script[{i}]");
@@ -334,6 +340,13 @@ fn rc_script(rc: &Table) -> Result<Vec<RcRow>, String> {
             yaw: ranged(row, &name, "yaw", -1.0, 1.0)?,
             throttle: ranged(row, &name, "throttle", 0.0, 1.0)?,
             arm: get(row, &name, "arm")?.as_bool().ok_or(format!("{name}.arm: must be true or false"))?,
+            mode: match row.get("mode") {
+                None => Switch3::Low,
+                Some(Value::String(m)) if m == "low" => Switch3::Low,
+                Some(Value::String(m)) if m == "middle" => Switch3::Middle,
+                Some(Value::String(m)) if m == "high" => Switch3::High,
+                Some(_) => return Err(format!("{name}.mode: must be \"low\", \"middle\" or \"high\"")),
+            },
         });
     }
     if script.is_empty() {
@@ -607,7 +620,7 @@ impl Scenario {
                 return Err(format!("{key}: unknown table"));
             }
         }
-        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz", "mag_expected", "gnss_velocity"])?;
+        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz", "mag_expected", "gnss_velocity", "baro_lost"])?;
         let ground = match root.get("initial").and_then(Value::as_table).and_then(|i| i.get("contact")) {
             None => false,
             Some(Value::String(c)) if c == "air" => false,
@@ -668,6 +681,18 @@ impl Scenario {
             let name = format!("rc.lost[{i}]");
             rc_lost.push((micros(row, &name, "from_s")?, micros(row, &name, "to_s")?));
         }
+        let mut baro_lost = Vec::new();
+        if let Some(v) = s.get("baro_lost") {
+            let bad = || "scenario.baro_lost: must be a list of [from_s, to_s] pairs, 0 <= from_s < to_s".to_string();
+            for pair in v.as_array().ok_or_else(bad)? {
+                match pair.as_array().map(|p| p.iter().map(number).collect::<Vec<_>>()).as_deref() {
+                    Some([Some(from), Some(to)]) if *from >= 0.0 && from < to => {
+                        baro_lost.push(((from * 1e6).round() as u64, (to * 1e6).round() as u64));
+                    }
+                    _ => return Err(bad()),
+                }
+            }
+        }
         let mut disturbances = Vec::new();
         for (i, row) in rows(&root, "", "disturbance", &["from_s", "to_s", "torque_nm"])?.into_iter().enumerate() {
             let name = format!("disturbance[{i}]");
@@ -717,6 +742,7 @@ impl Scenario {
             phases,
             pilot,
             rc_lost,
+            baro_lost,
             disturbances,
             verdict: verdict(&root)?,
         })

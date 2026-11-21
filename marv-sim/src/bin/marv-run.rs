@@ -754,7 +754,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             world.slow.tick(&pinned);
             if (k - 1).is_multiple_of(RC_TICKS) {
                 let sticks = Sticks { roll: row.roll, pitch: row.pitch, throttle: row.throttle, yaw: row.yaw };
-                pending = Some(RcSample { sticks, arm: row.arm, t_us: pinned.t_us - TICK_US });
+                pending = Some(RcSample { sticks, arm: row.arm, switch6: row.mode, t_us: pinned.t_us - TICK_US });
             }
             if pinned.t_us.is_multiple_of(IMU_PERIOD_US) {
                 let s1 = world.imu1.sample(&pinned);
@@ -794,7 +794,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             if !lost {
                 let given = row;
                 let sticks = Sticks { roll: given.roll, pitch: given.pitch, throttle: given.throttle, yaw: given.yaw };
-                pending = Some(RcSample { sticks, arm: given.arm, t_us: now + off });
+                pending = Some(RcSample { sticks, arm: given.arm, switch6: given.mode, t_us: now + off });
                 trace.rc_us.push(now);
                 log.rc(now, [given.roll, given.pitch, given.throttle, given.yaw], given.arm);
             }
@@ -826,6 +826,9 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             sensors_f.imu1.t_us += off;
             if let Some(i) = sensors_f.imu2.as_mut() {
                 i.t_us += off;
+            }
+            if scenario.baro_lost.iter().any(|&(from, to)| truth.t_us >= from && truth.t_us < to) {
+                sensors_f.baro = None;
             }
             if let Some(b) = sensors_f.baro.as_mut() {
                 b.t_us += off;
