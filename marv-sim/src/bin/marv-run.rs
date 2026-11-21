@@ -11,6 +11,7 @@ use fw_flight::gate::MotorCommand;
 use fw_flight::gnc::{Allocator, Controller, Estimator, Sensors, Setpoint};
 use fw_flight::gnc::NavState;
 use fw_flight::mahony::Mahony;
+use fw_flight::eskf::Eskf;
 use fw_flight::mahony_baro::MahonyBaro;
 use fw_flight::pid::CascadedPid;
 use fw_flight::step::{Flight, FlightInputs, StepOut};
@@ -21,7 +22,7 @@ use marv_sim::pilot::{Ending, Pilot, PilotView};
 use marv_sim::rng::Rng;
 use marv_sim::scenario::{Air, Cell, Ground, Map, Point, RcRow, Rotors, Scenario, Spread};
 use marv_sim::sensors::{IMU_PERIOD_US, ImuModel};
-use marv_sim::slow_sensors::SlowSensors;
+use marv_sim::slow_sensors::{Origin, SlowSensors, ned_from_geo};
 use marv_sim::verdict::{Check, Sample, Trace, judge};
 use marv_sim::{Backend, NativeBackend, Plant, Reaction, Start, Truth};
 use std::io::Write;
@@ -43,7 +44,8 @@ const USAGE: &str = "usage: marv-run --card <marv.toml> --env <env.toml> --seed 
        marv-run --card <marv.toml> --env <env.toml> [--seed <u64>] --spread <file> --out-dir <dir> \
 [--only <cell>] [--logs fail|all] [--home <env/home.local.toml>]
 (--seed is given exactly when the spread file has no seeds axis)
-Either form takes --shadow mahony-baro: MahonyBaro runs in the shadow slot and one `shadow` line reports it.";
+Either form takes --shadow mahony-baro or --shadow eskf: that estimator runs in the shadow slot and one `shadow` line
+reports it.";
 
 struct Args {
     card: PathBuf,
@@ -51,8 +53,8 @@ struct Args {
     /// The env's git-ignored `home_override`: its records replace the env file's (origin and field).
     home: Option<PathBuf>,
     seed: Option<u64>,
-    /// `--shadow mahony-baro`: run `MahonyBaro` in the shadow slot.
-    shadow: bool,
+    /// `--shadow mahony-baro` or `--shadow eskf`: the estimator in the shadow slot.
+    shadow: Option<ShadowKind>,
     job: Job,
 }
 
@@ -73,7 +75,7 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
     let (mut card, mut env, mut scenario, mut seed, mut out) = (None, None, None, None, None);
     let (mut point, mut spread, mut out_dir) = (None, None, None);
     let (mut only, mut logs, mut home) = (None, None, None);
-    let mut shadow = false;
+    let mut shadow = None;
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         if flag == "--help" || flag == "-h" {
@@ -91,8 +93,9 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
             "--spread" => spread = Some(PathBuf::from(value)),
             "--out-dir" => out_dir = Some(PathBuf::from(value)),
             "--only" => only = Some(value.clone()),
-            "--shadow" if value == "mahony-baro" => shadow = true,
-            "--shadow" => return Err(format!("--shadow: {value} is not mahony-baro")),
+            "--shadow" if value == "mahony-baro" => shadow = Some(ShadowKind::MahonyBaro),
+            "--shadow" if value == "eskf" => shadow = Some(ShadowKind::Eskf),
+            "--shadow" => return Err(format!("--shadow: {value} is not mahony-baro or eskf")),
             "--logs" => {
                 logs = Some(match value.as_str() {
                     "fail" => Logs::Fail,
@@ -310,6 +313,193 @@ air_v3_within_2s {} air_v3_within_half_s {} liftoffs {} td_s {} d_td {} d_td_nod
     }
 }
 
+/// Which estimator `--shadow` puts in the shadow slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShadowKind {
+    MahonyBaro,
+    Eskf,
+}
+
+/// A shadow slot's estimator: fed after each flight step, reported in one line.
+trait Slot {
+    fn feed(&mut self, sensors: &Sensors, out: &StepOut, truth: &Truth, drift_m: f64, ground: bool);
+    fn line(&self) -> String;
+}
+
+impl Slot for Shadow {
+    fn feed(&mut self, sensors: &Sensors, out: &StepOut, truth: &Truth, drift_m: f64, ground: bool) {
+        Shadow::feed(self, sensors, out, truth, drift_m, ground);
+    }
+    fn line(&self) -> String {
+        Shadow::line(self)
+    }
+}
+
+/// Tilt error, rad: the angle between the body down axes of two attitudes [w, x, y, z].
+fn tilt_err(a: [f64; 4], b: [f64; 4]) -> f64 {
+    let z = |q: [f64; 4]| {
+        let [w, x, y, zz] = q;
+        [2.0 * (x * zz + w * y), 2.0 * (y * zz - w * x), 1.0 - 2.0 * (x * x + y * y)]
+    };
+    let (u, v) = (z(a), z(b));
+    (u[0] * v[0] + u[1] * v[1] + u[2] * v[2]).clamp(-1.0, 1.0).acos()
+}
+
+/// The 321 yaw of [w, x, y, z], rad.
+fn yaw_of(q: [f64; 4]) -> f64 {
+    let [w, x, y, z] = q;
+    (2.0 * (x * y + w * z)).atan2(1.0 - 2.0 * (y * y + z * z))
+}
+
+fn wrap_pi(a: f64) -> f64 {
+    (a + std::f64::consts::PI).rem_euclid(2.0 * std::f64::consts::PI) - std::f64::consts::PI
+}
+
+/// The shadow slot with `Eskf` (decision-nav-eskf-20261120, E1b item 5): fed as `MahonyBaro`'s slot; its state refers
+/// to the horizon (`NavState.t_us`), so it is compared with the truth of that step. Heading against truth while
+/// `heading` is valid; north-east against truth (the offset between the filter's origin and the sim's removed) while
+/// `position_ne` is valid; vertical as `mahony-baro`'s line; tilt beside Mahony's (the flight step's estimator, at the
+/// step time) on the same steps. Nothing it does reaches the flight step, the log or the verdict.
+struct EskfShadow {
+    est: Eskf,
+    armed: bool,
+    sim_origin: Origin,
+    /// Truth of the recent steps: t_us, attitude, velocity, position.
+    hist: std::collections::VecDeque<(u64, [f64; 4], [f64; 3], [f64; 3])>,
+    dt_s: f64,
+    last_t: Option<u64>,
+    // heading
+    h_valid_s: f64,
+    h_bad_s: f64,
+    h_first_s: Option<f64>,
+    h_worst: f64,
+    // north-east
+    ne_valid_s: f64,
+    ne_out3_s: f64,
+    ne_n: u64,
+    ne_p2: f64,
+    ne_pmax: f64,
+    ne_vmax: f64,
+    // vertical (as `mahony-baro`)
+    init: Option<(u64, f64)>,
+    drift0: f64,
+    v_n: u64,
+    d2: f64,
+    d_max: f64,
+    d_max_nodrift: f64,
+    vd2: f64,
+    vd_max: f64,
+    vd_3sigma: u64,
+    // tilt: Eskf (at the horizon) and Mahony (at the step) on the same steps
+    t_n: u64,
+    te2: f64,
+    te_max: f64,
+    tm2: f64,
+    tm_max: f64,
+}
+
+impl EskfShadow {
+    /// The declination from the sim's field, as the tests set it (C4).
+    fn new(tuning: &Tuning, env: &Env) -> Result<EskfShadow, String> {
+        let mut t = *tuning;
+        let f = env.magnetic_field_ned.v.ok_or("magnetic_field.ned is \"ask\"")?;
+        t.nav_mag_declination_rad = f[1].atan2(f[0]) as f32;
+        let est = Eskf::new(&t).map_err(|e| format!("Eskf: {e:?}"))?;
+        Ok(EskfShadow { est, armed: false, sim_origin: Origin::from_env(env)?, hist: Default::default(), dt_s: 0.0, last_t: None,
+            h_valid_s: 0.0, h_bad_s: 0.0, h_first_s: None, h_worst: 0.0, ne_valid_s: 0.0, ne_out3_s: 0.0, ne_n: 0, ne_p2: 0.0,
+            ne_pmax: 0.0, ne_vmax: 0.0, init: None, drift0: 0.0, v_n: 0, d2: 0.0, d_max: 0.0, d_max_nodrift: 0.0, vd2: 0.0,
+            vd_max: 0.0, vd_3sigma: 0, t_n: 0, te2: 0.0, te_max: 0.0, tm2: 0.0, tm_max: 0.0 })
+    }
+}
+
+impl Slot for EskfShadow {
+    fn feed(&mut self, sensors: &Sensors, out: &StepOut, truth: &Truth, drift_m: f64, _ground: bool) {
+        self.est.set_armed(self.armed);
+        self.armed = out.armed;
+        let r = &sensors.imu1.reading;
+        if !r.gyro_rads.iter().chain(&r.accel_ms2).all(|v| v.is_finite()) {
+            return;
+        }
+        self.hist.push_back((truth.t_us, truth.attitude, truth.velocity_ms, truth.position_m));
+        while self.hist.len() > 1_000 {
+            self.hist.pop_front();
+        }
+        let nav = self.est.update(sensors);
+        self.dt_s = self.last_t.map_or(0.0, |t| (nav.t_us.saturating_sub(t)) as f64 * 1e-6);
+        self.last_t = Some(nav.t_us);
+        let Some(&(_, q, v, p)) = self.hist.iter().rev().find(|h| h.0 == nav.t_us) else { return };
+        let dt = self.dt_s;
+        let qe = nav.attitude.map(f64::from);
+        let sig = self.est.sigmas();
+        if nav.valid.tilt {
+            let (e, m) = (tilt_err(qe, q), tilt_err(out.nav.attitude.map(f64::from), truth.attitude));
+            self.t_n += 1;
+            self.te2 += e * e;
+            self.te_max = self.te_max.max(e);
+            self.tm2 += m * m;
+            self.tm_max = self.tm_max.max(m);
+        }
+        if nav.valid.heading {
+            let e = wrap_pi(yaw_of(qe) - yaw_of(q)).abs();
+            self.h_valid_s += dt;
+            self.h_first_s.get_or_insert(nav.t_us as f64 * 1e-6);
+            self.h_bad_s += if e > 15f64.to_radians() { dt } else { 0.0 };
+            self.h_worst = self.h_worst.max(e);
+        }
+        if nav.valid.position_ne {
+            let off = self.est.origin().map_or([0.0; 3], |o| ned_from_geo(&self.sim_origin, o.lat_e7, o.lon_e7, o.alt_mm));
+            let pe = [f64::from(nav.position_m[0]) + off[0] - p[0], f64::from(nav.position_m[1]) + off[1] - p[1]];
+            let ve = [f64::from(nav.velocity_ms[0]) - v[0], f64::from(nav.velocity_ms[1]) - v[1]];
+            let s = |i: usize| f64::from(sig[i]);
+            let out3 = pe[0].abs() > 3.0 * s(6) || pe[1].abs() > 3.0 * s(7) || ve[0].abs() > 3.0 * s(3) || ve[1].abs() > 3.0 * s(4);
+            let h = pe[0].hypot(pe[1]);
+            self.ne_valid_s += dt;
+            self.ne_out3_s += if out3 { dt } else { 0.0 };
+            self.ne_n += 1;
+            self.ne_p2 += h * h;
+            self.ne_pmax = self.ne_pmax.max(h);
+            self.ne_vmax = self.ne_vmax.max(ve[0].hypot(ve[1]));
+        }
+        if self.init.is_none() && nav.valid.position_d {
+            self.init = Some((nav.t_us, p[2]));
+            self.drift0 = drift_m;
+        }
+        let Some((t0, d0)) = self.init else { return };
+        if nav.t_us < t0 + SHADOW_SETTLE_US {
+            return;
+        }
+        let ed = f64::from(nav.position_m[2]) - (p[2] - d0);
+        let ev = f64::from(nav.velocity_ms[2]) - v[2];
+        self.v_n += 1;
+        self.d2 += ed * ed;
+        self.d_max = self.d_max.max(ed.abs());
+        self.d_max_nodrift = self.d_max_nodrift.max((ed + (drift_m - self.drift0)).abs());
+        self.vd2 += ev * ev;
+        self.vd_max = self.vd_max.max(ev.abs());
+        self.vd_3sigma += u64::from(ev.abs() > 3.0 * f64::from(sig[5]));
+    }
+
+    /// One line, `key value` pairs after `shadow eskf`.
+    fn line(&self) -> String {
+        let s = self.est.stats();
+        let rms = |sum: f64, n: u64| (sum / n.max(1) as f64).sqrt();
+        let d = f64::to_degrees;
+        format!(
+            "shadow eskf hdg_valid_s {:.2} hdg_bad15_s {:.2} hdg_first_s {} hdg_worst_deg {:.2} ne_valid_s {:.2} ne_out3_s {:.2} \
+ne_p_rms {:.3} ne_p_max {:.3} ne_v_max {:.3} init_s {} judged {} d_rms {:.4} d_max {:.4} d_max_nodrift {:.4} v_rms {:.4} v_max {:.4} \
+v_3sigma {} tilt_rms_deg {:.3} tilt_max_deg {:.3} mahony_tilt_rms_deg {:.3} mahony_tilt_max_deg {:.3} mag_refused {} \
+screens {} gated {} resets_height {} resets_yaw {} resets_gps {} reinits {} yaw_aligned {} multi_job {}",
+            self.h_valid_s, self.h_bad_s, self.h_first_s.map_or("none".to_string(), |t| format!("{t:.3}")), d(self.h_worst),
+            self.ne_valid_s, self.ne_out3_s, rms(self.ne_p2, self.ne_n), self.ne_pmax, self.ne_vmax,
+            self.init.map_or("none".to_string(), |(t, _)| format!("{:.3}", t as f64 * 1e-6)), self.v_n, rms(self.d2, self.v_n),
+            self.d_max, self.d_max_nodrift, rms(self.vd2, self.v_n), self.vd_max, self.vd_3sigma, d(rms(self.te2, self.t_n)),
+            d(self.te_max), d(rms(self.tm2, self.t_n)), d(self.tm_max), s.mag_refused, s.gps_e1s + s.gps_e3b,
+            s.baro_gated + s.mag_gated + s.gps_pos_gated + s.gps_vel_gated, s.height_resets, s.yaw_resets, s.gps_resets,
+            s.reinits, self.est.yaw_aligned(), if s.max_jobs_per_step > 1 { "yes" } else { "no" }
+        )
+    }
+}
+
 /// The simulated world: what the flight step is run against.
 struct World {
     plant: Plant,
@@ -364,7 +554,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
     mut pilot: Option<&mut Pilot>,
     ticks: u64,
     log: &mut Log,
-    mut shadow: Option<&mut Shadow>,
+    mut shadow: Option<&mut (dyn Slot + 'static)>,
 ) -> (u64, u64, Trace) {
     // The newest StepOut's time and command, as the ESC task sees them; none yet counts as (0, Stop).
     let mut newest = (0, MotorCommand::STOP);
@@ -478,7 +668,7 @@ struct Run<'a> {
 /// when `keep` or when a check fails.
 #[allow(clippy::too_many_arguments)]
 fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option<Point>, cell: Option<&Run>, out: &Path,
-    keep: bool, shadow: bool) -> Result<Outcome, String> {
+    keep: bool, shadow: Option<ShadowKind>) -> Result<Outcome, String> {
     let (map, air, ground) = cell.map_or((Map::default(), Air::default(), Ground::default()), |r| (r.map, r.air, r.ground));
     let sloped;
     let scenario = match ground.roll_pitch_deg {
@@ -564,9 +754,13 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
     let tuning = Tuning::DEFAULT;
     let flight = Flight::new(Mahony::new(&tuning), CascadedPid::new(&tuning), CardAllocator::new(), &tuning, handshake);
     let mut world = World { plant, backend, imu1, imu2, slow, wind_ned_ms: wind };
-    let mut shadow = shadow.then(|| Shadow::new(&tuning));
+    let mut shadow: Option<Box<dyn Slot>> = match shadow {
+        None => None,
+        Some(ShadowKind::MahonyBaro) => Some(Box::new(Shadow::new(&tuning))),
+        Some(ShadowKind::Eskf) => Some(Box::new(EskfShadow::new(&tuning, env)?)),
+    };
     let (ran, flight_steps, mut trace) =
-        run(flight, &mut world, scenario, pilot.as_mut(), ticks, &mut log, shadow.as_mut());
+        run(flight, &mut world, scenario, pilot.as_mut(), ticks, &mut log, shadow.as_deref_mut());
 
     if let Some(p) = &pilot {
         trace.phases = p.timeline().to_vec();
