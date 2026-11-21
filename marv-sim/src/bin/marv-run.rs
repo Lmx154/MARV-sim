@@ -11,7 +11,7 @@ use fw_flight::gate::MotorCommand;
 use fw_flight::gnc::{Allocator, Controller, Estimator, Sensors, Setpoint};
 use fw_flight::gnc::NavState;
 use fw_flight::mahony::Mahony;
-use fw_flight::eskf::Eskf;
+use fw_flight::eskf::{Aiding, Eskf};
 use fw_flight::mahony_baro::MahonyBaro;
 use fw_flight::pid::CascadedPid;
 use fw_flight::step::{Flight, FlightInputs, StepOut};
@@ -25,9 +25,11 @@ use marv_sim::sensors::{IMU_PERIOD_US, ImuModel};
 use marv_sim::slow_sensors::{Origin, SlowSensors, ned_from_geo};
 use marv_sim::verdict::{Check, Sample, Trace, judge};
 use marv_sim::{Backend, NativeBackend, Plant, Reaction, Start, Truth};
+use std::cell::Cell as StdCell;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::rc::Rc;
 use std::time::Instant;
 
 const TICK_US: u64 = 125;
@@ -45,7 +47,8 @@ const USAGE: &str = "usage: marv-run --card <marv.toml> --env <env.toml> --seed 
 [--only <cell>] [--logs fail|all] [--home <env/home.local.toml>]
 (--seed is given exactly when the spread file has no seeds axis)
 Either form takes --shadow mahony-baro or --shadow eskf: that estimator runs in the shadow slot and one `shadow` line
-reports it.";
+reports it, and --estimator mahony|eskf1|eskf2 (the flight step's estimator; one `steer` line reports it) with
+--rates native|pt1|pt1-bias (eskf1 and eskf2 only: which body rates the flight step gets).";
 
 struct Args {
     card: PathBuf,
@@ -55,7 +58,32 @@ struct Args {
     seed: Option<u64>,
     /// `--shadow mahony-baro` or `--shadow eskf`: the estimator in the shadow slot.
     shadow: Option<ShadowKind>,
+    /// `--estimator` and `--rates`: the flight step's estimator; `None` is the default Mahony with no `steer` line.
+    steer: Option<SteerCfg>,
     job: Job,
+}
+
+/// The flight step's estimator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EstKind {
+    Mahony,
+    Eskf1,
+    Eskf2,
+}
+
+/// The body rates an Eskf steering the flight step reports: its own, Mahony's PT1 of the gyro, or that PT1 minus the
+/// Eskf's gyro-bias estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rates {
+    Native,
+    Pt1,
+    Pt1Bias,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SteerCfg {
+    est: EstKind,
+    rates: Rates,
 }
 
 /// Which logs a spread keeps: `Fail` only those of cells with a failing check.
@@ -76,6 +104,7 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
     let (mut point, mut spread, mut out_dir) = (None, None, None);
     let (mut only, mut logs, mut home) = (None, None, None);
     let mut shadow = None;
+    let (mut estimator, mut rates) = (None, None);
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         if flag == "--help" || flag == "-h" {
@@ -96,6 +125,22 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
             "--shadow" if value == "mahony-baro" => shadow = Some(ShadowKind::MahonyBaro),
             "--shadow" if value == "eskf" => shadow = Some(ShadowKind::Eskf),
             "--shadow" => return Err(format!("--shadow: {value} is not mahony-baro or eskf")),
+            "--estimator" => {
+                estimator = Some(match value.as_str() {
+                    "mahony" => EstKind::Mahony,
+                    "eskf1" => EstKind::Eskf1,
+                    "eskf2" => EstKind::Eskf2,
+                    _ => return Err(format!("--estimator: {value} is not mahony, eskf1 or eskf2")),
+                })
+            }
+            "--rates" => {
+                rates = Some(match value.as_str() {
+                    "native" => Rates::Native,
+                    "pt1" => Rates::Pt1,
+                    "pt1-bias" => Rates::Pt1Bias,
+                    _ => return Err(format!("--rates: {value} is not native, pt1 or pt1-bias")),
+                })
+            }
             "--logs" => {
                 logs = Some(match value.as_str() {
                     "fail" => Logs::Fail,
@@ -120,7 +165,12 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
     if matches!(job, Job::One { .. }) && seed.is_none() {
         return Err("--seed is required with --scenario".into());
     }
+    if rates.is_some() && !matches!(estimator, Some(EstKind::Eskf1 | EstKind::Eskf2)) {
+        return Err("--rates needs --estimator eskf1 or eskf2".into());
+    }
+    let steer = estimator.map(|est| SteerCfg { est, rates: rates.unwrap_or(Rates::Native) });
     Ok(Some(Args {
+        steer,
         card: card.ok_or("--card is required")?,
         env: env.ok_or("--env is required")?,
         home,
@@ -527,6 +577,99 @@ screens {} gated {} resets_height {} resets_yaw {} resets_gps {} reinits {} yaw_
     }
 }
 
+/// An `Eskf` steering the flight step: everything of its NavState is the Eskf's except, with `Pt1` or `Pt1Bias`, the rates.
+/// The PT1 is a real `Mahony` fed the same sensors (so it is bit for bit Mahony's `rates_rads`: same helper, same
+/// `ins_gyro_lpf_hz`, same first-sample rule); `Pt1Bias` takes the Eskf's gyro-bias estimate off it.
+struct Steering {
+    eskf: Eskf,
+    rates: Rates,
+    pt1: Mahony,
+    /// Largest |gyro bias| component seen, rad/s, and the Eskf's re-initialisations: read after the run.
+    info: Rc<StdCell<(f32, u32)>>,
+}
+
+impl Estimator for Steering {
+    fn update(&mut self, sensors: &Sensors) -> NavState {
+        let mut nav = self.eskf.update(sensors);
+        let bg = self.eskf.biases().0;
+        if self.rates != Rates::Native {
+            let pt = self.pt1.update(sensors).rates_rads;
+            nav.rates_rads = match self.rates {
+                Rates::Pt1Bias => [pt[0] - bg[0], pt[1] - bg[1], pt[2] - bg[2]],
+                _ => pt,
+            };
+        }
+        let (m, _) = self.info.get();
+        let big = bg.iter().fold(m, |a, b| a.max(b.abs()));
+        self.info.set((big, self.eskf.stats().reinits));
+        nav
+    }
+    fn origin(&self) -> Option<fw_flight::gnc::GeoPoint> {
+        self.eskf.origin()
+    }
+    fn set_armed(&mut self, armed: bool) {
+        self.eskf.set_armed(armed);
+    }
+}
+
+/// The `steer` line's accumulators: the steering estimator's tilt error against truth at the same step (rad), split at
+/// 5 s after its tilt first becomes valid, and the step-to-step change of the motor levels.
+#[derive(Default)]
+struct Steer {
+    t0: Option<u64>,
+    /// [first 5 s, after]: steps, sum of squares, largest.
+    tilt: [(u64, f64, f64); 2],
+    prev: Option<[u16; 4]>,
+    /// Sum of squared level changes (DShot counts) over the four motors, and the count of motor changes: consecutive
+    /// steps that both spin.
+    dm2: f64,
+    dm_n: u64,
+}
+
+impl Steer {
+    fn feed(&mut self, out: &StepOut, truth: &Truth) {
+        if out.nav.valid.tilt {
+            let e = tilt_err(out.nav.attitude.map(f64::from), truth.attitude);
+            let t0 = *self.t0.get_or_insert(out.t_us);
+            let k = usize::from(out.t_us >= t0 + 5_000_000);
+            let t = &mut self.tilt[k];
+            *t = (t.0 + 1, t.1 + e * e, t.2.max(e));
+        }
+        let now = out.motors.throttles().map(|t| t.map(|x| x.level()));
+        if let (Some(p), Some(n)) = (self.prev, now) {
+            for i in 0..4 {
+                let d = f64::from(n[i]) - f64::from(p[i]);
+                self.dm2 += d * d;
+                self.dm_n += 1;
+            }
+        }
+        self.prev = now;
+    }
+
+    fn line(&self, cfg: SteerCfg, info: Option<(f32, u32)>) -> String {
+        let d = f64::to_degrees;
+        let rms = |t: (u64, f64, f64)| d((t.1 / t.0.max(1) as f64).sqrt());
+        let (bias, reinits) = info.unwrap_or((0.0, 0));
+        let est = match cfg.est {
+            EstKind::Mahony => "mahony",
+            EstKind::Eskf1 => "eskf1",
+            EstKind::Eskf2 => "eskf2",
+        };
+        let rates = match (cfg.est, cfg.rates) {
+            (EstKind::Mahony, _) => "native",
+            (_, Rates::Native) => "native",
+            (_, Rates::Pt1) => "pt1",
+            (_, Rates::Pt1Bias) => "pt1-bias",
+        };
+        format!(
+            "steer {est} {rates} tilt_rms_first5_deg {:.4} tilt_max_first5_deg {:.4} tilt_rms_after_deg {:.4} tilt_max_after_deg {:.4} \
+tilt_n_first5 {} tilt_n_after {} bias_max_dps {:.4} motor_dlevel_rms {:.4} motor_dlevel_n {} reinits {}",
+            rms(self.tilt[0]), d(self.tilt[0].2), rms(self.tilt[1]), d(self.tilt[1].2), self.tilt[0].0, self.tilt[1].0,
+            d(f64::from(bias)), (self.dm2 / self.dm_n.max(1) as f64).sqrt(), self.dm_n, reinits
+        )
+    }
+}
+
 /// The simulated world: what the flight step is run against.
 struct World {
     plant: Plant,
@@ -582,6 +725,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
     ticks: u64,
     log: &mut Log,
     mut shadow: Option<&mut (dyn Slot + 'static)>,
+    mut steer: Option<&mut Steer>,
 ) -> (u64, u64, Trace) {
     // The newest StepOut's time and command, as the ESC task sees them; none yet counts as (0, Stop).
     let mut newest = (0, MotorCommand::STOP);
@@ -652,6 +796,9 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             if let Some(sh) = shadow.as_deref_mut() {
                 sh.feed(&sensors, &out, &truth, world.slow.baro.drift_m(), ground);
             }
+            if let Some(st) = steer.as_deref_mut() {
+                st.feed(&out, &truth);
+            }
             flight_steps += 1;
 
             log.imu(truth.t_us, 0, &s1.reading);
@@ -681,6 +828,8 @@ struct Outcome {
     notes: Vec<String>,
     /// The shadow's line, with `--shadow`.
     shadow: Option<String>,
+    /// The `steer` line, with `--estimator`.
+    steer: Option<String>,
 }
 
 /// The cell of a matrix run: its name and the values of its axes, for the plant, the sensors and the log.
@@ -695,7 +844,7 @@ struct Run<'a> {
 /// when `keep` or when a check fails.
 #[allow(clippy::too_many_arguments)]
 fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option<Point>, cell: Option<&Run>, out: &Path,
-    keep: bool, shadow: Option<ShadowKind>) -> Result<Outcome, String> {
+    keep: bool, shadow: Option<ShadowKind>, steer_cfg: Option<SteerCfg>) -> Result<Outcome, String> {
     let (map, air, ground) = cell.map_or((Map::default(), Air::default(), Ground::default()), |r| (r.map, r.air, r.ground));
     let sloped;
     let scenario = match ground.roll_pitch_deg {
@@ -779,15 +928,30 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
     // is running; the pre-arm rule is checked on the board, not here).
     handshake.set_permit(true);
     let tuning = Tuning::DEFAULT;
-    let flight = Flight::new(Mahony::new(&tuning), CascadedPid::new(&tuning), CardAllocator::new(), &tuning, handshake);
     let mut world = World { plant, backend, imu1, imu2, slow, wind_ned_ms: wind };
     let mut shadow: Option<Box<dyn Slot>> = match shadow {
         None => None,
         Some(ShadowKind::MahonyBaro) => Some(Box::new(Shadow::new(&tuning))),
         Some(ShadowKind::Eskf) => Some(Box::new(EskfShadow::new(&tuning, env)?)),
     };
-    let (ran, flight_steps, mut trace) =
-        run(flight, &mut world, scenario, pilot.as_mut(), ticks, &mut log, shadow.as_deref_mut());
+    let mut steer = steer_cfg.map(|_| Steer::default());
+    let info = Rc::new(StdCell::new((0.0f32, 0u32)));
+    let (ran, flight_steps, mut trace) = match steer_cfg {
+        None | Some(SteerCfg { est: EstKind::Mahony, .. }) => {
+            let flight = Flight::new(Mahony::new(&tuning), CascadedPid::new(&tuning), CardAllocator::new(), &tuning, handshake);
+            run(flight, &mut world, scenario, pilot.as_mut(), ticks, &mut log, shadow.as_deref_mut(), steer.as_mut())
+        }
+        Some(cfg) => {
+            let mut t = tuning;
+            let f = env.magnetic_field_ned.v.ok_or("magnetic_field.ned is \"ask\"")?;
+            t.nav_mag_declination_rad = f[1].atan2(f[0]) as f32;
+            let aiding = if cfg.est == EstKind::Eskf1 { Aiding::Imu } else { Aiding::ImuBaro };
+            let eskf = Eskf::with_aiding(&t, aiding).map_err(|e| format!("Eskf: {e:?}"))?;
+            let est = Steering { eskf, rates: cfg.rates, pt1: Mahony::new(&tuning), info: info.clone() };
+            let flight = Flight::new(est, CascadedPid::new(&tuning), CardAllocator::new(), &tuning, handshake);
+            run(flight, &mut world, scenario, pilot.as_mut(), ticks, &mut log, shadow.as_deref_mut(), steer.as_mut())
+        }
+    };
 
     if let Some(p) = &pilot {
         trace.phases = p.timeline().to_vec();
@@ -842,7 +1006,10 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
             summary.push(format!("PHASE {i:>2} {:<8} start {:>7.3} s  {how}", ph.name, ph.start_us as f64 * 1e-6));
         }
     }
-    Ok(Outcome { summary, checks, notes, shadow: shadow.map(|s| s.line()) })
+    let steer = steer_cfg.zip(steer).map(|(cfg, st)| {
+        st.line(cfg, (cfg.est != EstKind::Mahony).then(|| info.get()))
+    });
+    Ok(Outcome { summary, checks, notes, shadow: shadow.map(|s| s.line()), steer })
 }
 
 /// What `--spread` refuses before any run: a value outside a card range, or a slope on a scenario in the air. The
@@ -907,8 +1074,8 @@ fn go(args: &Args) -> Result<bool, Failure> {
         Job::One { scenario, out, point } => {
             let seed = args.seed.ok_or(Failure::Usage("--seed is required with --scenario".to_string()))?;
             let scenario = Scenario::load(scenario)?;
-            let o = run_one(&card, &env, &scenario, seed, *point, None, out, true, args.shadow)?;
-            for line in o.summary.iter().chain(&o.notes).chain(&o.shadow) {
+            let o = run_one(&card, &env, &scenario, seed, *point, None, out, true, args.shadow, args.steer)?;
+            for line in o.summary.iter().chain(&o.notes).chain(&o.shadow).chain(&o.steer) {
                 println!("{line}");
             }
             for c in &o.checks {
@@ -962,7 +1129,7 @@ fn go(args: &Args) -> Result<bool, Failure> {
                 let out = out_dir.join(format!("{}.BIN", cell.name));
                 let keep = only.is_some() || *logs == Logs::All;
                 let o = run_one(&card, &env, &scenarios[cell.scenario], cell.seed, Some(spread.points[cell.point]),
-                    Some(&run), &out, keep, args.shadow)?;
+                    Some(&run), &out, keep, args.shadow, args.steer)?;
                 if only.is_some() {
                     for line in o.summary.iter().chain(&o.notes) {
                         println!("{line}");
@@ -987,6 +1154,9 @@ fn go(args: &Args) -> Result<bool, Failure> {
                 cell_pass.push(failing.is_empty());
                 println!("{:<width$}  {}  {}", cell.name, if failing.is_empty() { "PASS" } else { "FAIL" }, failing.join(", "));
                 if let Some(line) = &o.shadow {
+                    println!("{:<width$}  {line}", cell.name);
+                }
+                if let Some(line) = &o.steer {
                     println!("{:<width$}  {line}", cell.name);
                 }
                 let _ = std::io::stdout().flush();

@@ -191,6 +191,15 @@ throttle is cut, Stop after switch-off, and (nominal card only) the pilot's mean
 the first contact after the first rise through `airborne_m` (Amendment B7). The pilot's
 drift correction is printed.
 
+`--estimator mahony|eskf1|eskf2` puts that estimator in the flight step (default Mahony; eskf1 = `Aiding::Imu`, eskf2 =
+`Aiding::ImuBaro`) and adds one `steer <estimator> <rates>` line per run (per cell in a spread): tilt error against truth
+at the same step (rms and max, first 5 s after the estimator's tilt is valid, and after), the largest |gyro bias|
+estimate (deg/s), `motor_dlevel_rms` (rms of the step-to-step change of each motor's DShot level, pooled over the four
+motors and over consecutive steps that both spin) and the Eskf's re-initialisations. `--rates native|pt1|pt1-bias`
+(eskf only) chooses the body rates it reports: its own (gyro minus bias, unfiltered), Mahony's PT1 of the gyro (a Mahony
+runs inside the wrapper for it, so the bits are Mahony's), or that PT1 minus the Eskf's gyro-bias estimate. Without
+`--estimator` nothing changes and no `steer` line is printed.
+
 ## The parameter spread and the run matrix
 
     cargo run -q --release -p marv-sim --bin marv-run -- --card marv-card/marv.toml --env env/default.toml \
