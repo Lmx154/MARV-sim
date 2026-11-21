@@ -19,6 +19,12 @@ pub struct Scenario {
     pub duration_s: f64,
     /// `[scenario] gnss_rate_hz`: 1, 5 or 10; 5 when not given (the board's default).
     pub gnss_rate_hz: u32,
+    /// `[scenario] mag_expected`: whether the compass sample carries the expected field (`MagSample.expected`); true
+    /// when not given.
+    pub mag_expected: bool,
+    /// `[scenario] gnss_velocity`: whether the GNSS sample carries the velocity north, east and down
+    /// (`GnssReading.vel_ned_mm_s`); true when not given.
+    pub gnss_velocity: bool,
     pub position_ned_m: [f64; 3],
     pub velocity_ned_ms: [f64; 3],
     /// Body to world `[w, x, y, z]`, from the file's roll, pitch, yaw.
@@ -601,7 +607,7 @@ impl Scenario {
                 return Err(format!("{key}: unknown table"));
             }
         }
-        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz"])?;
+        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz", "mag_expected", "gnss_velocity"])?;
         let ground = match root.get("initial").and_then(Value::as_table).and_then(|i| i.get("contact")) {
             None => false,
             Some(Value::String(c)) if c == "air" => false,
@@ -631,6 +637,13 @@ impl Scenario {
             Some(r) if crate::slow_sensors::GNSS_RATES_HZ.iter().any(|&x| f64::from(x) == r) => r as u32,
             Some(_) => return Err("scenario.gnss_rate_hz: must be 1, 5 or 10".to_string()),
         };
+        let flag = |key: &str| match s.get(key) {
+            None => Ok(true),
+            Some(Value::Boolean(b)) => Ok(*b),
+            Some(_) => Err(format!("scenario.{key}: must be true or false")),
+        };
+        let mag_expected = flag("mag_expected")?;
+        let gnss_velocity = flag("gnss_velocity")?;
         let rotors = match get(i, "initial", "rotors")? {
             Value::String(r) if r == "hover" => Rotors::Hover,
             Value::String(r) if r == "stopped" => Rotors::Stopped,
@@ -691,6 +704,8 @@ impl Scenario {
             name,
             duration_s,
             gnss_rate_hz,
+            mag_expected,
+            gnss_velocity,
             position_ned_m,
             velocity_ned_ms,
             attitude,

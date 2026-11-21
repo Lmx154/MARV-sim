@@ -73,7 +73,11 @@ draws from its own noise stream (3, 4, 5; the IMUs keep 1 and 2), so every exist
   hard_iron)` (`Calibration`). The runner applies none (`Calibration::NONE`), so the card's soft and hard iron are what the
   firmware's calibration leaves (as `hard_iron_bias`'s source says); with a perfect calibration (hard iron equal,
   correction the inverse of the soft iron) the sample is the env field in body FRD. No mounting rotation: the board hands
-  flight code the field after `MAG_ORIENT`.
+  flight code the field after `MAG_ORIENT`. Every sample also carries `MagSample.expected` (the health test's expected
+  field, Amendment C4): the strength and inclination of the env field (49.131 uT, 66.532 deg down for the default env)
+  with the firmware's default tolerances `MAG_HLT_STR` 10 % and `MAG_HLT_INC` 10 deg, converted as the core-0 fill does
+  (fraction, radians). The sim does not depend on `fw-settings`, so the two tolerances are constants in `slow_sensors.rs`
+  (the firmware's table test pins the defaults); `[scenario] mag_expected = false` leaves it `None`. It draws nothing.
 - GNSS: truth at t - `gnss.latency`; north and east errors a first-order Gauss-Markov term (`gnss.slow_horizontal_sd`,
   `gnss.slow_time_constant`, starting in its stationary spread) plus white noise `gnss.horizontal_sd`; down error a
   Gauss-Markov term (`gnss.slow_vertical_sd`); velocity north and east plus white noise `gnss.velocity_sd`, as speed and
@@ -81,7 +85,10 @@ draws from its own noise stream (3, 4, 5; the IMUs keep 1 and 2), so every exist
   `gnss.horizontal_sd` (latitude, longitude) and `gnss.vertical_sd`; satellites, DOP and UTC are `None`. Position: the
   firmware has no conversion yet, so a local tangent plane at the env origin (WGS 84 meridian and prime-vertical radii at
   the origin latitude, longitude wrapped at 180 deg), rounded to 1e-7 deg and mm; `ned_from_geo` is the inverse in seams
-  10's form. Rate 1, 5 or 10 Hz by `[scenario] gnss_rate_hz` (default 5, the board's `GPS_RATE_MS` 200). Not modelled:
+  10's form. `vel_ned_mm_s` (north, east, down in mm/s, down positive down) is the same truth velocity plus white noise
+  `gnss.velocity_sd` on each component, drawn from its own stream (`STREAM_GNSS_VEL` 6), so it is independent of the speed
+  and course (which keep their own noise) and the position, speed and course samples are bit-identical with or without it;
+  `[scenario] gnss_velocity = false` leaves it `None`. Rate 1, 5 or 10 Hz by `[scenario] gnss_rate_hz` (default 5, the board's `GPS_RATE_MS` 200). Not modelled:
   the receiver's smoothing and its hold.
 
 The sim logs none of these samples yet (no record of the GNSS position goes in a log).
@@ -114,6 +121,8 @@ load. Times are seconds; each script row holds until the next.
     name = "hover"
     duration_s = 10.0
     gnss_rate_hz = 5              # optional: 1, 5 or 10 (default 5)
+    mag_expected = true           # optional: false leaves MagSample.expected None (default true)
+    gnss_velocity = true          # optional: false leaves GnssReading.vel_ned_mm_s None (default true)
     [initial]                     # position, velocity, roll_pitch_yaw_deg (Z-Y-X), rates, rotors = "hover" | "stopped"
     ...
     [rc]

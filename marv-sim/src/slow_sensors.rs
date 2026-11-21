@@ -7,7 +7,7 @@
 use crate::backend::Truth;
 use crate::math::{Mat3, Quat, Vec3, mat_t_vec, mat_vec, rot_matrix};
 use crate::rng::Rng;
-use fw_core::sample::{BaroReading, BaroSample, GnssReading, GnssSample, MagReading, MagSample};
+use fw_core::sample::{BaroReading, BaroSample, GnssReading, GnssSample, MagExpected, MagReading, MagSample};
 use marv_card::{Card, Env, Record};
 use std::collections::VecDeque;
 
@@ -26,6 +26,14 @@ pub const COURSE_HOLD_MS: f64 = 0.3;
 pub const STREAM_BARO: u64 = 3;
 pub const STREAM_MAG: u64 = 4;
 pub const STREAM_GNSS: u64 = 5;
+/// The GNSS velocity's own noise stream: its draws never touch `STREAM_GNSS`, so the position, speed and course samples
+/// are the same with or without the velocity.
+pub const STREAM_GNSS_VEL: u64 = 6;
+/// The compass health test's tolerances in the firmware's units: `MAG_HLT_STR` (percent) and `MAG_HLT_INC` (degrees),
+/// their defaults in `fw_settings::mag::CAL_TABLE` (10 and 10). The sim does not depend on `fw-settings` (no new
+/// dependency edge), so the numbers are repeated here; the firmware's own test pins the defaults.
+pub const MAG_HLT_STR_PCT: f32 = 10.0;
+pub const MAG_HLT_INC_DEG: f32 = 10.0;
 /// ISA (ISO 2533): the specific gas constant of dry air, J/(kg K); with the env's ISA numbers it gives the
 /// troposphere's pressure law.
 const ISA_GAS_CONSTANT: f64 = 287.05287;
@@ -185,7 +193,9 @@ impl Calibration {
 
 /// The env field turned into body FRD by the true attitude; then the TRUE distortion, `soft_iron x field +
 /// hard_iron_bias` (the card's `compass.soft_iron`, `compass.hard_iron_bias`), plus the card's measured noise; then the
-/// CALIBRATION APPLIED (`Calibration`). The sample is the calibrated field, what the board hands to flight code.
+/// CALIBRATION APPLIED (`Calibration`). The sample is the calibrated field, what the board hands to flight code, with
+/// the expected field of the health test (`MagSample.expected`): the strength and inclination of the env field and the
+/// firmware's default tolerances, unless switched off (`without_expected`). Filling it draws nothing.
 pub struct MagModel {
     field_ned_ut: Vec3,
     soft_iron: Mat3,
@@ -193,21 +203,36 @@ pub struct MagModel {
     noise_ut: Vec3,
     calibration: Calibration,
     temperature_c: f32,
+    expected: Option<MagExpected>,
     pub latency_ticks: usize,
     rng: Rng,
     seq: u32,
 }
 
+/// The health test's expected field for an env field: its strength, its inclination (positive down), and the firmware's
+/// default tolerances converted as the core-0 fill does (percent to a fraction, degrees to radians).
+fn expected_of(field_ned_ut: Vec3) -> MagExpected {
+    let [n, e, d] = field_ned_ut;
+    MagExpected {
+        strength_ut: (n * n + e * e + d * d).sqrt() as f32,
+        inclination_rad: d.atan2(n.hypot(e)) as f32,
+        tol_strength_frac: MAG_HLT_STR_PCT / 100.0,
+        tol_inclination_rad: MAG_HLT_INC_DEG.to_radians(),
+    }
+}
+
 impl MagModel {
     pub fn new(card: &Card, env: &Env, calibration: Calibration, rng: Rng) -> Result<MagModel, String> {
         let c = &card.compass;
+        let field_ned_ut = need(&env.magnetic_field_ned, "magnetic_field.ned")?;
         Ok(MagModel {
-            field_ned_ut: need(&env.magnetic_field_ned, "magnetic_field.ned")?,
+            field_ned_ut,
             soft_iron: need(&c.soft_iron, "compass.soft_iron")?,
             hard_iron_ut: need(&c.hard_iron_bias, "compass.hard_iron_bias")?,
             noise_ut: need(&c.field_noise_sd, "compass.field_noise_sd")?,
             calibration,
             temperature_c: (need(&env.sea_level_temperature, "atmosphere.sea_level_temperature")? - 273.15) as f32,
+            expected: Some(expected_of(field_ned_ut)),
             latency_ticks: ticks(need(&c.latency, "compass.latency")?),
             rng,
             seq: 0,
@@ -217,6 +242,12 @@ impl MagModel {
     /// Without noise (the tests set it to zero to check the calibration identity).
     pub fn without_noise(mut self) -> MagModel {
         self.noise_ut = [0.0; 3];
+        self
+    }
+
+    /// Leaves `MagSample.expected` `None` (the firmware's value without a guided calibration).
+    pub fn without_expected(mut self) -> MagModel {
+        self.expected = None;
         self
     }
 
@@ -233,6 +264,7 @@ impl MagModel {
             reading: MagReading { field_ut: field.map(|x| x as f32), temperature_c: self.temperature_c },
             t_us,
             seq: self.seq,
+            expected: self.expected,
         };
         self.seq = self.seq.wrapping_add(1);
         s
@@ -298,7 +330,10 @@ pub fn ned_from_geo(o: &Origin, lat_e7: i32, lon_e7: i32, alt_mm: i32) -> Vec3 {
 /// scatter (`horizontal_sd`); down error: a Gauss-Markov term; velocity north and east with white noise
 /// (`velocity_sd`), turned into speed and course, the course held below `COURSE_HOLD_MS` (none before the first);
 /// the deviations of the sample from the card's `horizontal_sd` (latitude and longitude) and `vertical_sd`; fix
-/// type 3. Not modelled: the receiver's smoothing and its hold; satellites, DOP and UTC are left `None`.
+/// type 3. The velocity north, east and down (`vel_ned_mm_s`, down positive down) is the same truth velocity with the
+/// card's `velocity_sd` on each component, drawn from its own stream (`with_velocity_rng`, `STREAM_GNSS_VEL`), `None`
+/// when switched off (`without_velocity`). Not modelled: the receiver's smoothing and its hold; satellites, DOP and UTC
+/// are left `None`.
 pub struct GnssModel {
     origin: Origin,
     white_h_m: f64,
@@ -309,9 +344,11 @@ pub struct GnssModel {
     slow_m: Vec3,
     std_mm: [u32; 3],
     course_cdeg: Option<u16>,
+    velocity: bool,
     pub period_us: u64,
     pub latency_ticks: usize,
     rng: Rng,
+    vel_rng: Rng,
     seq: u32,
 }
 
@@ -340,11 +377,25 @@ impl GnssModel {
             slow_m,
             std_mm: [mm(horizontal_sd), mm(horizontal_sd), mm(vertical_sd)],
             course_cdeg: None,
+            velocity: true,
             period_us,
             latency_ticks: ticks(need(&g.latency, "gnss.latency")?),
             rng,
+            vel_rng: Rng::new(0, STREAM_GNSS_VEL),
             seq: 0,
         })
+    }
+
+    /// The velocity's noise stream (`new` starts it from seed 0; `SlowSensors::new` gives it the run's seed).
+    pub fn with_velocity_rng(mut self, rng: Rng) -> GnssModel {
+        self.vel_rng = rng;
+        self
+    }
+
+    /// Leaves `GnssReading.vel_ned_mm_s` `None`.
+    pub fn without_velocity(mut self) -> GnssModel {
+        self.velocity = false;
+        self
     }
 
     pub fn origin(&self) -> Origin {
@@ -367,6 +418,10 @@ impl GnssModel {
         let down = p[2] + self.slow_m[2];
         let vn = past.velocity_ms[0] + self.velocity_sd_ms * self.rng.gaussian();
         let ve = past.velocity_ms[1] + self.velocity_sd_ms * self.rng.gaussian();
+        let vel_noise = [0, 1, 2].map(|_| self.velocity_sd_ms * self.vel_rng.gaussian());
+        let vel_ned_mm_s = self
+            .velocity
+            .then(|| [0, 1, 2].map(|i| ((past.velocity_ms[i] + vel_noise[i]) * 1e3).round() as i32));
         let speed = vn.hypot(ve);
         if speed >= COURSE_HOLD_MS {
             let cdeg = (ve.atan2(vn).to_degrees().rem_euclid(360.0) * 100.0).round() as u32 % 36_000;
@@ -389,6 +444,7 @@ impl GnssModel {
                 lat_std_mm: Some(self.std_mm[0]),
                 lon_std_mm: Some(self.std_mm[1]),
                 alt_std_mm: Some(self.std_mm[2]),
+                vel_ned_mm_s,
             },
             t_us,
             seq: self.seq,
@@ -417,9 +473,22 @@ impl SlowSensors {
     pub fn new(card: &Card, env: &Env, gnss_rate_hz: u32, seed: u64) -> Result<SlowSensors, String> {
         let baro = BaroModel::new(card, env, Rng::new(seed, STREAM_BARO))?;
         let mag = MagModel::new(card, env, Calibration::NONE, Rng::new(seed, STREAM_MAG))?;
-        let gnss = GnssModel::new(card, env, gnss_rate_hz, Rng::new(seed, STREAM_GNSS))?;
+        let gnss = GnssModel::new(card, env, gnss_rate_hz, Rng::new(seed, STREAM_GNSS))?
+            .with_velocity_rng(Rng::new(seed, STREAM_GNSS_VEL));
         let depth = baro.latency_ticks.max(mag.latency_ticks).max(gnss.latency_ticks);
         Ok(SlowSensors { history: TruthDelay::new(depth), baro, mag, gnss, pending: (None, None, None) })
+    }
+
+    /// The scenario's switches: whether the compass fills `MagSample.expected` and the receiver `vel_ned_mm_s` (both
+    /// default on; off leaves the field `None` and changes nothing else).
+    pub fn with_outputs(mut self, mag_expected: bool, gnss_velocity: bool) -> SlowSensors {
+        if !mag_expected {
+            self.mag.expected = None;
+        }
+        if !gnss_velocity {
+            self.gnss.velocity = false;
+        }
+        self
     }
 
     /// Once per base tick, after the backend step: records the truth; each device whose period ends at this tick makes a

@@ -512,7 +512,8 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
     }
     let imu1 = ImuModel::new("imu1", &imu1_profile, env, Rng::new(seed, STREAM_IMU1))?;
     let imu2 = ImuModel::new("imu2", &card.imu2, env, Rng::new(seed, STREAM_IMU2))?;
-    let slow = SlowSensors::new(card, env, scenario.gnss_rate_hz, seed)?;
+    let slow = SlowSensors::new(card, env, scenario.gnss_rate_hz, seed)?
+        .with_outputs(scenario.mag_expected, scenario.gnss_velocity);
     // Wind for this step is the mean only; gusts come in step 7.
     let wind = match air.wind_ned_ms {
         Some(w) => w,

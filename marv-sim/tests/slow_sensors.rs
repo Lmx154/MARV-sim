@@ -1,6 +1,7 @@
 //! The barometer, compass and GNSS models against their definitions (decision-nav-eskf-20261120, section 9a-c), on the
 //! real card and the default (public) environment, long seeded runs.
 
+use fw_core::sample::{GnssReading, GnssSample};
 use marv_card::{Card, Env};
 use marv_sim::math::{mat_inv, mat_t_vec, rot_matrix};
 use marv_sim::rng::Rng;
@@ -295,4 +296,150 @@ fn latency_in_ticks_is_the_cards() {
     }
     assert_eq!(d.ago(3440).position_m[2], (4999 - 3440) as f64);
     assert_eq!(d.ago(92).position_m[2], (4999 - 92) as f64);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// F1b / D-pvt: the compass's expected field and the GNSS velocity (decision-nav-eskf-20261120, C4 and C2f)
+// ---------------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn compass_expected_is_the_env_field_and_the_default_tolerances() {
+    let (card, env) = (card(), env());
+    let field = env.magnetic_field_ned.v.unwrap();
+    let strength = field.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let inclination = field[2].atan2(field[0].hypot(field[1]));
+    let mut m = MagModel::new(&card, &env, Calibration::NONE, Rng::new(1, STREAM_MAG)).unwrap();
+    for k in 0..3 {
+        let e = m.sample(k * MAG_PERIOD_US, &still(0.0, true)).expected.expect("filled by default");
+        assert!((f64::from(e.strength_ut) / strength - 1.0).abs() < 1e-6, "{} want {strength}", e.strength_ut);
+        assert!((f64::from(e.inclination_rad) - inclination).abs() < 1e-6, "{} want {inclination}", e.inclination_rad);
+        // The firmware's defaults MAG_HLT_STR 10 % and MAG_HLT_INC 10 deg, converted as the core-0 fill does.
+        assert_eq!(e.tol_strength_frac, 10.0f32 / 100.0);
+        assert_eq!(e.tol_inclination_rad, 10.0f32.to_radians());
+    }
+    // The same field as the env file states it (49.131 uT, 66.532 deg down), to the file's digits.
+    let e = m.sample(0, &still(0.0, true)).expected.unwrap();
+    assert!((f64::from(e.strength_ut) - 49.131).abs() < 0.005, "{}", e.strength_ut);
+    assert!((f64::from(e.inclination_rad).to_degrees() - 66.532).abs() < 0.005, "{}", e.inclination_rad.to_degrees());
+    // Switched off: None, and the field itself is the same.
+    let mut on = MagModel::new(&card, &env, Calibration::NONE, Rng::new(1, STREAM_MAG)).unwrap();
+    let mut off = MagModel::new(&card, &env, Calibration::NONE, Rng::new(1, STREAM_MAG)).unwrap().without_expected();
+    let (a, b) = (on.sample(0, &still(0.0, true)), off.sample(0, &still(0.0, true)));
+    assert!(a.expected.is_some() && b.expected.is_none());
+    assert_eq!((a.reading, a.t_us, a.seq), (b.reading, b.t_us, b.seq));
+    // The runner's switches reach the samples.
+    let mut s = SlowSensors::new(&card, &env, 5, 1).unwrap().with_outputs(false, true);
+    let mut seen = (0, 0);
+    for t in (1..=2000u64).map(|k| k * TICK_US) {
+        s.tick(&truth(t, [0.0; 3], [0.0; 3]));
+        if let (_, Some(m), g) = s.take() {
+            seen.0 += 1;
+            assert!(m.expected.is_none());
+            if let Some(g) = g {
+                seen.1 += 1;
+                assert!(g.reading.vel_ned_mm_s.is_some());
+            }
+        }
+    }
+    assert!(seen.0 > 20);
+}
+
+#[test]
+fn gnss_velocity_is_the_delayed_truth_with_the_cards_noise_on_each_component() {
+    let (card, env) = (card(), env());
+    let want = card.gnss.velocity_sd.v.unwrap();
+    let truth_v = [3.0, -1.5, 0.5];
+    let mut m = GnssModel::new(&card, &env, 5, Rng::new(6, STREAM_GNSS)).unwrap().with_velocity_rng(Rng::new(6, STREAM_GNSS_VEL));
+    let snap = Snapshot { position_m: [0.0; 3], velocity_ms: truth_v, attitude: [1.0, 0.0, 0.0, 0.0], on_ground: false };
+    let v: Vec<[i32; 3]> = (0..20_000u64).map(|k| m.sample(k * 200_000, &snap).reading.vel_ned_mm_s.unwrap()).collect();
+    for i in 0..3 {
+        // Component i of the error against truth, m/s; down is positive down, as the truth is.
+        let e: Vec<f64> = v.iter().map(|s| f64::from(s[i]) * 1e-3 - truth_v[i]).collect();
+        let (mean, sd) = mean_sd(&e);
+        assert!((sd / want - 1.0).abs() < 0.05, "component {i} sd {sd} want {want}");
+        assert!(mean.abs() < 4.0 * want / 141.0, "component {i} mean {mean}");
+    }
+    // Independent components: no correlation between north and east errors beyond sampling noise.
+    let (n, e): (Vec<f64>, Vec<f64>) = v.iter().map(|s| (f64::from(s[0]) * 1e-3 - truth_v[0], f64::from(s[1]) * 1e-3 - truth_v[1])).unzip();
+    let cross = n.iter().zip(&e).map(|(a, b)| a * b).sum::<f64>() / (n.len() as f64 * want * want);
+    assert!(cross.abs() < 0.05, "north-east correlation {cross}");
+    // Switched off: None.
+    let mut off = GnssModel::new(&card, &env, 5, Rng::new(6, STREAM_GNSS)).unwrap().without_velocity();
+    assert_eq!(off.sample(0, &snap).reading.vel_ned_mm_s, None);
+}
+
+#[test]
+fn gnss_velocity_has_the_gnss_latency() {
+    let (card, env) = (card(), env());
+    for rate in GNSS_RATES_HZ {
+        let mut s = SlowSensors::new(&card, &env, rate, 1).unwrap();
+        let mut stamps = Vec::new();
+        let mut t = 0;
+        while t < 3_000_000 {
+            t += TICK_US;
+            // At 1 s the truth velocity jumps to 1 m/s north, 1 m/s up (down velocity -1).
+            let v = if t > 1_000_000 { [1.0, 0.0, -1.0] } else { [0.0; 3] };
+            s.tick(&truth(t, [0.0; 3], v));
+            if let (_, _, Some(g)) = s.take() {
+                stamps.push((g.t_us, g.reading.vel_ned_mm_s.unwrap()));
+            }
+        }
+        let lat_us = (card.gnss.latency.v.unwrap() * 1e6) as u64;
+        let period = 1_000_000 / u64::from(rate);
+        let first_n = stamps.iter().find(|(_, v)| v[0] > 600).unwrap().0;
+        let first_d = stamps.iter().find(|(_, v)| v[2] < -600).unwrap().0;
+        for first in [first_n, first_d] {
+            assert!(first > 1_000_000 + lat_us - period && first <= 1_000_000 + lat_us + period, "rate {rate}: {first}");
+        }
+    }
+}
+
+#[test]
+fn gnss_velocity_agrees_with_speed_and_course_above_the_hold_speed() {
+    let (card, env) = (card(), env());
+    let sd = card.gnss.velocity_sd.v.unwrap();
+    let mut m = GnssModel::new(&card, &env, 5, Rng::new(8, STREAM_GNSS)).unwrap().with_velocity_rng(Rng::new(8, STREAM_GNSS_VEL));
+    let snap = Snapshot { position_m: [0.0; 3], velocity_ms: [1.5, 1.0, 0.0], attitude: [1.0, 0.0, 0.0, 0.0], on_ground: false };
+    let (mut dn, mut de) = (Vec::new(), Vec::new());
+    for k in 0..20_000u64 {
+        let r = m.sample(k * 200_000, &snap).reading;
+        let speed = f64::from(r.speed_mm_s.unwrap()) * 1e-3;
+        if speed < COURSE_HOLD_MS {
+            continue;
+        }
+        let course = (f64::from(r.course_cdeg.unwrap()) * 0.01).to_radians();
+        let [vn, ve, _] = r.vel_ned_mm_s.unwrap();
+        dn.push(f64::from(vn) * 1e-3 - speed * course.cos());
+        de.push(f64::from(ve) * 1e-3 - speed * course.sin());
+    }
+    assert!(dn.len() > 19_000);
+    // The two are independent draws of the same truth: the difference has mean 0 and sd sqrt(2) times the card's.
+    for (name, x) in [("north", &dn), ("east", &de)] {
+        let (mean, s) = mean_sd(x);
+        assert!((s / (sd * 2f64.sqrt()) - 1.0).abs() < 0.05, "{name} difference sd {s}");
+        assert!(mean.abs() < 4.0 * sd * 2f64.sqrt() / (x.len() as f64).sqrt(), "{name} difference mean {mean}");
+        assert!(x.iter().all(|d| d.abs() < 6.0 * sd * 2f64.sqrt()), "{name} difference outlier");
+    }
+}
+
+/// The velocity has its own draws: the position, speed and course samples are the same sample for sample whatever the
+/// velocity's stream or switch is.
+#[test]
+fn the_velocity_draws_leave_the_old_fields_unchanged() {
+    let (card, env) = (card(), env());
+    let new = |vel: Option<u64>| {
+        let m = GnssModel::new(&card, &env, 5, Rng::new(9, STREAM_GNSS)).unwrap();
+        match vel {
+            Some(seed) => m.with_velocity_rng(Rng::new(seed, STREAM_GNSS_VEL)),
+            None => m.without_velocity(),
+        }
+    };
+    let (mut a, mut b, mut c) = (new(Some(1)), new(Some(2)), new(None));
+    for k in 0..2000u64 {
+        let snap = Snapshot { position_m: [k as f64 * 0.1, 0.0, 0.0], velocity_ms: [if k % 50 < 25 { 2.0 } else { 0.0 }, 1.0, 0.0], attitude: [1.0, 0.0, 0.0, 0.0], on_ground: false };
+        let (x, y, z) = (a.sample(k * 200_000, &snap), b.sample(k * 200_000, &snap), c.sample(k * 200_000, &snap));
+        let old = |g: &GnssSample| GnssReading { vel_ned_mm_s: None, ..g.reading };
+        assert_eq!((old(&x), old(&y)), (old(&z), old(&z)), "sample {k}");
+        assert_ne!(x.reading.vel_ned_mm_s, y.reading.vel_ned_mm_s);
+    }
 }
