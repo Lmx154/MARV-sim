@@ -383,11 +383,12 @@ impl Slot for Shadow {
     }
 }
 
-/// Tilt error, rad: the angle between the body down axes of two attitudes [w, x, y, z].
+/// Tilt error, rad: the angle between NED down seen in the body frame (the third row of the body-to-NED matrix) for two
+/// attitudes [w, x, y, z]; it does not depend on the yaw of either (the same form as verdict.rs `down_gap_deg`).
 fn tilt_err(a: [f64; 4], b: [f64; 4]) -> f64 {
     let z = |q: [f64; 4]| {
         let [w, x, y, zz] = q;
-        [2.0 * (x * zz + w * y), 2.0 * (y * zz - w * x), 1.0 - 2.0 * (x * x + y * y)]
+        [2.0 * (x * zz - w * y), 2.0 * (y * zz + w * x), 1.0 - 2.0 * (x * x + y * y)]
     };
     let (u, v) = (z(a), z(b));
     (u[0] * v[0] + u[1] * v[1] + u[2] * v[2]).clamp(-1.0, 1.0).acos()
@@ -616,6 +617,8 @@ struct Steer {
     hist: Vec<(u64, f64)>,
     /// The first step with the gate armed.
     t_arm: Option<u64>,
+    /// Largest |yaw difference| between the estimate and truth over the valid-tilt steps, rad.
+    yaw_max: f64,
 }
 
 impl Steer {
@@ -628,6 +631,7 @@ impl Steer {
             let t0 = *self.t0.get_or_insert(out.t_us);
             let k = usize::from(out.t_us >= t0 + 5_000_000);
             self.hist.push((out.t_us, e));
+            self.yaw_max = self.yaw_max.max(wrap_pi(yaw_of(out.nav.attitude.map(f64::from)) - yaw_of(truth.attitude)).abs());
             let t = &mut self.tilt[k];
             *t = (t.0 + 1, t.1 + e * e, t.2.max(e));
         }
@@ -660,9 +664,9 @@ impl Steer {
         let to_max = d(w.iter().copied().fold(0.0, f64::max));
         format!(
             "steer {est} tilt_rms_first5_deg {:.4} tilt_max_first5_deg {:.4} tilt_rms_after_deg {:.4} tilt_max_after_deg {:.4} \
-tilt_n_first5 {} tilt_n_after {} bias_max_dps {:.4} motor_dlevel_rms {:.4} motor_dlevel_n {} reinits {} takeoff_rms_deg {:.4} takeoff_max_deg {:.4} takeoff_n {}",
+tilt_n_first5 {} tilt_n_after {} bias_max_dps {:.4} motor_dlevel_rms {:.4} motor_dlevel_n {} reinits {} takeoff_rms_deg {:.4} takeoff_max_deg {:.4} takeoff_n {} yaw_diff_max_deg {:.3}",
             rms(self.tilt[0]), d(self.tilt[0].2), rms(self.tilt[1]), d(self.tilt[1].2), self.tilt[0].0, self.tilt[1].0,
-            d(f64::from(bias)), (self.dm2 / self.dm_n.max(1) as f64).sqrt(), self.dm_n, reinits, to_rms, to_max, w.len()
+            d(f64::from(bias)), (self.dm2 / self.dm_n.max(1) as f64).sqrt(), self.dm_n, reinits, to_rms, to_max, w.len(), d(self.yaw_max)
         )
     }
 }
@@ -1311,5 +1315,27 @@ fn main() -> ExitCode {
             eprintln!("marv-run: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tilt_err;
+
+    /// Z-Y-X quaternion [w, x, y, z] from roll, pitch, yaw (rad).
+    fn q(roll: f64, pitch: f64, yaw: f64) -> [f64; 4] {
+        let (cr, sr, cp, sp, cy, sy) = ((roll / 2.0).cos(), (roll / 2.0).sin(), (pitch / 2.0).cos(), (pitch / 2.0).sin(),
+            (yaw / 2.0).cos(), (yaw / 2.0).sin());
+        [cr * cp * cy + sr * sp * sy, sr * cp * cy - cr * sp * sy, cr * sp * cy + sr * cp * sy, cr * cp * sy - sr * sp * cy]
+    }
+
+    #[test]
+    fn tilt_error_ignores_yaw() {
+        let (r, p) = (0.3f64, -0.2f64);
+        for yaw in [90f64, 180.0] {
+            assert!(tilt_err(q(r, p, 0.0), q(r, p, yaw.to_radians())) < 1e-9, "yaw {yaw}");
+        }
+        let e = tilt_err(q(0.0, 0.0, 0.7), q(10f64.to_radians(), 0.0, 0.7));
+        assert!((e.to_degrees() - 10.0).abs() < 1e-9, "{}", e.to_degrees());
     }
 }
