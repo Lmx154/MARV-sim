@@ -17,6 +17,8 @@ pub enum Rotors {
 pub struct Scenario {
     pub name: String,
     pub duration_s: f64,
+    /// `[scenario] gnss_rate_hz`: 1, 5 or 10; 5 when not given (the board's default).
+    pub gnss_rate_hz: u32,
     pub position_ned_m: [f64; 3],
     pub velocity_ned_ms: [f64; 3],
     /// Body to world `[w, x, y, z]`, from the file's roll, pitch, yaw.
@@ -599,7 +601,7 @@ impl Scenario {
                 return Err(format!("{key}: unknown table"));
             }
         }
-        let s = table(&root, "scenario", &["name", "duration_s"])?;
+        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz"])?;
         let ground = match root.get("initial").and_then(Value::as_table).and_then(|i| i.get("contact")) {
             None => false,
             Some(Value::String(c)) if c == "air" => false,
@@ -624,6 +626,11 @@ impl Scenario {
         if duration_s <= 0.0 {
             return Err("scenario.duration_s: must be > 0".to_string());
         }
+        let gnss_rate_hz = match optional_scalar(s, "scenario", "gnss_rate_hz")? {
+            None => crate::slow_sensors::GNSS_DEFAULT_RATE_HZ,
+            Some(r) if crate::slow_sensors::GNSS_RATES_HZ.iter().any(|&x| f64::from(x) == r) => r as u32,
+            Some(_) => return Err("scenario.gnss_rate_hz: must be 1, 5 or 10".to_string()),
+        };
         let rotors = match get(i, "initial", "rotors")? {
             Value::String(r) if r == "hover" => Rotors::Hover,
             Value::String(r) if r == "stopped" => Rotors::Stopped,
@@ -683,6 +690,7 @@ impl Scenario {
         Ok(Scenario {
             name,
             duration_s,
+            gnss_rate_hz,
             position_ned_m,
             velocity_ned_ms,
             attitude,

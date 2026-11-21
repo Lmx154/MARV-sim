@@ -19,6 +19,7 @@ use marv_sim::pilot::{Ending, Pilot, PilotView};
 use marv_sim::rng::Rng;
 use marv_sim::scenario::{Air, Cell, Ground, Map, Point, RcRow, Rotors, Scenario, Spread};
 use marv_sim::sensors::{IMU_PERIOD_US, ImuModel};
+use marv_sim::slow_sensors::SlowSensors;
 use marv_sim::verdict::{Check, Sample, Trace, judge};
 use marv_sim::{Backend, NativeBackend, Plant, Reaction, Start, Truth};
 use std::io::Write;
@@ -36,14 +37,16 @@ const STREAM_IMU1: u64 = 1;
 const STREAM_IMU2: u64 = 2;
 
 const USAGE: &str = "usage: marv-run --card <marv.toml> --env <env.toml> --seed <u64> --scenario <file> --out <file.BIN> \
-[--point <kf_scale>,<inertia_scale>,<lag_s or ->]
+[--point <kf_scale>,<inertia_scale>,<lag_s or ->] [--home <env/home.local.toml>]
        marv-run --card <marv.toml> --env <env.toml> [--seed <u64>] --spread <file> --out-dir <dir> \
-[--only <cell>] [--logs fail|all]
+[--only <cell>] [--logs fail|all] [--home <env/home.local.toml>]
 (--seed is given exactly when the spread file has no seeds axis)";
 
 struct Args {
     card: PathBuf,
     env: PathBuf,
+    /// The env's git-ignored `home_override`: its records replace the env file's (origin and field).
+    home: Option<PathBuf>,
     seed: Option<u64>,
     job: Job,
 }
@@ -64,7 +67,7 @@ enum Job {
 fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
     let (mut card, mut env, mut scenario, mut seed, mut out) = (None, None, None, None, None);
     let (mut point, mut spread, mut out_dir) = (None, None, None);
-    let (mut only, mut logs) = (None, None);
+    let (mut only, mut logs, mut home) = (None, None, None);
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         if flag == "--help" || flag == "-h" {
@@ -74,6 +77,7 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
         match flag.as_str() {
             "--card" => card = Some(PathBuf::from(value)),
             "--env" => env = Some(PathBuf::from(value)),
+            "--home" => home = Some(PathBuf::from(value)),
             "--scenario" => scenario = Some(PathBuf::from(value)),
             "--seed" => seed = Some(value.parse::<u64>().map_err(|_| format!("--seed: {value} is not a u64"))?),
             "--out" => out = Some(PathBuf::from(value)),
@@ -108,6 +112,7 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
     Ok(Some(Args {
         card: card.ok_or("--card is required")?,
         env: env.ok_or("--env is required")?,
+        home,
         seed,
         job,
     }))
@@ -149,6 +154,7 @@ struct World {
     backend: NativeBackend,
     imu1: ImuModel,
     imu2: ImuModel,
+    slow: SlowSensors,
     wind_ned_ms: [f64; 3],
 }
 
@@ -245,6 +251,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
         let truth = world.backend.step(&wrench, TICK_US).clone();
         ran += 1;
         touched |= truth.on_ground;
+        world.slow.tick(&truth);
         if truth.on_ground && !was_on_ground {
             trace.touchdowns.extend(world.backend.touchdown().copied());
         } else if was_on_ground && !truth.on_ground {
@@ -254,7 +261,8 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
         if truth.t_us.is_multiple_of(IMU_PERIOD_US) {
             let s1 = world.imu1.sample(&truth);
             let s2 = world.imu2.sample(&truth);
-            let sensors = Sensors { imu1: s1, imu2: Some(s2), baro: None, mag: None, gnss: None, external: None };
+            let (baro, mag, gnss) = world.slow.take();
+            let sensors = Sensors { imu1: s1, imu2: Some(s2), baro, mag, gnss, external: None };
             let out = flight.step(&FlightInputs { sensors, rc: pending.take() });
             newest = (out.t_us, out.motors);
             flight_steps += 1;
@@ -336,6 +344,7 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
     }
     let imu1 = ImuModel::new("imu1", &imu1_profile, env, Rng::new(seed, STREAM_IMU1))?;
     let imu2 = ImuModel::new("imu2", &card.imu2, env, Rng::new(seed, STREAM_IMU2))?;
+    let slow = SlowSensors::new(card, env, scenario.gnss_rate_hz, seed)?;
     // Wind for this step is the mean only; gusts come in step 7.
     let wind = match air.wind_ned_ms {
         Some(w) => w,
@@ -381,7 +390,7 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
     handshake.set_permit(true);
     let tuning = Tuning::DEFAULT;
     let flight = Flight::new(Mahony::new(&tuning), CascadedPid::new(&tuning), CardAllocator::new(), &tuning, handshake);
-    let mut world = World { plant, backend, imu1, imu2, wind_ned_ms: wind };
+    let mut world = World { plant, backend, imu1, imu2, slow, wind_ned_ms: wind };
     let (ran, flight_steps, mut trace) = run(flight, &mut world, scenario, pilot.as_mut(), ticks, &mut log);
 
     if let Some(p) = &pilot {
@@ -490,7 +499,14 @@ fn go(args: &Args) -> Result<bool, Failure> {
         )
         .into());
     }
-    let env = Env::load(&args.env).map_err(join)?;
+    let env = match &args.home {
+        None => Env::load(&args.env).map_err(join)?,
+        Some(home) => {
+            // Only a git-ignored override is read, so the private origin cannot be one that is committed.
+            marv_card::check_home_override(&args.env, &home.to_string_lossy())?;
+            Env::load_with_home(&args.env, home).map_err(join)?
+        }
+    };
     match &args.job {
         Job::One { scenario, out, point } => {
             let seed = args.seed.ok_or(Failure::Usage("--seed is required with --scenario".to_string()))?;

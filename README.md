@@ -4,8 +4,9 @@ The simulation workspace for bringing up guidance, navigation and control on the
 decisions and the owner's controlling document are in `MARV-V2-drivers/_plan` (`plan-sim-suite.md`,
 `decision-sim-*-20261119.md`, `HANDOFF-sim-suite-20261118.md`).
 
-State on 2026-11-19: build step 5 of 9. The vehicle card and its checker, the plant, the native backend, the IMU model,
-the scenario file, the runner `marv-run` and the DataFlash log exist. The runner flies the firmware's real flight code
+State on 2026-11-21: build step 7 of 9 in progress (steps 1 to 6 done). The vehicle card and its checker, the plant, the
+native backend, the IMU model, the barometer, compass and GNSS models (step 7, navigation phase 1, packet S1), the
+scenario file, the runner `marv-run` and the DataFlash log exist. The runner flies the firmware's real flight code
 (`Flight<Mahony, CascadedPid, CardAllocator>` with the gate, `Tuning::DEFAULT` and the compiled card) from a stick
 script, and judges each run against the thresholds of `decision-first-pair-20261119.md` (sections 8 and 13): four
 scenarios and a five-point parameter spread. `takeoff-land` takes off from the ground, flies and lands with a sim pilot
@@ -18,12 +19,13 @@ scenarios and a five-point parameter spread. `takeoff-land` takes off from the g
 | `marv-card/marv.toml` | The vehicle card: the only source of the vehicle's physical numbers. Every number is a record with a value, a unit, a tag (`measured`, `datasheet`, `cad`, `derived`, `placeholder`) and a source. |
 | `marv-card/src/` | The loader and the checks (`schema.rs`) and the `card-check` program. |
 | `marv-card/build.rs` | Compiles the card into `const` data for the firmware (`no_std`, without feature `std`): rotor positions and spins, the mixer matrix, coefficients, levels, mass, the card's sha256. `marv-run` refuses a card whose sha256 differs. An `"ask"` in a number the firmware needs fails the build; placeholders show as cargo warnings. |
-| `marv-sim/src/` | `plant.rs` (motor levels to a wrench), `backend.rs` (wrench to truth, RK4, and the ground), `sensors.rs` (the IMU model), `rng.rs` (seeded noise), `scenario.rs` (scenario and spread files), `pilot.rs` (the sim pilot, a test device), `verdict.rs` (the checks), `log.rs` (DataFlash), `math.rs`. |
+| `marv-sim/src/` | `plant.rs` (motor levels to a wrench), `backend.rs` (wrench to truth, RK4, and the ground), `sensors.rs` (the IMU model), `slow_sensors.rs` (the barometer, compass and GNSS models and their path to the flight step), `rng.rs` (seeded noise), `scenario.rs` (scenario and spread files), `pilot.rs` (the sim pilot, a test device), `verdict.rs` (the checks), `log.rs` (DataFlash), `math.rs`. |
 | `marv-sim/src/bin/marv-run.rs` | The runner. |
 | `marv-sim/tests/invariants.rs` | The plant invariants and the ground contact. |
+| `marv-sim/tests/slow_sensors.rs` | The barometer, compass and GNSS models against their definitions. |
 | `scenarios/*.toml` | The four scenarios (`hover`, `steps`, `stick-sign`, `rc-loss`), `takeoff-land`, the spread (`spread.toml`) and the take-off and landing matrix (`takeoff-land-matrix.toml`). |
-| `env/default.toml` | Gravity, atmosphere, origin, magnetic field, wind. Its origin is a public reference point, never home. |
-| `env/home.local.toml` | The real home location, if you create it. Git-ignored; never commit it. |
+| `env/default.toml` | Gravity, atmosphere, origin, magnetic field, wind. Its origin is a public reference point, never home: the Royal Observatory, Greenwich (51.47783 N, 0.00139 W, 68 m), with the WMM2025 field there for 2026-11-20 (19.561, 0.434, 45.067 uT NED; declination 1.271 deg, inclination 66.532 deg). |
+| `env/home.local.toml` | The real home location, if you create it: records of `[origin]` and `[magnetic_field]` that replace the default's under `--home`. Git-ignored; never commit it. |
 
 The firmware is a path dependency: `marv-sim` builds `fw-flight` and `fw-core` from `../MARV-V2-firmware` (read only
 from here), so an edit to the flight code runs in the sim at once.
@@ -40,13 +42,49 @@ It prints a summary, then one line per check and a last line:
 
 Exit status: 0 every check passed, 3 a check failed, 1 a load, refusal or run error (message on stderr), 2 a usage
 error. `--point "<kf_scale>,<inertia_scale>,<lag_s or ->"` runs one spread point (`-` keeps the card's motor time
-constants). The same card, environment, scenario, point and seed give a byte-identical log. `logs/` is git-ignored.
+constants). `--home env/home.local.toml` (either form) runs at the owner's origin: the file must be the env's git-ignored
+`home_override`, and each of its records replaces the same record of `--env`; a record that is still `"ask"` there and that
+a model needs (today: `origin.altitude`) refuses the run. The same card, environment, scenario, point and seed give a
+byte-identical log. `logs/` is git-ignored.
 
 The loop: base tick 125 us. Every 8 ticks (1 kHz) the plant takes `fw_flight::esc::hold(..).throttles()` of the
 newest flight command, the board's own stale-command rule (0 for Stop). Every 32 ticks (4 ms) a stick report is made
 from the script row in force, unless the link is lost then; the newest one goes to the next flight step, once. Every
-tick the plant makes a wrench (plus any disturbance torque) and the backend integrates it. Every 10 ticks (800 Hz)
-both IMU models make a sample and the flight step runs once.
+tick the plant makes a wrench (plus any disturbance torque) and the backend integrates it, and the slow sensors record
+the truth; every 160 ticks (50 Hz) the barometer, every 80 ticks (100 Hz) the compass and every 1600 ticks (5 Hz; 8000 or
+800 at 1 or 10 Hz) the GNSS make a sample, the newest of each waiting for the next flight step. Every 10 ticks (800 Hz)
+both IMU models make a sample and the flight step runs once, with each waiting slow sample once (`Sensors.baro`, `mag`,
+`gnss`; `None` when there is none new), as the board's slow-sensor path gives them.
+
+## The slow sensors
+
+`slow_sensors.rs`, decision-nav-eskf-20261120 section 9a-c. Each model makes the firmware's sample type
+(`fw_core::sample::{BaroSample, MagSample, GnssSample}`) stamped `t_us` with the sim time of its tick and `seq` +1 per
+sample, from the truth of the card's latency earlier (a truth history at the 125 us tick: 92, 40 and 3440 ticks). Each
+draws from its own noise stream (3, 4, 5; the IMUs keep 1 and 2), so every existing run is unchanged.
+
+- Barometer: the ISA troposphere (env `[atmosphere]`, specific gas constant 287.05287 J/(kg K) of ISO 2533) at the origin
+  altitude minus down, after adding two height errors: a drift random walk whose 1-sigma size after `baro.drift_time` (840
+  s) is `baro.drift_sd` (0.77 m), and, while not on the ground, white noise `baro.airborne_height_noise_sd` (0.11 m); then
+  `baro.pressure_bias` and white noise `baro.pressure_noise_sd`. Temperature: ISA at that height. Not modelled: the
+  ground-effect error (0.47 m near the ground under thrust) and the speed error (+0.6 m above 3 m/s).
+- Compass: the env field turned into body FRD by the true attitude, then the TRUE distortion `compass.soft_iron x field +
+  compass.hard_iron_bias` plus white noise `compass.field_noise_sd`, then the CALIBRATION APPLIED, `correction x (raw -
+  hard_iron)` (`Calibration`). The runner applies none (`Calibration::NONE`), so the card's soft and hard iron are what the
+  firmware's calibration leaves (as `hard_iron_bias`'s source says); with a perfect calibration (hard iron equal,
+  correction the inverse of the soft iron) the sample is the env field in body FRD. No mounting rotation: the board hands
+  flight code the field after `MAG_ORIENT`.
+- GNSS: truth at t - `gnss.latency`; north and east errors a first-order Gauss-Markov term (`gnss.slow_horizontal_sd`,
+  `gnss.slow_time_constant`, starting in its stationary spread) plus white noise `gnss.horizontal_sd`; down error a
+  Gauss-Markov term (`gnss.slow_vertical_sd`); velocity north and east plus white noise `gnss.velocity_sd`, as speed and
+  course; the course is held below 0.3 m/s (none before the first motion). Fix type 3; the deviations are
+  `gnss.horizontal_sd` (latitude, longitude) and `gnss.vertical_sd`; satellites, DOP and UTC are `None`. Position: the
+  firmware has no conversion yet, so a local tangent plane at the env origin (WGS 84 meridian and prime-vertical radii at
+  the origin latitude, longitude wrapped at 180 deg), rounded to 1e-7 deg and mm; `ned_from_geo` is the inverse in seams
+  10's form. Rate 1, 5 or 10 Hz by `[scenario] gnss_rate_hz` (default 5, the board's `GPS_RATE_MS` 200). Not modelled:
+  the receiver's smoothing and its hold.
+
+The sim logs none of these samples yet (no record of the GNSS position goes in a log).
 
 ## The plant, the ground and the drag
 
@@ -75,6 +113,7 @@ load. Times are seconds; each script row holds until the next.
     [scenario]
     name = "hover"
     duration_s = 10.0
+    gnss_rate_hz = 5              # optional: 1, 5 or 10 (default 5)
     [initial]                     # position, velocity, roll_pitch_yaw_deg (Z-Y-X), rates, rotors = "hover" | "stopped"
     ...
     [rc]
@@ -218,12 +257,15 @@ core 0 (the pre-arm rule is checked on the board).
 
 Four tests: the plant invariants (free fall, hover thrust equals weight, yaw torque sign matches rotor spin) and
 `ground_contact` (at rest the IMU reads gravity only; release on the first tick the net force points up; a touchdown
-records the state before the hold).
+records the state before the hold). Nine in `tests/slow_sensors.rs`: each slow-sensor model against its definition over
+long seeded runs (noise sd, Gauss-Markov sigma and time constant, drift size, latency, rates, course hold), the compass's
+perfect-calibration identity, the GNSS position round trip and the 180 deg wrap, and every sample reaching a flight step
+exactly once.
 
 ## Not built yet
 
-Barometer, compass and GNSS models, wind gusts, the shadow estimator, the TCP link and the Gazebo backend (steps 6
-to 9).
+Wind gusts (phase 2), the logging of the slow samples, the shadow estimator, the ESKF and the altitude and position
+holds (step 7), the TCP link and the Gazebo backend (steps 8 and 9).
 
 ## Check the card
 
@@ -240,10 +282,12 @@ placeholder and every value or range that is still `"ask"`. Any error exits 1.
       cd ~/Projects/CAD/drone && python3 tools/make_card.py ~/Documents/MARV-sim/marv-card/marv.toml
 
 - Everything else is edited by hand. Give each number its tag and say in `src` where it came from. A `placeholder`
-  needs a range, or `range = "ask"`.
+  needs a range, or `range = "ask"`. A `proposed` number has been put to the owner and is not yet approved; card-check
+  lists it (today the three GNSS `slow_*` numbers).
 
 ## Tests
 
     cargo test --workspace
 
-Six tests in `marv-card` (one card that passes, and one broken card per check) and the four of `marv-sim`.
+Eight tests in `marv-card` (one card that passes, one broken card per check, the sensor fields, the home override)
+and the thirteen of `marv-sim`.

@@ -11,6 +11,7 @@ pub mod plant;
 pub mod rng;
 pub mod scenario;
 pub mod sensors;
+pub mod slow_sensors;
 pub mod verdict;
 
 pub use backend::{Backend, NativeBackend, Reaction, Start, Touchdown, Truth};
