@@ -259,7 +259,8 @@ pub fn build_stream(log: &Log, opts: &StreamOpts) -> Result<Stream, String> {
     let mot = log.table("MOT")?;
     let carm = mot.col("Arm")?;
 
-    // IMU1 samples, each with its MOT.Arm (same TimeUS: one block of the board's step).
+    // IMU1 samples, each with the Arm of the nearest earlier (or same-time) MOT record: the board logs IMU1 at every
+    // step and MOT at every step armed, every 8th disarmed. Before the first MOT record: disarmed.
     struct Row {
         t: u64,
         r: ImuReading,
@@ -272,21 +273,15 @@ pub fn build_stream(log: &Log, opts: &StreamOpts) -> Result<Stream, String> {
             continue;
         }
         let t = imu.time(k);
-        while m < mot.rows() && mot.time(m) < t {
+        while m < mot.rows() && mot.time(m) <= t {
             m += 1;
         }
-        if m >= mot.rows() {
-            // The log ends between an IMU record and its MOT: the last sample has no step block, drop it.
-            break;
-        }
-        if mot.time(m) != t {
-            return Err(format!("IMU1 sample at {t} us has no MOT record: the log is not in the flight-step layout"));
-        }
+        let armed = m > 0 && mot.u8(m - 1, carm) != 0;
         let f3 = |c: usize| [imu.f32(k, c), imu.f32(k, c + 1), imu.f32(k, c + 2)];
         rows.push(Row {
             t,
             r: ImuReading { gyro_rads: f3(cgx), accel_ms2: f3(cax), temperature_c: imu.f32(k, ct) },
-            armed: mot.u8(m, carm) != 0,
+            armed,
         });
     }
     if rows.is_empty() {
@@ -536,5 +531,27 @@ mod tests {
         assert!((e.strength_ut - 50.0).abs() < 1e-6 && (e.tol_strength_frac - 0.1).abs() < 1e-6);
         assert!(matches!(s.expected_from, ExpectedFrom::Log));
         assert!(s.steps[0].armed && !s.steps[4].armed && !s.steps[11].armed);
+    }
+
+    #[test]
+    fn full_rate_imu_with_mot_every_8th_disarmed_fills_nothing() {
+        let mut r = Vec::new();
+        // Armed 4 steps (IMU + MOT each), then disarmed: IMU every step, MOT at steps 4 and 12 only.
+        for k in 0..4u64 {
+            r.extend(imu_block(1000 * k, true, 0.1));
+        }
+        for k in 4..16u64 {
+            let t = 1000 * k;
+            if k % 8 == 4 {
+                r.extend(imu_block(t, false, 0.2));
+            } else {
+                r.push(rec(|b| dflog::encode_imu(b, t, 0, [0.2, 0.0, 0.0], [0.0, 0.0, -9.8], 30.0)));
+            }
+        }
+        let l = Log::parse(&log(&r)).unwrap();
+        let s = build_stream(&l, &StreamOpts { imu_period_us: None, expected_cli: None }).unwrap();
+        assert_eq!((s.real, s.filled, s.steps.len()), (16, 0, 16));
+        assert!(s.steps[..4].iter().all(|x| x.armed));
+        assert!(s.steps[4..].iter().all(|x| !x.armed));
     }
 }

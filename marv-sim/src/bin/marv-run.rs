@@ -14,7 +14,7 @@ use fw_flight::mahony::Mahony;
 use fw_flight::eskf::{Aiding, Eskf};
 use fw_flight::mahony_baro::MahonyBaro;
 use fw_flight::pid::CascadedPid;
-use fw_flight::step::{Flight, FlightInputs, StepOut};
+use fw_flight::step::{Flight, FlightInputs, StepOut, log_due};
 use fw_flight::tuning::Tuning;
 use marv_card::{Card, Env};
 use marv_sim::log::Log;
@@ -734,7 +734,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
     let mut levels = [0u16; 4];
     let mut pending: Option<RcSample> = None;
     let mut trace = Trace::default();
-    let mut flight_steps = 0;
+    let mut flight_steps: u64 = 0;
     let mut ran = 0;
     // Contact at any tick since the last stick report: what the pilot's eye catches between reports (Amendment B1).
     let mut touched = false;
@@ -852,11 +852,17 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             }
             flight_steps += 1;
 
-            log.imu(truth.t_us, 0, &s1.reading);
+            // The firmware's rule (`log_due`): IMU1 every step; NAV, SETP, DMD, MOT every step armed, every 8th disarmed.
+            let due = log_due((flight_steps - 1) as u32, out.armed);
+            if due.imu {
+                log.imu(truth.t_us, 0, &s1.reading);
+            }
             log.imu(truth.t_us, 1, &s2.reading);
             log.truth(&truth);
             log.rotors(truth.t_us, levels, world.plant.rotor_speeds());
-            log.step(&out);
+            if due.block {
+                log.step(&out);
+            }
             if pilot.is_some() {
                 log.ground(&truth);
             }
