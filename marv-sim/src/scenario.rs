@@ -187,6 +187,20 @@ pub enum Verdict {
         off_s: f64,
         off_bound_s: f64,
     },
+    /// decision-nav-eskf-20261120, Amendment F, F9: altitude hold on ESKF2 (windows, heights and the mode sequence).
+    AltHold {
+        windows: Vec<(f64, f64)>,
+        max_height_error_m: f64,
+        max_nav_gap_m: f64,
+        climb_from_s: f64,
+        climb_to_s: f64,
+        descent_from_s: f64,
+        descent_to_s: f64,
+        enter_s: f64,
+        enter_bound_s: f64,
+        baro_lost_from_s: f64,
+        baro_lost_to_s: f64,
+    },
     /// decision-sim-takeoff-landing, section 3. `airborne_m` is `[pilot] airborne_m`, the verdict's lift-off height.
     TakeoffLand {
         airborne_m: f64,
@@ -466,13 +480,15 @@ fn verdict(root: &Table) -> Result<Verdict, String> {
             "min_accel_rise_ms2"],
         "rc_loss" => &["on_high_s", "low_s", "arm_s", "throttle_s", "lost_at_s", "rc_fs_timeout_s", "stop_bound_s",
             "resume_s", "rearm_s", "off_s", "off_bound_s"],
+        "alt_hold" => &["windows", "max_height_error_m", "max_nav_gap_m", "climb_from_s", "climb_to_s",
+            "descent_from_s", "descent_to_s", "enter_s", "enter_bound_s", "baro_lost_from_s", "baro_lost_to_s"],
         "takeoff_land" => &["arm_bound_s", "r_stance_m", "stance_floor_weight", "max_stance_ratio",
             "max_light_after_td_s", "max_peak_height_m", "max_peak_climb_ms", "liftoff_window_s",
             "max_liftoff_tilt_deg", "height_band_m", "max_tilt_deg",
             "max_speed_h_ms", "max_nav_gap_deg",
             "max_td_vz_ms", "max_td_vh_ms", "max_td_tilt_deg", "max_td_rate_dps", "idle_after_s", "stop_bound_s",
             "hover_trim_tolerance"],
-        _ => return Err("verdict.check: must be \"hover\", \"steps\", \"stick_sign\", \"rc_loss\" or \"takeoff_land\""
+        _ => return Err("verdict.check: must be \"hover\", \"steps\", \"stick_sign\", \"rc_loss\", \"alt_hold\" or \"takeoff_land\""
             .to_string()),
     };
     known_keys(v, "verdict", &[&["check"], keys].concat())?;
@@ -523,6 +539,19 @@ fn verdict(root: &Table) -> Result<Verdict, String> {
                 min_accel_rise_ms2: f("min_accel_rise_ms2")?,
             }
         }
+        "alt_hold" => Verdict::AltHold {
+            windows: pairs(v, "verdict", "windows")?,
+            max_height_error_m: f("max_height_error_m")?,
+            max_nav_gap_m: f("max_nav_gap_m")?,
+            climb_from_s: f("climb_from_s")?,
+            climb_to_s: f("climb_to_s")?,
+            descent_from_s: f("descent_from_s")?,
+            descent_to_s: f("descent_to_s")?,
+            enter_s: f("enter_s")?,
+            enter_bound_s: f("enter_bound_s")?,
+            baro_lost_from_s: f("baro_lost_from_s")?,
+            baro_lost_to_s: f("baro_lost_to_s")?,
+        },
         "takeoff_land" => Verdict::TakeoffLand {
             airborne_m: root
                 .get("pilot")
@@ -564,6 +593,19 @@ fn verdict(root: &Table) -> Result<Verdict, String> {
             off_bound_s: f("off_bound_s")?,
         },
     })
+}
+
+/// A list of `[from_s, to_s]` pairs, 0 <= from_s < to_s.
+fn pairs(t: &Table, table: &str, key: &str) -> Result<Vec<(f64, f64)>, String> {
+    let bad = || format!("{table}.{key}: must be a list of [from_s, to_s] pairs, 0 <= from_s < to_s");
+    let mut out = Vec::new();
+    for pair in get(t, table, key)?.as_array().ok_or_else(bad)? {
+        match pair.as_array().map(|p| p.iter().map(number).collect::<Vec<_>>()).as_deref() {
+            Some([Some(from), Some(to)]) if *from >= 0.0 && from < to => out.push((*from, *to)),
+            _ => return Err(bad()),
+        }
+    }
+    Ok(out)
 }
 
 fn number(v: &Value) -> Option<f64> {
@@ -681,18 +723,13 @@ impl Scenario {
             let name = format!("rc.lost[{i}]");
             rc_lost.push((micros(row, &name, "from_s")?, micros(row, &name, "to_s")?));
         }
-        let mut baro_lost = Vec::new();
-        if let Some(v) = s.get("baro_lost") {
-            let bad = || "scenario.baro_lost: must be a list of [from_s, to_s] pairs, 0 <= from_s < to_s".to_string();
-            for pair in v.as_array().ok_or_else(bad)? {
-                match pair.as_array().map(|p| p.iter().map(number).collect::<Vec<_>>()).as_deref() {
-                    Some([Some(from), Some(to)]) if *from >= 0.0 && from < to => {
-                        baro_lost.push(((from * 1e6).round() as u64, (to * 1e6).round() as u64));
-                    }
-                    _ => return Err(bad()),
-                }
-            }
-        }
+        let baro_lost = match s.get("baro_lost") {
+            None => Vec::new(),
+            Some(_) => pairs(s, "scenario", "baro_lost")?
+                .into_iter()
+                .map(|(from, to)| ((from * 1e6).round() as u64, (to * 1e6).round() as u64))
+                .collect(),
+        };
         let mut disturbances = Vec::new();
         for (i, row) in rows(&root, "", "disturbance", &["from_s", "to_s", "torque_nm"])?.into_iter().enumerate() {
             let name = format!("disturbance[{i}]");

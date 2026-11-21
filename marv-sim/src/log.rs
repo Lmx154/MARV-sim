@@ -7,7 +7,7 @@ use crate::backend::Truth;
 use crate::pilot::Report;
 use fw_core::dflog::{self, HEAD1, HEAD2, RecordDef};
 use fw_flight::imu::ImuReading;
-use fw_flight::step::{StepOut, encode_step};
+use fw_flight::step::{StepOut, encode_mode, encode_spn, encode_step};
 use std::path::Path;
 
 const ID_TRU: u8 = 200;
@@ -185,6 +185,20 @@ impl Log {
         let n = encode_step(out, &mut buf);
         self.append(&buf, n);
         self.counts.step += 1;
+    }
+
+    /// MODE (the selected and the effective mode), written by the firmware's `encode_mode`.
+    pub fn mode(&mut self, out: &StepOut) {
+        let mut buf = [0u8; 64];
+        let n = encode_mode(out, &mut buf);
+        self.append(&buf, n);
+    }
+
+    /// SPN (the altitude target), written by the firmware's `encode_spn`; the setpoint must be Altitude.
+    pub fn spn(&mut self, out: &StepOut) {
+        let mut buf = [0u8; 64];
+        let n = encode_spn(out, &mut buf);
+        self.append(&buf, n);
     }
 
     /// One stick report that reaches the flight step, in the order of the columns R, P, T, Y; `t_us` is the report's

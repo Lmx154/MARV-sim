@@ -14,7 +14,7 @@ use fw_flight::mahony::Mahony;
 use fw_flight::eskf::{Aiding, Eskf};
 use fw_flight::mahony_baro::MahonyBaro;
 use fw_flight::pid::CascadedPid;
-use fw_flight::step::{Flight, FlightInputs, StepOut, log_due};
+use fw_flight::step::{Flight, FlightInputs, ModeLog, StepOut, log_due, mode_code};
 use fw_flight::tuning::Tuning;
 use marv_card::{Card, Env};
 use marv_sim::log::Log;
@@ -54,6 +54,10 @@ Tuning::nav_noaid_sigma_m, the armed no-aid position hold's sigma).";
 
 /// `--noaid-sigma`: replaces `Tuning::nav_noaid_sigma_m` (the armed no-aid position hold's sigma) for every estimator.
 static NOAID_SIGMA: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+
+/// `--tuning-override <name>=<value>` (a negative-control option, not for the flight's own runs): replaces one of
+/// `psc_posz_p`, `psc_velz_p`, `psc_velz_i` in the flight code's `Tuning`.
+static TUNING_OVERRIDE: std::sync::OnceLock<(String, f32)> = std::sync::OnceLock::new();
 
 struct Args {
     card: PathBuf,
@@ -125,6 +129,14 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
             "--noaid-sigma" => {
                 let v = value.parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0).ok_or(format!("--noaid-sigma: {value} is not a positive number"))?;
                 let _ = NOAID_SIGMA.set(v);
+            }
+            "--tuning-override" => {
+                let (name, v) = value.split_once('=').ok_or(format!("--tuning-override: {value} is not name=value"))?;
+                let v = v.parse::<f32>().ok().filter(|v| v.is_finite()).ok_or(format!("--tuning-override: {value}: not a number"))?;
+                if !["psc_posz_p", "psc_velz_p", "psc_velz_i"].contains(&name) {
+                    return Err(format!("--tuning-override: {name} is not psc_posz_p, psc_velz_p or psc_velz_i"));
+                }
+                let _ = TUNING_OVERRIDE.set((name.to_string(), v));
             }
             "--preroll" => {
                 let s = value.parse::<f64>().map_err(|_| format!("--preroll: {value} is not a number"))?;
@@ -687,7 +699,7 @@ fn row_at(script: &[RcRow], t_us: u64) -> RcRow {
 }
 
 /// What the verdict reads of one flight step.
-fn sample(truth: &Truth, out: &StepOut) -> Sample {
+fn sample(truth: &Truth, out: &StepOut, baro_drift_m: f64) -> Sample {
     let (sp_q, sp_heading_rate) = match out.setpoint {
         Setpoint::Attitude { attitude, heading_rate_rads, .. } => (attitude.map(f64::from), f64::from(heading_rate_rads)),
         _ => ([1.0, 0.0, 0.0, 0.0], 0.0),
@@ -698,6 +710,26 @@ fn sample(truth: &Truth, out: &StepOut) -> Sample {
         u8::from(s.roll) | u8::from(s.pitch) << 1 | u8::from(s.yaw) << 2 | u8::from(s.thrust_low) << 3
             | u8::from(s.thrust_high) << 4
     });
+    let target_d = match out.setpoint {
+        Setpoint::Altitude { down_m, .. } => f64::from(down_m),
+        _ => f64::NAN,
+    };
+    let mut logged: Vec<f32> = [out.nav.attitude.as_slice(), &out.nav.rates_rads, &out.nav.velocity_ms, &out.nav.position_m].concat();
+    match out.setpoint {
+        Setpoint::Attitude { attitude, heading_rate_rads, thrust_n } => {
+            logged.extend(attitude);
+            logged.extend([heading_rate_rads, thrust_n]);
+        }
+        Setpoint::Altitude { attitude, heading_rate_rads, down_m, velocity_d_ms } => {
+            logged.extend(attitude);
+            logged.extend([heading_rate_rads, down_m, velocity_d_ms]);
+        }
+        _ => {}
+    }
+    if let Ok(d) = out.demand {
+        logged.push(d.thrust_n);
+        logged.extend(d.torque_nm);
+    }
     Sample {
         t_us: truth.t_us,
         truth_q: truth.attitude,
@@ -713,6 +745,15 @@ fn sample(truth: &Truth, out: &StepOut) -> Sample {
         on_ground: truth.on_ground,
         settling: truth.settling,
         reaction: truth.reaction,
+        selected: mode_code(out.selected),
+        mode: mode_code(out.mode),
+        vel_d_valid: out.nav.valid.velocity_d,
+        pos_d_valid: out.nav.valid.position_d,
+        nav_d: f64::from(out.nav.position_m[2]),
+        target_d,
+        thrust_n: out.demand.map_or(0.0, |d| f64::from(d.thrust_n)),
+        finite: logged.iter().all(|x| x.is_finite()),
+        baro_drift_m,
     }
 }
 
@@ -734,6 +775,9 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
     let mut levels = [0u16; 4];
     let mut pending: Option<RcSample> = None;
     let mut trace = Trace::default();
+    // The barometer model's drift when the flight code is first given a barometer sample (the pre-roll's included).
+    let mut drift0: Option<f64> = None;
+    let mut mode_log = ModeLog::new();
     let mut flight_steps: u64 = 0;
     let mut ran = 0;
     // Contact at any tick since the last stick report: what the pilot's eye catches between reports (Amendment B1).
@@ -761,6 +805,9 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
                 let s2 = world.imu2.sample(&pinned);
                 let (baro, mag, gnss) = world.slow.take();
                 let sensors = Sensors { imu1: s1, imu2: Some(s2), baro, mag, gnss, external: None };
+                if baro.is_some() && drift0.is_none() {
+                    drift0 = Some(world.slow.baro.drift_m());
+                }
                 let out = flight.step(&FlightInputs { sensors, rc: pending.take() });
                 if let Some(sh) = shadow.as_deref_mut() {
                     sh.feed(&sensors, &out, &pinned, world.slow.baro.drift_m(), std::mem::replace(&mut contact, false));
@@ -830,6 +877,9 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             if scenario.baro_lost.iter().any(|&(from, to)| truth.t_us >= from && truth.t_us < to) {
                 sensors_f.baro = None;
             }
+            if sensors_f.baro.is_some() && drift0.is_none() {
+                drift0 = Some(world.slow.baro.drift_m());
+            }
             if let Some(b) = sensors_f.baro.as_mut() {
                 b.t_us += off;
             }
@@ -866,12 +916,22 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             if due.block {
                 log.step(&out);
             }
+            // The board's MODE (at the first step and at every change of the selected or effective mode) and SPN (the
+            // step block's cadence, only while the setpoint is Altitude), src/flight.rs.
+            if mode_log.pending(&out) {
+                log.mode(&out);
+                mode_log.done(&out);
+            }
+            if due.block && matches!(out.setpoint, Setpoint::Altitude { .. }) {
+                log.spn(&out);
+            }
             if pilot.is_some() {
                 log.ground(&truth);
             }
-            trace.steps.push(sample(&truth, &out));
+            trace.steps.push(sample(&truth, &out, world.slow.baro.drift_m()));
         }
     }
+    trace.baro_drift0_m = drift0.unwrap_or(0.0);
     (ran, flight_steps, trace)
 }
 
@@ -996,6 +1056,13 @@ every row's time is scenario time (the flight code's clock was scenario time + {
     if let Some(s) = NOAID_SIGMA.get() {
         tuning.nav_noaid_sigma_m = *s;
     }
+    if let Some((name, v)) = TUNING_OVERRIDE.get() {
+        match name.as_str() {
+            "psc_posz_p" => tuning.psc_posz_p = *v,
+            "psc_velz_p" => tuning.psc_velz_p = *v,
+            _ => tuning.psc_velz_i = *v,
+        }
+    }
     let mut world = World { plant, backend, imu1, imu2, slow, wind_ned_ms: wind };
     let mut shadow: Option<Box<dyn Slot>> = match shadow {
         None => None,
@@ -1021,9 +1088,9 @@ every row's time is scenario time (the flight code's clock was scenario time + {
         }
     };
 
+    trace.weight_n = card.mass.mass.v.unwrap_or(f64::NAN) * env.gravity.v.unwrap_or(f64::NAN);
     if let Some(p) = &pilot {
         trace.phases = p.timeline().to_vec();
-        trace.weight_n = card.mass.mass.v.unwrap_or(f64::NAN) * env.gravity.v.unwrap_or(f64::NAN);
         // The nominal cell changes nothing of the card, the environment or the scenario's ground.
         let same = |set: Option<f64>, card: Option<f64>| set.is_none_or(|x| Some(x) == card);
         let same3 = |set: Option<[f64; 3]>, card: Option<[f64; 3]>| set.is_none_or(|x| Some(x) == card);

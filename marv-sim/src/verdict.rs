@@ -30,6 +30,22 @@ pub struct Sample {
     pub on_ground: bool,
     pub settling: bool,
     pub reaction: Reaction,
+    /// `StepOut.selected` and `StepOut.mode` as the MODE record codes them (1 Angle, 2 Altitude, 3 Position).
+    pub selected: u8,
+    pub mode: u8,
+    /// `StepOut.nav.valid.velocity_d` and `position_d`.
+    pub vel_d_valid: bool,
+    pub pos_d_valid: bool,
+    /// The estimate's down position, m.
+    pub nav_d: f64,
+    /// `Setpoint::Altitude.down_m` (SPN.PD), m; NaN when the setpoint is not Altitude.
+    pub target_d: f64,
+    /// The demanded collective thrust, N (0 when the demand was refused).
+    pub thrust_n: f64,
+    /// Every logged number of the step (estimate, setpoint, demand) is finite.
+    pub finite: bool,
+    /// The barometer model's drift state at this step, m.
+    pub baro_drift_m: f64,
 }
 
 /// A value read from one flight step (degrees or degrees per second).
@@ -52,6 +68,9 @@ pub struct Trace {
     pub liftoffs: Vec<u64>,
     pub weight_n: f64,
     pub nominal: bool,
+    /// The barometer model's drift when the flight code was given its first barometer sample, m (the filter's height
+    /// is referenced to that sample; the altitude-hold check takes the drift since then out of the height error).
+    pub baro_drift0_m: f64,
 }
 
 /// One `CHECK` line. `limit` carries its comparison, for example `<=1.5000`.
@@ -210,6 +229,7 @@ pub fn judge(verdict: &Verdict, trace: &Trace) -> (Vec<Check>, Vec<String>) {
             ];
             (checks, Vec::new())
         }
+        Verdict::AltHold { .. } => alt_hold(verdict, trace),
         Verdict::TakeoffLand { .. } => takeoff_land(verdict, trace),
     }
 }
@@ -256,6 +276,103 @@ fn count_check(name: &str, bad: Option<usize>) -> Check {
         limit: "=0".into(),
         pass: bad == Some(0),
     }
+}
+
+/// The step time, us (800 Hz flight steps).
+const STEP_US: f64 = 1250.0;
+const MODE_ALTITUDE: u8 = 2;
+
+/// A check on a number that must lie in `[lo, hi]`.
+fn within(name: &str, value: f64, lo: f64, hi: f64) -> Check {
+    Check {
+        name: name.into(),
+        measured: format!("{value:.4}"),
+        limit: format!("[{lo:.4},{hi:.4}]"),
+        pass: value >= lo && value <= hi,
+    }
+}
+
+/// decision-nav-eskf-20261120, Amendment F, F9 (the thresholds are the scenario file's): over the windows the truth
+/// height against the target (SPN.PD), the estimate against the truth with the barometer model's drift taken out (the
+/// owner's ruling on a2; the raw figure is reported, not judged); I6 (never Altitude without velocity_d and position_d)
+/// and the mode sequence Angle, Altitude, Angle (within a step of the flags dropping), Altitude (within a step of
+/// their return); every logged number finite and the vehicle armed at the end.
+pub fn alt_hold(verdict: &Verdict, trace: &Trace) -> (Vec<Check>, Vec<String>) {
+    let Verdict::AltHold { ref windows, max_height_error_m, max_nav_gap_m, climb_from_s, climb_to_s, descent_from_s,
+        descent_to_s, enter_s, enter_bound_s, baro_lost_from_s, baro_lost_to_s } = *verdict else { unreachable!() };
+    let judged = || trace.steps.iter().filter(|s| windows.iter().any(|&(a, b)| s.t_us >= us(a) && s.t_us < us(b)));
+    let covered = |s: &Sample| s.vel_d_valid && s.pos_d_valid;
+    let t_first = |from: u64, f: &dyn Fn(&Sample) -> bool| trace.steps.iter().find(|s| s.t_us >= from && f(s)).map(|s| s.t_us);
+    let nodrift = |s: &Sample| s.nav_d - s.truth_pos[2] + (s.baro_drift_m - trace.baro_drift0_m);
+    let steps_late = |t: Option<u64>, reference: Option<u64>| match (t, reference) {
+        (Some(t), Some(r)) => (t as f64 - r as f64) / STEP_US,
+        _ => f64::NAN,
+    };
+
+    // The mode sequence: the first Altitude step, the first step out of Altitude after it, the first Altitude step after
+    // that; the flags' drop (the first step from the start of the barometer loss with velocity_d or position_d false)
+    // and their return (the first step from the end of the loss with both true).
+    let t_enter = t_first(0, &|s| s.mode == MODE_ALTITUDE);
+    let t_exit = t_enter.and_then(|t| t_first(t, &|s| s.mode != MODE_ALTITUDE));
+    let t_back = t_exit.and_then(|t| t_first(t, &|s| s.mode == MODE_ALTITUDE));
+    let t_drop = t_first(us(baro_lost_from_s), &|s| !covered(s));
+    let t_fusion = t_first(us(baro_lost_to_s), &covered);
+    let changes = trace.steps.windows(2).filter(|w| w[0].mode != w[1].mode).count();
+    let above_coverage = trace.steps.iter().filter(|s| s.mode == MODE_ALTITUDE && !covered(s)).count();
+
+    let mut checks = vec![
+        at_most("alt_height_error_m", largest(judged().map(|s| (s.truth_pos[2] - s.target_d).abs())), max_height_error_m),
+        at_most("alt_nav_gap_nodrift_m", largest(judged().map(|s| nodrift(s).abs())), max_nav_gap_m),
+        count_check("alt_i6_altitude_without_coverage_steps", Some(above_coverage)),
+        at_most("alt_enter_delay_s", t_enter.map_or(f64::NAN, |t| (secs(t) - enter_s).abs()), enter_bound_s),
+        within("alt_exit_steps_after_flags_drop", steps_late(t_exit, t_drop), 0.0, 1.0),
+        within("alt_return_steps_after_flags_back", steps_late(t_back, t_fusion), 0.0, 1.0),
+        Check { name: "alt_mode_changes".into(), measured: changes.to_string(), limit: "=3".into(), pass: changes == 3 },
+        count_check("alt_non_finite_steps", Some(trace.steps.iter().filter(|s| !s.finite).count())),
+    ];
+    let armed = trace.steps.last().is_some_and(|s| s.armed);
+    checks.push(Check { name: "alt_armed_at_end".into(), measured: armed.to_string(), limit: "=true".into(), pass: armed });
+
+    let at = |t: Option<u64>| t.map_or(f64::NAN, secs);
+    let target_at = |s: f64| sample_at(trace, s).map_or(f64::NAN, |x| x.target_d);
+    let truth_at = |s: f64| sample_at(trace, s).map_or(f64::NAN, |x| x.truth_pos[2]);
+    let mut notes = vec![
+        format!("INFO alt raw |nav D - truth D| over the windows {:.4} m (not judged; barometer drift taken out above)",
+            largest(judged().map(|s| (s.nav_d - s.truth_pos[2]).abs()))),
+        format!("INFO alt barometer-model drift: at the first barometer sample {:.4} m, largest since then over the windows {:.4} m",
+            trace.baro_drift0_m, largest(judged().map(|s| (s.baro_drift_m - trace.baro_drift0_m).abs()))),
+        format!("INFO alt climb: target rose {:.4} m over {climb_from_s}..{climb_to_s} s, truth rose {:.4} m (not judged)",
+            target_at(climb_from_s) - target_at(climb_to_s), truth_at(climb_from_s) - truth_at(climb_to_s)),
+        format!("INFO alt descent: target fell {:.4} m over {descent_from_s}..{descent_to_s} s, truth fell {:.4} m (not judged)",
+            target_at(descent_to_s) - target_at(descent_from_s), truth_at(descent_to_s) - truth_at(descent_from_s)),
+        format!("INFO alt mode: Altitude from {:.4} s, Angle from {:.4} s, Altitude again from {:.4} s; flags dropped at {:.4} s ({:.4} s after the loss began), back at {:.4} s ({:.4} s after it ended)",
+            at(t_enter), at(t_exit), at(t_back), at(t_drop), at(t_drop) - baro_lost_from_s, at(t_fusion),
+            at(t_fusion) - baro_lost_to_s),
+    ];
+    if let (Some(a), Some(b)) = (t_exit, t_back) {
+        let h0 = trace.steps.iter().find(|s| s.t_us >= a).map_or(f64::NAN, |s| s.truth_pos[2]);
+        let band = trace.steps.iter().filter(|s| s.t_us >= a && s.t_us <= b).map(|s| s.truth_pos[2] - h0);
+        let (lo, hi) = band.fold((0.0f64, 0.0f64), |(lo, hi), d| (lo.min(d), hi.max(d)));
+        notes.push(format!("INFO alt Angle fallback {:.4}..{:.4} s: truth height moved {:.4} m up and {:.4} m down from its value at the fallback (not judged)", secs(a), secs(b), -lo, hi));
+    }
+    // The collective thrust over weight, 50 ms before and after each mode change (the step it makes).
+    let mean_ratio = |from: u64, to: u64| mean(trace.steps.iter().filter(|s| s.t_us >= from && s.t_us < to).map(|s| s.thrust_n / trace.weight_n));
+    for (what, t) in [("enter", t_enter), ("exit", t_exit), ("return", t_back)] {
+        if let Some(t) = t {
+            notes.push(format!("INFO alt thrust/weight at {what} ({:.4} s): 50 ms before {:.4}, 50 ms after {:.4}",
+                secs(t), mean_ratio(t.saturating_sub(50_000), t), mean_ratio(t, t + 50_000)));
+        }
+    }
+    // A short table of the flight, every 2 s (heights up positive; target nan while the mode is Angle).
+    notes.push("TABLE alt t_s truth_h_m target_h_m nav_h_m mode thrust_over_weight".to_string());
+    let end = trace.steps.last().map_or(0.0, |s| secs(s.t_us));
+    for k in 0..=(end / 2.0).floor() as u64 {
+        if let Some(s) = sample_at(trace, 2.0 * k as f64) {
+            notes.push(format!("TABLE alt {:>5.1} {:>8.3} {:>8.3} {:>8.3} {} {:.3}", secs(s.t_us), -s.truth_pos[2], -s.target_d,
+                -s.nav_d, if s.mode == MODE_ALTITUDE { "Altitude" } else { "Angle" }, s.thrust_n / trace.weight_n));
+        }
+    }
+    (checks, notes)
 }
 
 /// decision-sim-takeoff-landing, section 3: one check per row of its table. Lift-off is the end of the first tick off
