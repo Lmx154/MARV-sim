@@ -192,13 +192,15 @@ the first contact after the first rise through `airborne_m` (Amendment B7). The 
 drift correction is printed.
 
 `--estimator mahony|eskf1|eskf2` puts that estimator in the flight step (default Mahony; eskf1 = `Aiding::Imu`, eskf2 =
-`Aiding::ImuBaro`) and adds one `steer <estimator> <rates>` line per run (per cell in a spread): tilt error against truth
-at the same step (rms and max, first 5 s after the estimator's tilt is valid, and after), the largest |gyro bias|
-estimate (deg/s), `motor_dlevel_rms` (rms of the step-to-step change of each motor's DShot level, pooled over the four
-motors and over consecutive steps that both spin) and the Eskf's re-initialisations. `--rates native|pt1|pt1-bias`
-(eskf only) chooses the body rates it reports: its own (gyro minus bias, unfiltered), Mahony's PT1 of the gyro (a Mahony
-runs inside the wrapper for it, so the bits are Mahony's), or that PT1 minus the Eskf's gyro-bias estimate. Without
-`--estimator` nothing changes and no `steer` line is printed.
+`Aiding::ImuBaro`, built directly with `Eskf::with_aiding`; the Eskf's own rates, PT1 minus bias, are what the rate loop
+gets) and adds one `steer <estimator>` line per run (per cell in a spread): tilt error against truth at the same step
+(rms and max, first 5 s after the estimator's tilt is valid, and after), the largest |gyro bias| estimate (deg/s),
+`motor_dlevel_rms` (rms of the step-to-step change of each motor's DShot level, pooled over the four motors and over
+consecutive steps that both spin), the Eskf's re-initialisations, and `takeoff_rms_deg`/`takeoff_max_deg`/`takeoff_n`
+(tilt error over the valid steps from the first armed step to 3 s after the first lift-off; n 0 without a lift-off).
+With a pilot scenario each backend touchdown adds a `TD` note: truth state before the hold and the tilt error over the 2 s
+before it. `--noaid-sigma <m>` replaces `Tuning::nav_noaid_sigma_m` (the armed no-aid position hold's sigma) for every
+estimator. Without `--estimator` nothing changes and no `steer` line is printed.
 
 `--preroll <seconds>` (decision-nav-eskf D5; air-start scenarios with a script only: a ground start or a pilot scenario has
 its own ground phase and is a usage error, as is a non-zero initial velocity or rate) steps the flight code (and the

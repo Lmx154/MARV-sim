@@ -49,7 +49,7 @@ const USAGE: &str = "usage: marv-run --card <marv.toml> --env <env.toml> --seed 
 Either form takes --shadow mahony-baro or --shadow eskf: that estimator runs in the shadow slot and one `shadow` line
 reports it, and --preroll <seconds> (air-start scenarios only, not a ground start: that has its own ground phase; the
 flight code is stepped that long with the plant pinned at the initial state, disarmed, before scenario time 0), and --estimator mahony|eskf1|eskf2 (the flight step's estimator; one `steer` line reports it) with
---rates native|pt1|pt1-bias (eskf1 and eskf2 only: which body rates the flight step gets), and --noaid-sigma <m> (replaces
+and --noaid-sigma <m> (replaces
 Tuning::nav_noaid_sigma_m, the armed no-aid position hold's sigma).";
 
 /// `--noaid-sigma`: replaces `Tuning::nav_noaid_sigma_m` (the armed no-aid position hold's sigma) for every estimator.
@@ -63,7 +63,7 @@ struct Args {
     seed: Option<u64>,
     /// `--shadow mahony-baro` or `--shadow eskf`: the estimator in the shadow slot.
     shadow: Option<ShadowKind>,
-    /// `--estimator` and `--rates`: the flight step's estimator; `None` is the default Mahony with no `steer` line.
+    /// `--estimator`: the flight step's estimator; `None` is the default Mahony with no `steer` line.
     steer: Option<SteerCfg>,
     /// `--preroll <s>`: the runner's pre-roll before scenario time 0 (decision-nav-eskf D5), in base ticks.
     preroll: Option<u64>,
@@ -78,19 +78,9 @@ enum EstKind {
     Eskf2,
 }
 
-/// The body rates an Eskf steering the flight step reports: its own, Mahony's PT1 of the gyro, or that PT1 minus the
-/// Eskf's gyro-bias estimate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Rates {
-    Native,
-    Pt1,
-    Pt1Bias,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct SteerCfg {
     est: EstKind,
-    rates: Rates,
 }
 
 /// Which logs a spread keeps: `Fail` only those of cells with a failing check.
@@ -111,7 +101,7 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
     let (mut point, mut spread, mut out_dir) = (None, None, None);
     let (mut only, mut logs, mut home) = (None, None, None);
     let mut shadow = None;
-    let (mut estimator, mut rates, mut preroll) = (None, None, None);
+    let (mut estimator, mut preroll) = (None, None);
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         if flag == "--help" || flag == "-h" {
@@ -151,14 +141,6 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
                     _ => return Err(format!("--estimator: {value} is not mahony, eskf1 or eskf2")),
                 })
             }
-            "--rates" => {
-                rates = Some(match value.as_str() {
-                    "native" => Rates::Native,
-                    "pt1" => Rates::Pt1,
-                    "pt1-bias" => Rates::Pt1Bias,
-                    _ => return Err(format!("--rates: {value} is not native, pt1 or pt1-bias")),
-                })
-            }
             "--logs" => {
                 logs = Some(match value.as_str() {
                     "fail" => Logs::Fail,
@@ -183,10 +165,7 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
     if matches!(job, Job::One { .. }) && seed.is_none() {
         return Err("--seed is required with --scenario".into());
     }
-    if rates.is_some() && !matches!(estimator, Some(EstKind::Eskf1 | EstKind::Eskf2)) {
-        return Err("--rates needs --estimator eskf1 or eskf2".into());
-    }
-    let steer = estimator.map(|est| SteerCfg { est, rates: rates.unwrap_or(Rates::Native) });
+    let steer = estimator.map(|est| SteerCfg { est });
     Ok(Some(Args {
         steer,
         preroll,
@@ -596,28 +575,18 @@ screens {} gated {} resets_height {} resets_yaw {} resets_gps {} reinits {} yaw_
     }
 }
 
-/// An `Eskf` steering the flight step: everything of its NavState is the Eskf's except, with `Pt1` or `Pt1Bias`, the rates.
-/// The PT1 is a real `Mahony` fed the same sensors (so it is bit for bit Mahony's `rates_rads`: same helper, same
-/// `ins_gyro_lpf_hz`, same first-sample rule); `Pt1Bias` takes the Eskf's gyro-bias estimate off it.
+/// The `Eskf` steering the flight step, wrapped only to read its gyro-bias estimate and re-initialisation count after
+/// the run (`Flight` owns its estimator). Everything it returns is the Eskf's own.
 struct Steering {
     eskf: Eskf,
-    rates: Rates,
-    pt1: Mahony,
     /// Largest |gyro bias| component seen, rad/s, and the Eskf's re-initialisations: read after the run.
     info: Rc<StdCell<(f32, u32)>>,
 }
 
 impl Estimator for Steering {
     fn update(&mut self, sensors: &Sensors) -> NavState {
-        let mut nav = self.eskf.update(sensors);
+        let nav = self.eskf.update(sensors);
         let bg = self.eskf.biases().0;
-        if self.rates != Rates::Native {
-            let pt = self.pt1.update(sensors).rates_rads;
-            nav.rates_rads = match self.rates {
-                Rates::Pt1Bias => [pt[0] - bg[0], pt[1] - bg[1], pt[2] - bg[2]],
-                _ => pt,
-            };
-        }
         let (m, _) = self.info.get();
         let big = bg.iter().fold(m, |a, b| a.max(b.abs()));
         self.info.set((big, self.eskf.stats().reinits));
@@ -645,10 +614,15 @@ struct Steer {
     dm_n: u64,
     /// Every valid step's time and tilt error (rad), for the per-touchdown figures.
     hist: Vec<(u64, f64)>,
+    /// The first step with the gate armed.
+    t_arm: Option<u64>,
 }
 
 impl Steer {
     fn feed(&mut self, out: &StepOut, truth: &Truth) {
+        if out.armed && self.t_arm.is_none() {
+            self.t_arm = Some(out.t_us);
+        }
         if out.nav.valid.tilt {
             let e = tilt_err(out.nav.attitude.map(f64::from), truth.attitude);
             let t0 = *self.t0.get_or_insert(out.t_us);
@@ -668,7 +642,7 @@ impl Steer {
         self.prev = now;
     }
 
-    fn line(&self, cfg: SteerCfg, info: Option<(f32, u32)>) -> String {
+    fn line(&self, cfg: SteerCfg, info: Option<(f32, u32)>, t_lo: Option<u64>) -> String {
         let d = f64::to_degrees;
         let rms = |t: (u64, f64, f64)| d((t.1 / t.0.max(1) as f64).sqrt());
         let (bias, reinits) = info.unwrap_or((0.0, 0));
@@ -677,17 +651,18 @@ impl Steer {
             EstKind::Eskf1 => "eskf1",
             EstKind::Eskf2 => "eskf2",
         };
-        let rates = match (cfg.est, cfg.rates) {
-            (EstKind::Mahony, _) => "native",
-            (_, Rates::Native) => "native",
-            (_, Rates::Pt1) => "pt1",
-            (_, Rates::Pt1Bias) => "pt1-bias",
+        // The take-off window: tilt error (valid steps) from the first armed step to 3 s after the first lift-off.
+        let w: Vec<f64> = match (self.t_arm, t_lo) {
+            (Some(a), Some(l)) => self.hist.iter().filter(|(t, _)| *t >= a && *t <= l + 3_000_000).map(|h| h.1).collect(),
+            _ => Vec::new(),
         };
+        let to_rms = d((w.iter().map(|e| e * e).sum::<f64>() / w.len().max(1) as f64).sqrt());
+        let to_max = d(w.iter().copied().fold(0.0, f64::max));
         format!(
-            "steer {est} {rates} tilt_rms_first5_deg {:.4} tilt_max_first5_deg {:.4} tilt_rms_after_deg {:.4} tilt_max_after_deg {:.4} \
-tilt_n_first5 {} tilt_n_after {} bias_max_dps {:.4} motor_dlevel_rms {:.4} motor_dlevel_n {} reinits {}",
+            "steer {est} tilt_rms_first5_deg {:.4} tilt_max_first5_deg {:.4} tilt_rms_after_deg {:.4} tilt_max_after_deg {:.4} \
+tilt_n_first5 {} tilt_n_after {} bias_max_dps {:.4} motor_dlevel_rms {:.4} motor_dlevel_n {} reinits {} takeoff_rms_deg {:.4} takeoff_max_deg {:.4} takeoff_n {}",
             rms(self.tilt[0]), d(self.tilt[0].2), rms(self.tilt[1]), d(self.tilt[1].2), self.tilt[0].0, self.tilt[1].0,
-            d(f64::from(bias)), (self.dm2 / self.dm_n.max(1) as f64).sqrt(), self.dm_n, reinits
+            d(f64::from(bias)), (self.dm2 / self.dm_n.max(1) as f64).sqrt(), self.dm_n, reinits, to_rms, to_max, w.len()
         )
     }
 }
@@ -1027,7 +1002,7 @@ every row's time is scenario time (the flight code's clock was scenario time + {
             t.nav_mag_declination_rad = f[1].atan2(f[0]) as f32;
             let aiding = if cfg.est == EstKind::Eskf1 { Aiding::Imu } else { Aiding::ImuBaro };
             let eskf = Eskf::with_aiding(&t, aiding).map_err(|e| format!("Eskf: {e:?}"))?;
-            let est = Steering { eskf, rates: cfg.rates, pt1: Mahony::new(&tuning), info: info.clone() };
+            let est = Steering { eskf, info: info.clone() };
             let flight = Flight::new(est, CascadedPid::new(&tuning), CardAllocator::new(), &tuning, handshake);
             run(flight, &mut world, scenario, pilot.as_mut(), ticks, &mut log, shadow.as_deref_mut(), steer.as_mut(), preroll.unwrap_or(0))
         }
@@ -1103,7 +1078,7 @@ vh_ms {:.4} vz_ms {:.4}",
         }
     }
     let steer = steer_cfg.zip(steer).map(|(cfg, st)| {
-        st.line(cfg, (cfg.est != EstKind::Mahony).then(|| info.get()))
+        st.line(cfg, (cfg.est != EstKind::Mahony).then(|| info.get()), trace.liftoffs.first().copied())
     });
     Ok(Outcome { summary, checks, notes, shadow: shadow.map(|s| s.line()), steer })
 }
