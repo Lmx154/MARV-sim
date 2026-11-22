@@ -1,0 +1,40 @@
+# DIAGNOSTIC RUN (decision-nav-eskf-20261120, Amendments G and G-1, packet P-G4): S5: hover.toml run 30 s with GNSS lost 2..12 s (the verdict windows of hover.toml are unchanged). NOT part of the spread; the owner's test budget does not include it.
+# Hover hold (decision-first-pair-20261119, 8a): the common preamble ("arm in the air"), hover 10 s, a roll torque
+# step from 5 s. Judged on truth, and the estimate against truth, from 2 s.
+[scenario]
+name = "hover-gnss-lost"
+duration_s = 30.0
+gnss_lost = [[2.0, 12.0]]
+
+[initial]
+position_ned_m = [0.0, 0.0, 0.0]
+velocity_ned_ms = [0.0, 0.0, 0.0]
+roll_pitch_yaw_deg = [0.0, 0.0, 0.0]   # conventions 7c: yaw, then pitch, then roll (Z-Y-X)
+rates_rads = [0.0, 0.0, 0.0]
+rotors = "hover"                       # "hover": each at sqrt(mass * g / (4 * thrust_coefficient)); "stopped": 0
+
+[rc]
+# Each row holds from t_s until the next. roll, pitch, yaw -1..1 (right, forward, clockwise +); throttle 0..1;
+# arm = the channel-5 switch. A report is made every 4 ms from the row in force.
+script = [
+  { t_s = 0.0,   roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.0, arm = false },  # 8: switch off, throttle 0
+  { t_s = 0.020, roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.0, arm = true },   # 8: switch on (arms)
+  { t_s = 0.040, roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.5, arm = true },   # 8: throttle 0.5 (hover)
+]
+
+# 8a: a roll torque step of 0.046 N.m (5 % of the 0.911 N.m authority) from 5 s on, body frame.
+[[disturbance]]
+from_s = 5.0
+torque_nm = [0.046, 0.0, 0.0]
+
+[verdict]
+check = "hover"
+from_s = 2.0                  # 8a: judged over 2..10 s
+# 8a says "truth tilt <= 1.5 deg" over 2..10 s and, for the disturbance, "peak <= 6 deg, <= 1.5 deg over 8..10 s".
+# Read (lead): tilt <= 1.5 deg over [2, 5) before the disturbance, peak <= 6 deg over [5, 10], <= 1.5 deg over [8, 10].
+disturbance_s = 5.0           # 8a: the disturbance's start
+settle_from_s = 8.0           # 8a: "tilt <= 1.5 deg over 8..10 s"
+max_tilt_deg = 1.5            # 8a, 13 "hover thresholds"
+max_nav_gap_deg = 1.0         # 8a, 13: |nav tilt - truth tilt| over 2..10 s
+max_heading_change_deg = 5.0  # 8a, 13: truth heading against its value at 2 s, over 2..10 s
+max_peak_tilt_deg = 6.0       # 8a, 13 "hover disturbance"

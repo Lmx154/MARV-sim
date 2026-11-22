@@ -207,7 +207,7 @@ throttle is cut, Stop after switch-off, and (nominal card only) the pilot's mean
 the first contact after the first rise through `airborne_m` (Amendment B7). The pilot's
 drift correction is printed.
 
-`--estimator mahony|eskf1|eskf2` puts that estimator in the flight step (default Mahony; eskf1 = `Aiding::Imu`, eskf2 =
+`--estimator mahony|eskf1|eskf2|eskf3` puts that estimator in the flight step (default Mahony; eskf1 = `Aiding::Imu`, eskf2 =
 `Aiding::ImuBaro`, built directly with `Eskf::with_aiding`; the Eskf's own rates, PT1 minus bias, are what the rate loop
 gets) and adds one `steer <estimator>` line per run (per cell in a spread): tilt error against truth at the same step
 (rms and max, first 5 s after the estimator's tilt is valid, and after), the largest |gyro bias| estimate (deg/s),
@@ -217,6 +217,25 @@ consecutive steps that both spin), the Eskf's re-initialisations, and `takeoff_r
 With a pilot scenario each backend touchdown adds a `TD` note: truth state before the hold and the tilt error over the 2 s
 before it. `--noaid-sigma <m>` replaces `Tuning::nav_noaid_sigma_m` (the armed no-aid position hold's sigma) for every
 estimator. Without `--estimator` nothing changes and no `steer` line is printed.
+
+`--estimator eskf3` (Amendments G and G-1, packet P-G4) puts `SteerMix` in the flight step: an `EskfSteer` around its own
+`Eskf::new` core for attitude, rates and the horizontal state, an `EskfZ` (`Aiding::ImuBaro`) for the vertical, both in
+leaked storage. Its `steer` line gains, after a `|`: the output predictor's tracking error at each correction (attitude,
+velocity, position: rms and max), `skipped`, `ring_dropped`, the core's `yaw_aligns`, `yaw_align_s`, `yaw_resets`,
+`gps_pos_fused`, `reinits`, whether the G6-B latch fired (`latch`, `latch_s`: the first NKI Src 8, Ok 0), the tilt error
+against truth over the run and in the 5 s after the first yaw alignment (`align_airborne`: after the first lift-off),
+the heading error against truth while `heading` is valid, and the horizontal position error against truth at current
+time while `position_ne` is valid (the filter's origin removed), with the times the NE flags changed. `--window
+<from_s>,<to_s>` (repeatable, scenario time) adds one `window` line per interval: tilt rms/max, the truth tilt (lean),
+heading and horizontal error. Scenario fields for the diagnostic runs under `scenarios/fault/` (all off by default;
+those scenarios are not in the spread): `gnss_lost = [[from_s, to_s]]` (no GNSS sample reaches the flight code),
+`gnss_hold = [[from_s, to_s]]` (the samples repeat the last position before the interval and report zero speed and
+velocity; after it the model's true solution returns with the jump), `mag_fault = { from_s, kind = "rotate" | "stuck",
+deg, below_m, axis }` (`rotate`: the calibrated field vector turned about body `axis`, z by default, by `deg`; a
+negative `from_s` reaches into the pre-roll; `below_m`: only while the truth height above the start is below it.
+`stuck`: the field of the first sample at or after `from_s` is repeated while the sample's time and sequence advance;
+a rotation about z keeps the field's strength and inclination, so it passes the compass health test, a rotation about x
+or y does not), `gnss_latency_s` (replaces the GNSS model's 0.43 s).
 
 `--preroll <seconds>` (decision-nav-eskf D5; air-start scenarios with a script only: a ground start or a pilot scenario has
 its own ground phase and is a usage error, as is a non-zero initial velocity or rate) steps the flight code (and the

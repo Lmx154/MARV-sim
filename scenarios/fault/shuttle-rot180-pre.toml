@@ -1,0 +1,57 @@
+# DIAGNOSTIC RUN (decision-nav-eskf-20261120, Amendments G and G-1, packet P-G4): S7b NEGATIVE CONTROL (U5): compass rotated 180 deg from before the pre-roll, so the yaw aligns wrong; steps.toml's first 11 s (verdict windows unchanged), then a pitch shuttle of 0.3 stick (9 deg) alternating every 6 s, to keep the vehicle moving to 100 s. NOT part of the spread; the owner's test budget does not include it.
+# Roll, pitch and yaw steps (decision-first-pair-20261119, 8b): the common preamble, hover 2 s after the throttle row,
+# then roll 0.5 for 1.5 s and centre 1.5 s; pitch 0.5 the same way; yaw 0.5 the same way.
+[scenario]
+name = "shuttle-rot180-pre"
+duration_s = 100.0
+mag_fault = { from_s = -10.0, kind = "rotate", deg = 180.0 }
+
+[initial]
+position_ned_m = [0.0, 0.0, 0.0]
+velocity_ned_ms = [0.0, 0.0, 0.0]
+roll_pitch_yaw_deg = [0.0, 0.0, 0.0]
+rates_rads = [0.0, 0.0, 0.0]
+rotors = "hover"
+
+[rc]
+script = [
+  { t_s = 0.0,   roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.0, arm = false },
+  { t_s = 0.020, roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.0, arm = true },
+  { t_s = 0.040, roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.5, arm = true },
+  { t_s = 2.040, roll = 0.5, pitch = 0.0, yaw = 0.0, throttle = 0.5, arm = true },
+  { t_s = 3.540, roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.5, arm = true },
+  { t_s = 5.040, roll = 0.0, pitch = 0.5, yaw = 0.0, throttle = 0.5, arm = true },
+  { t_s = 6.540, roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.5, arm = true },
+  { t_s = 8.040, roll = 0.0, pitch = 0.0, yaw = 0.5, throttle = 0.5, arm = true },
+  { t_s = 9.540, roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.5, arm = true },
+  { t_s = 11.000, roll = 0.0, pitch = 0.3, yaw = 0.0, throttle = 0.5, arm = true },
+  { t_s = 14.000, roll = 0.0, pitch = -0.3, yaw = 0.0, throttle = 0.5, arm = true },
+  { t_s = 20.000, roll = 0.0, pitch = 0.3, yaw = 0.0, throttle = 0.5, arm = true },
+  { t_s = 26.000, roll = 0.0, pitch = -0.3, yaw = 0.0, throttle = 0.5, arm = true },
+  { t_s = 32.000, roll = 0.0, pitch = 0.3, yaw = 0.0, throttle = 0.5, arm = true },
+  { t_s = 38.000, roll = 0.0, pitch = -0.3, yaw = 0.0, throttle = 0.5, arm = true },
+  { t_s = 44.000, roll = 0.0, pitch = 0.3, yaw = 0.0, throttle = 0.5, arm = true },
+  { t_s = 50.000, roll = 0.0, pitch = -0.3, yaw = 0.0, throttle = 0.5, arm = true },
+  { t_s = 56.000, roll = 0.0, pitch = 0.3, yaw = 0.0, throttle = 0.5, arm = true },
+  { t_s = 62.000, roll = 0.0, pitch = -0.3, yaw = 0.0, throttle = 0.5, arm = true },
+  { t_s = 68.000, roll = 0.0, pitch = 0.3, yaw = 0.0, throttle = 0.5, arm = true },
+  { t_s = 74.000, roll = 0.0, pitch = -0.3, yaw = 0.0, throttle = 0.5, arm = true },
+  { t_s = 80.000, roll = 0.0, pitch = 0.3, yaw = 0.0, throttle = 0.5, arm = true },
+  { t_s = 86.000, roll = 0.0, pitch = -0.3, yaw = 0.0, throttle = 0.5, arm = true },
+  { t_s = 92.000, roll = 0.0, pitch = 0.3, yaw = 0.0, throttle = 0.5, arm = true },
+  { t_s = 98.000, roll = 0.0, pitch = -0.3, yaw = 0.0, throttle = 0.5, arm = true },
+]
+
+[verdict]
+check = "steps"
+# Roll and pitch: the logged nav attitude (the estimate) against the setpoint's angle; yaw: truth yaw rate (body r)
+# against the setpoint's heading rate. Each step and each return is judged over its 1.5 s hold window.
+roll_at_s = 2.040             # 8b: step instants (the return is at + hold_s)
+pitch_at_s = 5.040
+yaw_at_s = 8.040
+hold_s = 1.5                  # 8b
+step_angle_deg = 15.0         # 8b: 0.5 of roll or pitch stick is 15 deg (ANGLE_MAX 30 deg); the setpoint must be this
+step_yaw_rate_dps = 75.0      # 8b: 0.5 of yaw stick is 75 deg/s (PILOT_Y_RATE 150 deg/s)
+max_rise_s = 0.6              # 8b, 13: 10-90 % rise time
+max_overshoot_rp_pct = 10.0   # 8b, 13: roll and pitch
+max_overshoot_yaw_pct = 25.0  # 8b, 13: yaw

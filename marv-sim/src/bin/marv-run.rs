@@ -938,6 +938,51 @@ fn sample(truth: &Truth, out: &StepOut, baro_drift_m: f64) -> Sample {
     }
 }
 
+/// The scenario's GNSS hold and compass faults (G4), applied to the samples the flight code is given: the last GNSS
+/// sample outside a hold and the stuck compass field.
+#[derive(Default)]
+struct Faults {
+    gnss_prev: Option<fw_core::sample::GnssSample>,
+    mag_stuck: Option<[f32; 3]>,
+}
+
+impl Faults {
+    /// `t_us` is scenario time (negative in the pre-roll), `height_m` the truth height above the start.
+    fn apply(&mut self, sc: &Scenario, t_us: i64, height_m: f64, s: &mut Sensors) {
+        let within = |w: &[(u64, u64)]| t_us >= 0 && w.iter().any(|&(from, to)| t_us as u64 >= from && (t_us as u64) < to);
+        if within(&sc.gnss_lost) {
+            s.gnss = None;
+        } else if let Some(g) = s.gnss.as_mut() {
+            match self.gnss_prev.as_ref().filter(|_| within(&sc.gnss_hold)) {
+                Some(prev) => {
+                    g.reading.lat_e7 = prev.reading.lat_e7;
+                    g.reading.lon_e7 = prev.reading.lon_e7;
+                    g.reading.alt_mm = prev.reading.alt_mm;
+                    g.reading.speed_mm_s = Some(0);
+                    g.reading.vel_ned_mm_s = g.reading.vel_ned_mm_s.map(|_| [0; 3]);
+                }
+                None if within(&sc.gnss_hold) => {}
+                None => self.gnss_prev = Some(*g),
+            }
+        }
+        if let (Some(f), Some(m)) = (sc.mag_fault, s.mag.as_mut()) {
+            if t_us >= f.from_us {
+                match f.kind {
+                    MagFaultKind::Rotate if f.below_m.is_none_or(|b| height_m < b) => {
+                        let (a, b) = ((f.axis + 1) % 3, (f.axis + 2) % 3);
+                        let (sn, cs) = (f.deg_rad.sin() as f32, f.deg_rad.cos() as f32);
+                        let v = m.reading.field_ut;
+                        m.reading.field_ut[a] = cs * v[a] - sn * v[b];
+                        m.reading.field_ut[b] = sn * v[a] + cs * v[b];
+                    }
+                    MagFaultKind::Rotate => {}
+                    MagFaultKind::Stuck => m.reading.field_ut = *self.mag_stuck.get_or_insert(m.reading.field_ut),
+                }
+            }
+        }
+    }
+}
+
 /// Runs at most `ticks` base ticks (with a pilot, until its phase table ends); returns how many ticks and flight steps
 /// it made and what the verdict needs.
 fn run<E: Estimator, C: Controller, A: Allocator>(
@@ -962,8 +1007,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
     let mut flight_steps: u64 = 0;
     let mut ran = 0;
     // The scenario's GNSS hold and compass faults (G4): the last GNSS sample outside a hold, the stuck compass field.
-    let mut gnss_prev: Option<fw_core::sample::GnssSample> = None;
-    let mut mag_stuck: Option<[f32; 3]> = None;
+    let mut faults = Faults::default();
     // Contact at any tick since the last stick report: what the pilot's eye catches between reports (Amendment B1).
     let mut touched = false;
     // Contact at any tick since the last flight step, for the shadow's airborne time.
@@ -988,7 +1032,8 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
                 let s1 = world.imu1.sample(&pinned);
                 let s2 = world.imu2.sample(&pinned);
                 let (baro, mag, gnss) = world.slow.take();
-                let sensors = Sensors { imu1: s1, imu2: Some(s2), baro, mag, gnss, external: None };
+                let mut sensors = Sensors { imu1: s1, imu2: Some(s2), baro, mag, gnss, external: None };
+                faults.apply(scenario, pinned.t_us as i64 - off as i64, -pinned.position_m[2], &mut sensors);
                 if baro.is_some() && drift0.is_none() {
                     drift0 = Some(world.slow.baro.drift_m());
                 }
@@ -1061,37 +1106,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             if scenario.baro_lost.iter().any(|&(from, to)| truth.t_us >= from && truth.t_us < to) {
                 sensors_f.baro = None;
             }
-            let within = |w: &[(u64, u64)]| w.iter().any(|&(from, to)| truth.t_us >= from && truth.t_us < to);
-            if within(&scenario.gnss_lost) {
-                sensors_f.gnss = None;
-            } else if let Some(g) = sensors_f.gnss.as_mut() {
-                match gnss_prev.as_ref().filter(|_| within(&scenario.gnss_hold)) {
-                    Some(prev) => {
-                        g.reading.lat_e7 = prev.reading.lat_e7;
-                        g.reading.lon_e7 = prev.reading.lon_e7;
-                        g.reading.alt_mm = prev.reading.alt_mm;
-                        g.reading.speed_mm_s = Some(0);
-                        g.reading.vel_ned_mm_s = g.reading.vel_ned_mm_s.map(|_| [0; 3]);
-                    }
-                    None if within(&scenario.gnss_hold) => {}
-                    None => gnss_prev = Some(*g),
-                }
-            }
-            if let (Some(f), Some(m)) = (scenario.mag_fault, sensors_f.mag.as_mut()) {
-                if truth.t_us >= f.from_us {
-                    match f.kind {
-                        MagFaultKind::Rotate if f.below_m.is_none_or(|b| -truth.position_m[2] < b) => {
-                            let (a, b) = ((f.axis + 1) % 3, (f.axis + 2) % 3);
-                            let (sn, cs) = (f.deg_rad.sin() as f32, f.deg_rad.cos() as f32);
-                            let v = m.reading.field_ut;
-                            m.reading.field_ut[a] = cs * v[a] - sn * v[b];
-                            m.reading.field_ut[b] = sn * v[a] + cs * v[b];
-                        }
-                        MagFaultKind::Rotate => {}
-                        MagFaultKind::Stuck => m.reading.field_ut = *mag_stuck.get_or_insert(m.reading.field_ut),
-                    }
-                }
-            }
+            faults.apply(scenario, truth.t_us as i64, -truth.position_m[2], &mut sensors_f);
             if sensors_f.baro.is_some() && drift0.is_none() {
                 drift0 = Some(world.slow.baro.drift_m());
             }

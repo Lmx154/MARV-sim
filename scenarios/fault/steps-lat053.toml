@@ -1,0 +1,41 @@
+# DIAGNOSTIC RUN (decision-nav-eskf-20261120, Amendments G and G-1, packet P-G4): steps.toml with the GNSS model latency 0.53 s instead of the card 0.43 s (filter compiled 0.43 s). NOT part of the spread; the owner's test budget does not include it.
+# Roll, pitch and yaw steps (decision-first-pair-20261119, 8b): the common preamble, hover 2 s after the throttle row,
+# then roll 0.5 for 1.5 s and centre 1.5 s; pitch 0.5 the same way; yaw 0.5 the same way.
+[scenario]
+name = "steps-lat053"
+duration_s = 11.04
+gnss_latency_s = 0.53
+
+[initial]
+position_ned_m = [0.0, 0.0, 0.0]
+velocity_ned_ms = [0.0, 0.0, 0.0]
+roll_pitch_yaw_deg = [0.0, 0.0, 0.0]
+rates_rads = [0.0, 0.0, 0.0]
+rotors = "hover"
+
+[rc]
+script = [
+  { t_s = 0.0,   roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.0, arm = false },  # 8: preamble
+  { t_s = 0.020, roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.0, arm = true },
+  { t_s = 0.040, roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.5, arm = true },
+  { t_s = 2.040, roll = 0.5, pitch = 0.0, yaw = 0.0, throttle = 0.5, arm = true },   # roll 0.5 -> 15 deg
+  { t_s = 3.540, roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.5, arm = true },
+  { t_s = 5.040, roll = 0.0, pitch = 0.5, yaw = 0.0, throttle = 0.5, arm = true },   # pitch 0.5 -> 15 deg nose down
+  { t_s = 6.540, roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.5, arm = true },
+  { t_s = 8.040, roll = 0.0, pitch = 0.0, yaw = 0.5, throttle = 0.5, arm = true },   # yaw 0.5 -> 75 deg/s
+  { t_s = 9.540, roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.5, arm = true },
+]
+
+[verdict]
+check = "steps"
+# Roll and pitch: the logged nav attitude (the estimate) against the setpoint's angle; yaw: truth yaw rate (body r)
+# against the setpoint's heading rate. Each step and each return is judged over its 1.5 s hold window.
+roll_at_s = 2.040             # 8b: step instants (the return is at + hold_s)
+pitch_at_s = 5.040
+yaw_at_s = 8.040
+hold_s = 1.5                  # 8b
+step_angle_deg = 15.0         # 8b: 0.5 of roll or pitch stick is 15 deg (ANGLE_MAX 30 deg); the setpoint must be this
+step_yaw_rate_dps = 75.0      # 8b: 0.5 of yaw stick is 75 deg/s (PILOT_Y_RATE 150 deg/s)
+max_rise_s = 0.6              # 8b, 13: 10-90 % rise time
+max_overshoot_rp_pct = 10.0   # 8b, 13: roll and pitch
+max_overshoot_yaw_pct = 25.0  # 8b, 13: yaw

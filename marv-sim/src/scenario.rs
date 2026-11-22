@@ -66,7 +66,8 @@ pub struct Scenario {
 /// `[scenario] mag_fault` (G4): what is done to the compass sample the flight code gets, from `from_us` on.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MagFault {
-    pub from_us: u64,
+    /// Scenario time; negative reaches into the pre-roll (the run's time before scenario time 0).
+    pub from_us: i64,
     pub kind: MagFaultKind,
     /// `Rotate`: the angle, rad; unused by `Stuck`.
     pub deg_rad: f64,
@@ -787,9 +788,6 @@ impl Scenario {
                     _ => return Err("scenario.mag_fault.kind: must be \"rotate\" or \"stuck\"".to_string()),
                 };
                 let from_s = scalar(t, "scenario.mag_fault", "from_s")?;
-                if from_s < 0.0 {
-                    return Err("scenario.mag_fault.from_s: must be >= 0".to_string());
-                }
                 let deg = if kind == MagFaultKind::Rotate { scalar(t, "scenario.mag_fault", "deg")? } else { 0.0 };
                 let axis = match t.get("axis").map(Value::as_str) {
                     None | Some(Some("z")) => 2,
@@ -798,7 +796,7 @@ impl Scenario {
                     _ => return Err("scenario.mag_fault.axis: must be \"x\", \"y\" or \"z\"".to_string()),
                 };
                 Some(MagFault {
-                    from_us: (from_s * 1e6).round() as u64,
+                    from_us: (from_s * 1e6).round() as i64,
                     kind,
                     deg_rad: deg.to_radians(),
                     below_m: optional_scalar(t, "scenario.mag_fault", "below_m")?,
