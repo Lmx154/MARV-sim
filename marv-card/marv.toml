@@ -112,13 +112,13 @@ hard_iron_bias = { v = [0.0, 0.0, 0.0], unit = "uT", tag = "placeholder", range 
 soft_iron = { v = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], unit = "1", tag = "placeholder", range = "ask", src = "none: identity until a calibration's residual is measured (PLAN:decision-nav-eskf-20261120.md section 9b, 9e)" }
 latency = { v = 0.005, unit = "s", tag = "placeholder", range = [0.0, 0.005], src = "a bound, not a datasheet figure: at most averaging x 2.5 ms (PRESETS:89-90)" }
 
-# GNSS, Quectel LC76G. Values from flight log 186 (PLAN:decision-nav-eskf-20261120.md section 9c, 9e); owner approved
-# 2026-11-20 except the three slow_* numbers, which are proposed.
+# GNSS, u-blox SAM-M10Q since 2026-11-22 (PLAN:decision-gnss-m10-20261122.md). The sd values are the LC76G's (flight
+# log 186, PLAN:decision-nav-eskf-20261120.md section 9c, 9e), kept as placeholders until an M10 log measures them.
 [gnss]
-horizontal_sd = { v = 0.18, unit = "m", tag = "measured", src = "log 186 rest scatter, per horizontal axis" }
-vertical_sd = { v = 0.41, unit = "m", tag = "measured", src = "log 186 rest scatter" }
-velocity_sd = { v = 0.15, unit = "m/s", tag = "derived", src = "the reconstruction's raw GPS velocity innovations, std 0.12-0.19 (recon_summary.txt:67)" }
-latency = { v = 0.43, unit = "s", tag = "measured", range = [0.40, 0.46], src = "log 186 delay scan at 1 Hz, +-3 scan sigma" }
+horizontal_sd = { v = 0.18, unit = "m", tag = "placeholder", range = "ask", src = "LC76G log 186 rest scatter, per horizontal axis" }
+vertical_sd = { v = 0.41, unit = "m", tag = "placeholder", range = "ask", src = "LC76G log 186 rest scatter" }
+velocity_sd = { v = 0.15, unit = "m/s", tag = "placeholder", range = "ask", src = "LC76G: the reconstruction's raw GPS velocity innovations, std 0.12-0.19 (recon_summary.txt:67)" }
+latency = { v = 0.12, unit = "s", tag = "placeholder", range = "ask", src = "ArduPilot AP_GPS_UBLOX::get_lag() for M10, unverified; owner approved 2026-11-22; re-measure by the replay delay scan on the first M10 log" }
 slow_horizontal_sd = { v = 0.3, unit = "m", tag = "proposed", src = "decision-nav-eskf section 9c (offline filter settings); Gauss-Markov sigma per horizontal axis" }
 slow_vertical_sd = { v = 1.0, unit = "m", tag = "proposed", src = "decision-nav-eskf section 9c (offline filter settings); Gauss-Markov sigma, vertical" }
 slow_time_constant = { v = 60.0, unit = "s", tag = "proposed", src = "decision-nav-eskf section 9c (offline filter settings); Gauss-Markov time constant, all three axes" }
