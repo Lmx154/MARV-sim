@@ -577,18 +577,25 @@ fn takeoff_land(verdict: &Verdict, trace: &Trace) -> (Vec<Check>, Vec<String>) {
         let bad = trace.steps.iter().zip(&expected).filter(|(s, e)| s.mode == MODE_POSITION && !**e).count();
         checks.push(count_check("pos_c2_position_uncovered_or_grounded_steps", Some(bad)));
         let (_, longest_low) = airborne_latch(trace);
-        notes.push(format!("INFO pos longest in-air low-collective interval {longest_low:.4} s"));
+        notes.push(format!("INFO pos longest in-air thrust_low interval {longest_low:.4} s"));
         // Touchdown to the effective mode leaving Position, and the worst stance ratio over that interval.
         if let Some(td) = t_td {
             let first_pos_after = trace.steps.iter().find(|s| s.t_us >= td && s.mode != MODE_POSITION);
             match first_pos_after {
                 Some(e) => {
                     let w = trace.steps.iter().filter(|s| s.t_us >= td && s.t_us <= e.t_us).filter(loaded).map(ratio);
-                    notes.push(format!("INFO pos touchdown {:.4} s to Eff {} at {:.4} s: {:.4} s; stance ratio over it {:.4}",
-                        secs(td), e.mode, secs(e.t_us), secs(e.t_us) - secs(td), largest_or_zero(w)));
+                    let stance = w.fold(0.0, f64::max);
+                    notes.push(format!("INFO pos touchdown {:.4} s to Eff {} at {:.4} s: {:.4} s",
+                        secs(td), e.mode, secs(e.t_us), secs(e.t_us) - secs(td)));
+                    checks.push(at_most("pos_stance_margin_td_to_eff2", stance, max_stance_ratio));
                 }
-                None => notes.push(format!("INFO pos touchdown {:.4} s: Position still in effect at the end", secs(td))),
+                None => {
+                    notes.push(format!("INFO pos touchdown {:.4} s: Position still in effect at the end", secs(td)));
+                    checks.push(at_most("pos_stance_margin_td_to_eff2", f64::NAN, max_stance_ratio));
+                }
             }
+        } else {
+            checks.push(at_most("pos_stance_margin_td_to_eff2", f64::NAN, max_stance_ratio));
         }
     }
     (checks, notes)
@@ -596,11 +603,13 @@ fn takeoff_land(verdict: &Verdict, trace: &Trace) -> (Vec<Check>, Vec<String>) {
 
 const MODE_POSITION: u8 = 3;
 
-/// The airborne latch as the firmware keeps it (step.rs, Amendment P, P3 replaced), recomputed from the logged armed state
-/// and demanded thrust: after each step, low = thrust below `ground_thrust_g x m g` (a refused demand logs 0 N); disarmed
-/// clears it; not low sets it; low adds the step's dt (capped at `DT_MAX_US`) to `low_us`, and `low_us >= land_detect_us`
-/// clears it. Returns, per step, the latch as step i sees it (the value left by step i-1; false at the first step), and the
-/// longest `low_us` reached while the latch was still set (the in-air low-collective interval).
+/// The airborne latch as the firmware keeps it (step.rs, Amendment P, P3 second revision), recomputed from the logged armed
+/// state, the demanded thrust and the allocator's saturation bits (DMD Sat bit 3 = `thrust_low`, the collective on the idle
+/// floor): after each step, low = the demand was refused or `thrust_low`. Disarmed clears the latch and zeroes `low_us`; low
+/// adds the step's dt (capped at `DT_MAX_US`) to `low_us`, and `low_us >= land_detect_us` clears it; not low zeroes `low_us`
+/// and sets the latch if the thrust is at least `ground_thrust_g x m g`. Returns, per step, the latch as step i sees it (the
+/// value left by step i-1; false at the first step), and the longest `low_us` reached while the latch was still set (the
+/// in-air thrust_low interval).
 fn airborne_latch(trace: &Trace) -> (Vec<bool>, f64) {
     let tuning = fw_flight::tuning::Tuning::DEFAULT;
     let threshold = tuning.ground_thrust_g as f64 * trace.weight_n;
@@ -610,11 +619,14 @@ fn airborne_latch(trace: &Trace) -> (Vec<bool>, f64) {
     for i in 0..st.len() {
         seen.push(airborne);
         let dt = if i == 0 { 0 } else { (st[i].t_us - st[i - 1].t_us).min(fw_flight::mahony::DT_MAX_US) };
+        let low = st[i].flags.is_none_or(|f| f & 8 != 0);
         if !st[i].armed {
             airborne = false;
             low_us = 0;
-        } else if st[i].thrust_n >= threshold {
-            airborne = true;
+        } else if !low {
+            if st[i].thrust_n >= threshold {
+                airborne = true;
+            }
             low_us = 0;
         } else {
             low_us += dt;
@@ -750,7 +762,7 @@ fn pos_hold(verdict: &Verdict, trace: &Trace) -> (Vec<Check>, Vec<String>) {
 
     // Reported, not judged.
     let mut notes = Vec::new();
-    notes.push(format!("INFO pos longest in-air low-collective interval {longest_low:.4} s (margin to land_detect_us {:.4} s: {:.4} s)",
+    notes.push(format!("INFO pos longest in-air thrust_low interval {longest_low:.4} s (margin to land_detect_us {:.4} s: {:.4} s)",
         tuning.land_detect_us as f64 * 1e-6, tuning.land_detect_us as f64 * 1e-6 - longest_low));
     notes.push(format!("INFO pos c1 arm {:.4} s, first Position after Altitude {:.4} s", t_arm.map_or(f64::NAN, secs),
         t_pos.map_or(f64::NAN, secs)));
