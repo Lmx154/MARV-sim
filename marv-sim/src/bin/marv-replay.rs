@@ -2,6 +2,7 @@
 //! what the board logged. See `--help` and the README.
 
 use fw_flight::eskf::{Aiding, Eskf, EskfStats, Nki};
+use fw_flight::eskf_out::EskfSteer;
 use fw_flight::gnc::{Estimator, NavState, Valid};
 use fw_flight::mahony::Mahony;
 use fw_flight::mahony_baro::MahonyBaro;
@@ -13,7 +14,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 const HELP: &str = "\
-marv-replay <log.BIN> <outdir> [--every N] [--imu-period-us US] [--mag-expected UT,INC_DEG,STR_PCT,TOL_DEG] [--noaid-sigma M] [--no-baro-from-armed N] [--gps-delay-ms MS] [--gps-min-rate-hz HZ] [--no-mag] [--nki] [--steering mahony-baro|eskf2]
+marv-replay <log.BIN> <outdir> [--every N] [--imu-period-us US] [--mag-expected UT,INC_DEG,STR_PCT,TOL_DEG] [--noaid-sigma M] [--no-baro-from-armed N] [--gps-delay-ms MS] [--gps-min-rate-hz HZ] [--no-mag] [--nki] [--steering mahony-baro|eskf2|eskf3]
 
 Replays a flight log through the flight code's estimators (the real Rust code, Tuning::DEFAULT) and prints a
 validation table against the log's own NAV and NKF1 records. One CSV per estimator goes into <outdir>
@@ -49,9 +50,27 @@ trait Replayed: Estimator {
     fn nki(&self) -> Vec<Nki> {
         Vec::new()
     }
+    /// Extra CSV columns of this estimator after this step (`eskf3out`): tracking errors, T_d, counters.
+    fn extras(&self) -> Option<[f32; 9]> {
+        None
+    }
 }
 impl Replayed for Mahony {}
 impl Replayed for MahonyBaro {}
+/// `eskf3out`: the output predictor around its own `Eskf::new` core. The core is leaked: the wrapper borrows it for
+/// the life of the process (the board builds it as a static).
+impl Replayed for EskfSteer<'static> {
+    fn eskf_stats(&self) -> Option<EskfStats> {
+        Some(*self.core().stats())
+    }
+    fn biases(&self) -> Option<([f32; 3], [f32; 3])> {
+        Some(self.core().biases())
+    }
+    fn extras(&self) -> Option<[f32; 9]> {
+        let t = self.tracking();
+        Some([t.att_rad, t.vel_ms, t.pos_m, t.t_d_s, self.skipped() as f32, self.pushed() as f32, self.corrected() as f32, self.ring_dropped() as f32, self.core().stats().reinits as f32])
+    }
+}
 impl Replayed for Eskf {
     fn eskf_stats(&self) -> Option<EskfStats> {
         Some(*self.stats())
@@ -73,22 +92,30 @@ struct Row {
     bias: Vec<[f32; 6]>,
     /// NKI records of every step (`--nki`, eskf3 only).
     nki: Vec<Nki>,
+    /// `Replayed::extras` after every step (`eskf3out`).
+    extra: Vec<[f32; 9]>,
 }
 
 fn row(name: &'static str, armed_at: ArmedAt, est: Box<dyn Replayed>) -> Row {
-    Row { name, armed_at, est, nav: Vec::new(), bias: Vec::new(), nki: Vec::new() }
+    Row { name, armed_at, est, nav: Vec::new(), bias: Vec::new(), nki: Vec::new(), extra: Vec::new() }
 }
 
 /// The estimators to run: one line each.
 /// `steer_eskf2`: eskf2 steers (the state after the previous step, as `Flight::step` sets it); else it is a shadow.
-fn table(t: &Tuning, steer_eskf2: bool) -> Vec<Row> {
+fn table(t: &Tuning, steer_eskf2: bool, steer_eskf3: bool) -> Vec<Row> {
     vec![
         row("Mahony", ArmedAt::Before, Box::new(Mahony::new(t))),
         row("MahonyBaro", ArmedAt::Before, Box::new(MahonyBaro::new(t))),
         row("eskf1", ArmedAt::After, Box::new(Eskf::with_aiding(t, Aiding::Imu).expect("Tuning::DEFAULT is accepted"))),
         row("eskf2", if steer_eskf2 { ArmedAt::Before } else { ArmedAt::After }, Box::new(Eskf::with_aiding(t, Aiding::ImuBaro).expect("Tuning::DEFAULT is accepted"))),
         row("eskf3", ArmedAt::After, Box::new(Eskf::new(t).expect("Tuning::DEFAULT is accepted"))),
+        row("eskf3out", if steer_eskf3 { ArmedAt::Before } else { ArmedAt::After }, Box::new(eskf3out(t))),
     ]
+}
+
+fn eskf3out(t: &Tuning) -> EskfSteer<'static> {
+    let core: &'static mut Eskf = Box::leak(Box::new(Eskf::new(t).expect("Tuning::DEFAULT is accepted")));
+    EskfSteer::new(core, t).expect("the output ring is sized for Tuning::DEFAULT")
 }
 
 struct Args {
@@ -110,6 +137,9 @@ struct Args {
     nki: bool,
     /// `--steering mahony-baro|eskf2`: which estimator steered on the board (default: read from the log).
     steering: Option<bool>,
+    /// `--steering eskf3`: eskf3out is the steering estimator of the log (armed state after the previous step). No flown log
+    /// has it yet; the old rows' steering is then read from the log as without the option.
+    steer_eskf3: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -119,6 +149,7 @@ fn parse_args() -> Result<Args, String> {
     let mut no_baro_from_armed = None;
     let (mut gps_delay_ms, mut gps_min_rate_hz, mut no_mag, mut nki) = (None, None, false, false);
     let mut steering = None;
+    let mut steer_eskf3 = false;
     let mut opts = StreamOpts { imu_period_us: None, expected_cli: None };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -141,13 +172,12 @@ fn parse_args() -> Result<Args, String> {
             }
             "--no-mag" => no_mag = true,
             "--nki" => nki = true,
-            "--steering" => {
-                steering = Some(match it.next().as_deref() {
-                    Some("eskf2") => true,
-                    Some("mahony-baro") => false,
-                    _ => return Err("--steering mahony-baro|eskf2".into()),
-                })
-            }
+            "--steering" => match it.next().as_deref() {
+                Some("eskf2") => steering = Some(true),
+                Some("mahony-baro") => steering = Some(false),
+                Some("eskf3") => steer_eskf3 = true,
+                _ => return Err("--steering mahony-baro|eskf2|eskf3".into()),
+            },
             "--every" => every = it.next().and_then(|v| v.parse().ok()).filter(|&v| v > 0).ok_or("--every N")?,
             "--imu-period-us" => {
                 opts.imu_period_us = Some(it.next().and_then(|v| v.parse().ok()).ok_or("--imu-period-us US")?)
@@ -166,19 +196,22 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     let [log, out]: [String; 2] = pos.try_into().map_err(|_| "usage: marv-replay <log.BIN> <outdir> [options]; --help")?;
-    Ok(Args { log: log.into(), out: out.into(), every, opts, noaid, no_baro_from_armed, gps_delay_ms, gps_min_rate_hz, no_mag, nki, steering })
+    Ok(Args { log: log.into(), out: out.into(), every, opts, noaid, no_baro_from_armed, gps_delay_ms, gps_min_rate_hz, no_mag, nki, steering, steer_eskf3 })
 }
 
 fn bits(v: &Valid) -> [u8; 7] {
     [v.tilt, v.heading, v.rates, v.velocity_ne, v.velocity_d, v.position_ne, v.position_d].map(u8::from)
 }
 
-fn write_csv(path: &std::path::Path, stream: &Stream, nav: &[NavState], bias: &[[f32; 6]], every: usize) -> std::io::Result<()> {
+fn write_csv(path: &std::path::Path, stream: &Stream, nav: &[NavState], bias: &[[f32; 6]], extra: &[[f32; 9]], every: usize) -> std::io::Result<()> {
     let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
-    writeln!(
-        w,
-        "t_us,step_t_us,armed,qw,qx,qy,qz,rx,ry,rz,vn,ve,vd,pn,pe,pd,v_tilt,v_heading,v_rates,v_vel_ne,v_vel_d,v_pos_ne,v_pos_d,s_tilt,s_heading,s_vel_ne,s_vel_d,s_pos_ne,s_pos_d,gbx,gby,gbz,abx,aby,abz"
-    )?;
+    let mut head = String::from(
+        "t_us,step_t_us,armed,qw,qx,qy,qz,rx,ry,rz,vn,ve,vd,pn,pe,pd,v_tilt,v_heading,v_rates,v_vel_ne,v_vel_d,v_pos_ne,v_pos_d,s_tilt,s_heading,s_vel_ne,s_vel_d,s_pos_ne,s_pos_d,gbx,gby,gbz,abx,aby,abz",
+    );
+    if !extra.is_empty() {
+        head.push_str(",trk_att_rad,trk_vel_ms,trk_pos_m,trk_td_s,skipped,pushed,corrected,ring_dropped,core_reinits");
+    }
+    writeln!(w, "{head}")?;
     for (k, (s, n)) in stream.steps.iter().zip(nav).enumerate() {
         if k % every != 0 {
             continue;
@@ -205,6 +238,11 @@ fn write_csv(path: &std::path::Path, stream: &Stream, nav: &[NavState], bias: &[
                 }
             }
             None => l.push_str(",,,,,,"),
+        }
+        if let Some(x) = extra.get(k) {
+            for v in x {
+                let _ = write!(l, ",{v}");
+            }
         }
         writeln!(w, "{l}")?;
     }
@@ -431,7 +469,7 @@ fn run() -> Result<(), String> {
         }
     };
     println!("steering estimator: {} ({why})", if steer { "eskf2" } else { "mahony-baro" });
-    let mut rows = table(&tuning, steer);
+    let mut rows = table(&tuning, steer, args.steer_eskf3);
     for r in &mut rows {
         r.nav.reserve(stream.steps.len());
     }
@@ -440,6 +478,9 @@ fn run() -> Result<(), String> {
         for r in &mut rows {
             r.est.set_armed(if r.armed_at == ArmedAt::Before { prev_armed } else { s.armed });
             r.nav.push(r.est.update(&s.sensors));
+            if let Some(x) = r.est.extras() {
+                r.extra.push(x);
+            }
             if args.nki && r.name == "eskf3" {
                 r.nki.extend(r.est.nki());
             }
@@ -450,9 +491,41 @@ fn run() -> Result<(), String> {
         prev_armed = s.armed;
     }
 
+    // The largest per-step change of the output's down-in-body vector beyond what the gyro accounts for:
+    // |d_k - d_(k-1)| - |omega_k| dt, at every step (not every 8th), for the rows named below.
+    for r in rows.iter().filter(|r| ["eskf3out", "eskf3", "eskf2"].contains(&r.name)) {
+        let down = |q: &[f32; 4]| [2.0 * (q[1] * q[3] - q[0] * q[2]), 2.0 * (q[2] * q[3] + q[0] * q[1]), 1.0 - 2.0 * (q[1] * q[1] + q[2] * q[2])];
+        let (mut all, mut armed) = ((f32::MIN, 0u64), (f32::MIN, 0u64));
+        for k in 1..r.nav.len() {
+            let (a, b) = (&r.nav[k - 1], &r.nav[k]);
+            if a.t_us == 0 || b.t_us == 0 || !b.valid.tilt || !a.valid.tilt {
+                continue;
+            }
+            let (da, db) = (down(&a.attitude), down(&b.attitude));
+            let dd = ((db[0] - da[0]).powi(2) + (db[1] - da[1]).powi(2) + (db[2] - da[2]).powi(2)).sqrt();
+            let g = stream.steps[k].sensors.imu1.reading.gyro_rads;
+            let dt = stream.steps[k].sensors.imu1.t_us.saturating_sub(stream.steps[k - 1].sensors.imu1.t_us).min(20_000) as f32 * 1e-6;
+            let ex = dd - (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt() * dt;
+            let t = stream.steps[k].sensors.imu1.t_us;
+            if ex > all.0 {
+                all = (ex, t);
+            }
+            if stream.steps[k].armed && ex > armed.0 {
+                armed = (ex, t);
+            }
+        }
+        println!(
+            "step excess {}: largest |d down| - |omega| dt over all steps {:.3e} rad at {:.3} s; while armed {:.3e} rad at {:.3} s",
+            r.name,
+            all.0,
+            all.1 as f64 * 1e-6,
+            armed.0,
+            armed.1 as f64 * 1e-6
+        );
+    }
     for r in &rows {
         let path = args.out.join(format!("{}.csv", r.name));
-        write_csv(&path, &stream, &r.nav, &r.bias, args.every).map_err(|e| format!("{}: {e}", path.display()))?;
+        write_csv(&path, &stream, &r.nav, &r.bias, &r.extra, args.every).map_err(|e| format!("{}: {e}", path.display()))?;
         println!("wrote {}", path.display());
     }
     if args.nki {
