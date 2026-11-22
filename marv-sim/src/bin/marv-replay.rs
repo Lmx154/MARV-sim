@@ -1,7 +1,7 @@
 //! `marv-replay`: replays a flown flight log (`.BIN`) through the flight code's own estimators and checks them against
 //! what the board logged. See `--help` and the README.
 
-use fw_flight::eskf::{Aiding, Eskf, EskfStats};
+use fw_flight::eskf::{Aiding, Eskf, EskfStats, Nki};
 use fw_flight::gnc::{Estimator, NavState, Valid};
 use fw_flight::mahony::Mahony;
 use fw_flight::mahony_baro::MahonyBaro;
@@ -13,7 +13,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 const HELP: &str = "\
-marv-replay <log.BIN> <outdir> [--every N] [--imu-period-us US] [--mag-expected UT,INC_DEG,STR_PCT,TOL_DEG] [--noaid-sigma M] [--no-baro-from-armed N] [--steering mahony-baro|eskf2]
+marv-replay <log.BIN> <outdir> [--every N] [--imu-period-us US] [--mag-expected UT,INC_DEG,STR_PCT,TOL_DEG] [--noaid-sigma M] [--no-baro-from-armed N] [--gps-delay-ms MS] [--gps-min-rate-hz HZ] [--no-mag] [--nki] [--steering mahony-baro|eskf2]
 
 Replays a flight log through the flight code's estimators (the real Rust code, Tuning::DEFAULT) and prints a
 validation table against the log's own NAV and NKF1 records. One CSV per estimator goes into <outdir>
@@ -45,6 +45,10 @@ trait Replayed: Estimator {
     fn biases(&self) -> Option<([f32; 3], [f32; 3])> {
         None
     }
+    /// This step's NKI records (`--nki`).
+    fn nki(&self) -> Vec<Nki> {
+        Vec::new()
+    }
 }
 impl Replayed for Mahony {}
 impl Replayed for MahonyBaro {}
@@ -55,6 +59,9 @@ impl Replayed for Eskf {
     fn biases(&self) -> Option<([f32; 3], [f32; 3])> {
         Some(Eskf::biases(self))
     }
+    fn nki(&self) -> Vec<Nki> {
+        self.events().copied().collect()
+    }
 }
 
 struct Row {
@@ -64,10 +71,12 @@ struct Row {
     nav: Vec<NavState>,
     /// Gyro and accelerometer bias after each step, for the estimators that have them.
     bias: Vec<[f32; 6]>,
+    /// NKI records of every step (`--nki`, eskf3 only).
+    nki: Vec<Nki>,
 }
 
 fn row(name: &'static str, armed_at: ArmedAt, est: Box<dyn Replayed>) -> Row {
-    Row { name, armed_at, est, nav: Vec::new(), bias: Vec::new() }
+    Row { name, armed_at, est, nav: Vec::new(), bias: Vec::new(), nki: Vec::new() }
 }
 
 /// The estimators to run: one line each.
@@ -91,6 +100,14 @@ struct Args {
     noaid: Option<f32>,
     /// `--no-baro-from-armed N`: from the N-th arming on, no barometer sample reaches any estimator.
     no_baro_from_armed: Option<usize>,
+    /// `--gps-delay-ms MS`: replaces `Tuning::nav_gps_delay_us` in every estimator.
+    gps_delay_ms: Option<f32>,
+    /// `--gps-min-rate-hz HZ`: replaces `Tuning::nav_gps_min_rate_hz` in every estimator.
+    gps_min_rate_hz: Option<f32>,
+    /// `--no-mag`: no compass sample reaches any estimator.
+    no_mag: bool,
+    /// `--nki`: also write `eskf3_nki.csv` (the filter's NKI records: t_us, src, ok, innovation, variance).
+    nki: bool,
     /// `--steering mahony-baro|eskf2`: which estimator steered on the board (default: read from the log).
     steering: Option<bool>,
 }
@@ -100,6 +117,7 @@ fn parse_args() -> Result<Args, String> {
     let mut every = 8usize;
     let mut noaid = None;
     let mut no_baro_from_armed = None;
+    let (mut gps_delay_ms, mut gps_min_rate_hz, mut no_mag, mut nki) = (None, None, false, false);
     let mut steering = None;
     let mut opts = StreamOpts { imu_period_us: None, expected_cli: None };
     let mut it = std::env::args().skip(1);
@@ -115,6 +133,14 @@ fn parse_args() -> Result<Args, String> {
             "--no-baro-from-armed" => {
                 no_baro_from_armed = Some(it.next().and_then(|v| v.parse::<usize>().ok()).filter(|&v| v > 0).ok_or("--no-baro-from-armed N (N >= 1)")?)
             }
+            "--gps-delay-ms" => {
+                gps_delay_ms = Some(it.next().and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite() && *v >= 0.0).ok_or("--gps-delay-ms MS")?)
+            }
+            "--gps-min-rate-hz" => {
+                gps_min_rate_hz = Some(it.next().and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite() && *v > 0.0).ok_or("--gps-min-rate-hz HZ")?)
+            }
+            "--no-mag" => no_mag = true,
+            "--nki" => nki = true,
             "--steering" => {
                 steering = Some(match it.next().as_deref() {
                     Some("eskf2") => true,
@@ -140,7 +166,7 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     let [log, out]: [String; 2] = pos.try_into().map_err(|_| "usage: marv-replay <log.BIN> <outdir> [options]; --help")?;
-    Ok(Args { log: log.into(), out: out.into(), every, opts, noaid, no_baro_from_armed, steering })
+    Ok(Args { log: log.into(), out: out.into(), every, opts, noaid, no_baro_from_armed, gps_delay_ms, gps_min_rate_hz, no_mag, nki, steering })
 }
 
 fn bits(v: &Valid) -> [u8; 7] {
@@ -346,6 +372,11 @@ fn run() -> Result<(), String> {
         );
     }
 
+    if args.no_mag {
+        let withheld: usize = stream.steps.iter_mut().map(|s| usize::from(s.sensors.mag.take().is_some())).sum();
+        println!("compass withheld: {withheld} samples not handed to any estimator");
+    }
+
     println!("log: {} bytes skipped between records: {}", args.log.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned()), log.bad_bytes);
     println!(
         "steps: {} real (logged IMU1 samples), {} filled (last logged sample repeated in disarmed gaps, period {} us); total {}",
@@ -378,6 +409,12 @@ fn run() -> Result<(), String> {
     if let Some(s) = args.noaid {
         tuning.nav_noaid_sigma_m = s;
     }
+    if let Some(ms) = args.gps_delay_ms {
+        tuning.nav_gps_delay_us = (ms * 1000.0).round() as u64;
+    }
+    if let Some(hz) = args.gps_min_rate_hz {
+        tuning.nav_gps_min_rate_hz = hz;
+    }
     gnss_diagnostics(&stream, &tuning);
 
     let (steer, why) = match args.steering {
@@ -403,6 +440,9 @@ fn run() -> Result<(), String> {
         for r in &mut rows {
             r.est.set_armed(if r.armed_at == ArmedAt::Before { prev_armed } else { s.armed });
             r.nav.push(r.est.update(&s.sensors));
+            if args.nki && r.name == "eskf3" {
+                r.nki.extend(r.est.nki());
+            }
             if let Some((g, a)) = r.est.biases() {
                 r.bias.push([g[0], g[1], g[2], a[0], a[1], a[2]]);
             }
@@ -414,6 +454,18 @@ fn run() -> Result<(), String> {
         let path = args.out.join(format!("{}.csv", r.name));
         write_csv(&path, &stream, &r.nav, &r.bias, args.every).map_err(|e| format!("{}: {e}", path.display()))?;
         println!("wrote {}", path.display());
+    }
+    if args.nki {
+        for r in rows.iter().filter(|r| r.name == "eskf3") {
+            let path = args.out.join("eskf3_nki.csv");
+            let mut w = std::io::BufWriter::new(std::fs::File::create(&path).map_err(|e| format!("{}: {e}", path.display()))?);
+            writeln!(w, "t_us,src,ok,inn,var").map_err(|e| e.to_string())?;
+            for n in &r.nki {
+                writeln!(w, "{},{},{},{},{}", n.t_us, n.src, n.ok, n.inn, n.var).map_err(|e| e.to_string())?;
+            }
+            w.flush().map_err(|e| e.to_string())?;
+            println!("wrote {}", path.display());
+        }
     }
     for r in &rows {
         if let Some(s) = r.est.eskf_stats() {
