@@ -26,6 +26,9 @@ pub struct Scenario {
     /// `[scenario] gnss_velocity`: whether the GNSS sample carries the velocity north, east and down
     /// (`GnssReading.vel_ned_mm_s`); true when not given.
     pub gnss_velocity: bool,
+    /// `[scenario] baro_motion`: whether the barometer has its motion-related height error (card `baro.motion_*`); true
+    /// when not given.
+    pub baro_motion: bool,
     pub position_ned_m: [f64; 3],
     pub velocity_ned_ms: [f64; 3],
     /// Body to world `[w, x, y, z]`, from the file's roll, pitch, yaw.
@@ -695,7 +698,7 @@ impl Scenario {
                 return Err(format!("{key}: unknown table"));
             }
         }
-        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz", "mag_expected", "gnss_velocity", "baro_lost", "gnss_lost", "gnss_hold", "mag_fault", "gnss_latency_s"])?;
+        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz", "mag_expected", "gnss_velocity", "baro_motion", "baro_lost", "gnss_lost", "gnss_hold", "mag_fault", "gnss_latency_s"])?;
         let ground = match root.get("initial").and_then(Value::as_table).and_then(|i| i.get("contact")) {
             None => false,
             Some(Value::String(c)) if c == "air" => false,
@@ -732,6 +735,7 @@ impl Scenario {
         };
         let mag_expected = flag("mag_expected")?;
         let gnss_velocity = flag("gnss_velocity")?;
+        let baro_motion = flag("baro_motion")?;
         let rotors = match get(i, "initial", "rotors")? {
             Value::String(r) if r == "hover" => Rotors::Hover,
             Value::String(r) if r == "stopped" => Rotors::Stopped,
@@ -843,6 +847,7 @@ impl Scenario {
             gnss_rate_hz,
             mag_expected,
             gnss_velocity,
+            baro_motion,
             position_ned_m,
             velocity_ned_ms,
             attitude,

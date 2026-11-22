@@ -124,6 +124,11 @@ pub struct BaroProfile {
     /// The drift random walk reaches `drift_sd` (1 sigma) after `drift_time`.
     pub drift_sd: Record<f64>,
     pub drift_time: Record<f64>,
+    /// The motion-related height error: its 1-sigma size per degree of tilt, m/deg, in the band `motion_band_lo_hz` to
+    /// `motion_band_hi_hz`.
+    pub motion_error_per_deg: Record<f64>,
+    pub motion_band_lo_hz: Record<f64>,
+    pub motion_band_hi_hz: Record<f64>,
 }
 
 /// The compass's model numbers (section 9b): body FRD, uT.
@@ -682,6 +687,9 @@ fn baro_profile(root: &Table, errs: &mut Vec<String>) -> Option<BaroProfile> {
         airborne_height_noise_sd: rec(root, "baro", "airborne_height_noise_sd", errs)?,
         drift_sd: rec(root, "baro", "drift_sd", errs)?,
         drift_time: rec(root, "baro", "drift_time", errs)?,
+        motion_error_per_deg: rec(root, "baro", "motion_error_per_deg", errs)?,
+        motion_band_lo_hz: rec(root, "baro", "motion_band_lo_hz", errs)?,
+        motion_band_hi_hz: rec(root, "baro", "motion_band_hi_hz", errs)?,
     })
 }
 
@@ -1131,6 +1139,9 @@ latency = { v = 0.0, unit = "s", tag = "derived", src = "fake" }
 airborne_height_noise_sd = { v = 1.0, unit = "m", tag = "derived", src = "fake" }
 drift_sd = { v = 1.0, unit = "m", tag = "derived", src = "fake" }
 drift_time = { v = 1.0, unit = "s", tag = "derived", src = "fake" }
+motion_error_per_deg = { v = 0.05, unit = "m/deg", tag = "derived", src = "fake" }
+motion_band_lo_hz = { v = 0.08, unit = "Hz", tag = "derived", src = "fake" }
+motion_band_hi_hz = { v = 0.5, unit = "Hz", tag = "derived", src = "fake" }
 
 [compass]
 field_noise_sd = { v = [1.0, 1.0, 1.0], unit = "uT", tag = "derived", src = "fake" }

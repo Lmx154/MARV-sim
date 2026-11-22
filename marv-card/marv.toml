@@ -103,6 +103,15 @@ airborne_height_noise_sd = { v = 0.11, unit = "m", tag = "measured", src = "log 
 # Drift: a random walk in height whose 1-sigma size after drift_time is drift_sd.
 drift_sd = { v = 0.77, unit = "m", tag = "measured", src = "log 186: 0.77 m over 14 min (PLAN:decision-nav-eskf-20261120.md section 9a, 9e; owner approved 2026-11-20)" }
 drift_time = { v = 840.0, unit = "s", tag = "measured", src = "the 14 min of drift_sd (same source)" }
+# Motion-related height error (owner approved 2026-11-22 "a motion-related baro error term sized to the measured 0.09-0.57 m, 0.08-0.5 Hz"):
+# band-limited noise whose 1-sigma = motion_error_per_deg x truth tilt. The mechanism (airflow at the port or propwash) is UNKNOWN.
+# Fit: 40 sub-windows of 25 s (logs 278 and 281, ESKF3 flight session 2026-11-22), the baro height error (pressure to height, 0.08-0.5 Hz)
+# against the GPS-velocity-integrated height; fit script a16.py (a15.py's windows), data MARV-V2-drivers/_plan/flights/20261122-eskf3-flight2/.
+# Window std = 0.0476 m/deg x mean tilt (through the origin; with an intercept 0.0085 + 0.0463 x tilt), residual 0.067 m rms, r 0.89 (tilt 1.6-14 deg, std 0.078-0.572 m).
+# Ground speed alone: 0.021 + 0.236 x speed, residual 0.082, r 0.83; given tilt it adds nothing (tilt and speed correlate 0.93), so the model has tilt only.
+motion_error_per_deg = { v = 0.0476, unit = "m/deg", tag = "measured", src = "fit through the origin over all 40 sub-windows of logs 278 and 281 (comment above): 0.0476 m/deg, residual 0.067 m rms, r 0.89" }
+motion_band_lo_hz = { v = 0.08, unit = "Hz", tag = "measured", src = "the analysis band of a15.py (alt-scripts), flight session 20261122-eskf3-flight2" }
+motion_band_hi_hz = { v = 0.5, unit = "Hz", tag = "measured", src = "the analysis band of a15.py (alt-scripts), flight session 20261122-eskf3-flight2" }
 
 # Compass, BMM350, the firmware default (100 Hz, averaging 2; FW:crates/fw-settings/src/mag.rs:37-38).
 [compass]
@@ -118,7 +127,7 @@ latency = { v = 0.005, unit = "s", tag = "placeholder", range = [0.0, 0.005], sr
 horizontal_sd = { v = 0.18, unit = "m", tag = "placeholder", range = "ask", src = "LC76G log 186 rest scatter, per horizontal axis" }
 vertical_sd = { v = 0.41, unit = "m", tag = "placeholder", range = "ask", src = "LC76G log 186 rest scatter" }
 velocity_sd = { v = 0.15, unit = "m/s", tag = "placeholder", range = "ask", src = "LC76G: the reconstruction's raw GPS velocity innovations, std 0.12-0.19 (recon_summary.txt:67)" }
-latency = { v = 0.12, unit = "s", tag = "placeholder", range = "ask", src = "ArduPilot AP_GPS_UBLOX::get_lag() for M10, unverified; owner approved 2026-11-22; re-measure by the replay delay scan on the first M10 log" }
+latency = { v = 0.07, unit = "s", tag = "measured", range = [0.059, 0.091], src = "SAM-M10Q PPS-measured edge-to-hand-off 59-91 ms, firmware nav_gps_delay_us 70 000, owner 2026-11-22" }
 slow_horizontal_sd = { v = 0.3, unit = "m", tag = "proposed", src = "decision-nav-eskf section 9c (offline filter settings); Gauss-Markov sigma per horizontal axis" }
 slow_vertical_sd = { v = 1.0, unit = "m", tag = "proposed", src = "decision-nav-eskf section 9c (offline filter settings); Gauss-Markov sigma, vertical" }
 slow_time_constant = { v = 60.0, unit = "s", tag = "proposed", src = "decision-nav-eskf section 9c (offline filter settings); Gauss-Markov time constant, all three axes" }

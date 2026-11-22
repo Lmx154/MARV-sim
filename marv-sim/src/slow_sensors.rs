@@ -29,6 +29,10 @@ pub const STREAM_GNSS: u64 = 5;
 /// The GNSS velocity's own noise stream: its draws never touch `STREAM_GNSS`, so the position, speed and course samples
 /// are the same with or without the velocity.
 pub const STREAM_GNSS_VEL: u64 = 6;
+/// The barometer's motion-related error term has its own stream: its draws never touch `STREAM_BARO`.
+pub const STREAM_BARO_MOTION: u64 = 7;
+/// Tones in the band-limited motion noise.
+const MOTION_TONES: usize = 32;
 /// The compass health test's tolerances in the firmware's units: `MAG_HLT_STR` (percent) and `MAG_HLT_INC` (degrees),
 /// their defaults in `fw_settings::mag::CAL_TABLE` (10 and 10). The sim does not depend on `fw-settings` (no new
 /// dependency edge), so the numbers are repeated here; the firmware's own test pins the defaults.
@@ -116,6 +120,29 @@ pub struct BaroModel {
     pub latency_ticks: usize,
     rng: Rng,
     seq: u32,
+    motion: Option<Motion>,
+}
+
+/// The motion-related height error: `per_deg` m x truth tilt (deg) x a unit-variance noise confined to the band, the sum
+/// of `MOTION_TONES` sinusoids of random frequency in the band and random phase, each of variance 1/MOTION_TONES.
+struct Motion {
+    per_deg: f64,
+    tones: Vec<(f64, f64)>,
+}
+
+impl Motion {
+    fn new(per_deg: f64, lo_hz: f64, hi_hz: f64, rng: &mut Rng) -> Motion {
+        let tones = (0..MOTION_TONES)
+            .map(|_| (std::f64::consts::TAU * (lo_hz + (hi_hz - lo_hz) * rng.uniform()), std::f64::consts::TAU * rng.uniform()))
+            .collect();
+        Motion { per_deg, tones }
+    }
+
+    fn error_m(&self, t_s: f64, past: &Snapshot) -> f64 {
+        let tilt_deg = rot_matrix(past.attitude)[2][2].clamp(-1.0, 1.0).acos().to_degrees();
+        let n: f64 = self.tones.iter().map(|&(w, p)| (w * t_s + p).cos()).sum::<f64>() * (2.0 / MOTION_TONES as f64).sqrt();
+        self.per_deg * tilt_deg * n
+    }
 }
 
 impl BaroModel {
@@ -138,7 +165,21 @@ impl BaroModel {
             latency_ticks: ticks(need(&b.latency, "baro.latency")?),
             rng,
             seq: 0,
+            motion: None,
         })
+    }
+
+    /// Adds the motion-related height error (card `baro.motion_*`), tones from `rng`; a model without it draws and
+    /// changes nothing.
+    pub fn with_motion(mut self, card: &Card, mut rng: Rng) -> Result<BaroModel, String> {
+        let b = &card.baro;
+        self.motion = Some(Motion::new(
+            need(&b.motion_error_per_deg, "baro.motion_error_per_deg")?,
+            need(&b.motion_band_lo_hz, "baro.motion_band_lo_hz")?,
+            need(&b.motion_band_hi_hz, "baro.motion_band_hi_hz")?,
+            &mut rng,
+        ));
+        Ok(self)
     }
 
     /// ISA troposphere at `height_m` above mean sea level: (pressure Pa, temperature K).
@@ -154,7 +195,11 @@ impl BaroModel {
         let airborne = self.airborne_sd_m * self.rng.gaussian();
         let white = self.noise_pa * self.rng.gaussian();
         let height = self.origin_alt_m - past.position_m[2];
-        let error_m = self.drift_m + if past.on_ground { 0.0 } else { airborne };
+        let motion = match &self.motion {
+            Some(m) if !past.on_ground => m.error_m(t_us as f64 * 1e-6, past),
+            _ => 0.0,
+        };
+        let error_m = self.drift_m + if past.on_ground { 0.0 } else { airborne } + motion;
         let (p, _) = self.isa(height + error_m);
         let (_, kelvin) = self.isa(height);
         let s = BaroSample {
@@ -471,7 +516,7 @@ pub struct SlowSensors {
 impl SlowSensors {
     /// The runner's: the card as it is, no compass calibration applied (`Calibration::NONE`), own streams of `seed`.
     pub fn new(card: &Card, env: &Env, gnss_rate_hz: u32, seed: u64) -> Result<SlowSensors, String> {
-        let baro = BaroModel::new(card, env, Rng::new(seed, STREAM_BARO))?;
+        let baro = BaroModel::new(card, env, Rng::new(seed, STREAM_BARO))?.with_motion(card, Rng::new(seed, STREAM_BARO_MOTION))?;
         let mag = MagModel::new(card, env, Calibration::NONE, Rng::new(seed, STREAM_MAG))?;
         let gnss = GnssModel::new(card, env, gnss_rate_hz, Rng::new(seed, STREAM_GNSS))?
             .with_velocity_rng(Rng::new(seed, STREAM_GNSS_VEL));
@@ -479,9 +524,12 @@ impl SlowSensors {
         Ok(SlowSensors { history: TruthDelay::new(depth), baro, mag, gnss, pending: (None, None, None) })
     }
 
-    /// The scenario's switches: whether the compass fills `MagSample.expected` and the receiver `vel_ned_mm_s` (both
-    /// default on; off leaves the field `None` and changes nothing else).
-    pub fn with_outputs(mut self, mag_expected: bool, gnss_velocity: bool) -> SlowSensors {
+    /// The scenario's switches: whether the compass fills `MagSample.expected`, the receiver `vel_ned_mm_s` and the
+    /// barometer has its motion-related error (all default on; off leaves the field `None` and changes nothing else).
+    pub fn with_outputs(mut self, mag_expected: bool, gnss_velocity: bool, baro_motion: bool) -> SlowSensors {
+        if !baro_motion {
+            self.baro.motion = None;
+        }
         if !mag_expected {
             self.mag.expected = None;
         }

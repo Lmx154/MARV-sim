@@ -11,7 +11,7 @@ use fw_flight::gate::MotorCommand;
 use fw_flight::gnc::{Allocator, Controller, Estimator, Sensors, Setpoint};
 use fw_flight::gnc::NavState;
 use fw_flight::mahony::Mahony;
-use fw_flight::eskf::{Aiding, Eskf, EskfStats, EskfZ, code};
+use fw_flight::eskf::{Aiding, Eskf, EskfStats, RING, code};
 use fw_flight::eskf_out::{EskfSteer, SteerMix};
 use fw_flight::mahony_baro::MahonyBaro;
 use fw_flight::pid::CascadedPid;
@@ -143,8 +143,8 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
             "--tuning-override" => {
                 let (name, v) = value.split_once('=').ok_or(format!("--tuning-override: {value} is not name=value"))?;
                 let v = v.parse::<f32>().ok().filter(|v| v.is_finite()).ok_or(format!("--tuning-override: {value}: not a number"))?;
-                if !["psc_posz_p", "psc_velz_p", "psc_velz_i"].contains(&name) {
-                    return Err(format!("--tuning-override: {name} is not psc_posz_p, psc_velz_p or psc_velz_i"));
+                if !["psc_posz_p", "psc_velz_p", "psc_velz_i", "nav_baro_sigma_m"].contains(&name) {
+                    return Err(format!("--tuning-override: {name} is not psc_posz_p, psc_velz_p, psc_velz_i or nav_baro_sigma_m"));
                 }
                 let _ = TUNING_OVERRIDE.set((name.to_string(), v));
             }
@@ -665,7 +665,7 @@ struct Info3 {
 
 /// `SteerMix` over leaked storage (the host is not memory-constrained), wrapped to fill `Info3`.
 struct Mix3 {
-    mix: SteerMix<'static>,
+    mix: SteerMix<'static, RING>,
     info: Rc<RefCell<Info3>>,
 }
 
@@ -1275,7 +1275,7 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
     let imu1 = ImuModel::new("imu1", &imu1_profile, env, Rng::new(seed, STREAM_IMU1))?;
     let imu2 = ImuModel::new("imu2", &card.imu2, env, Rng::new(seed, STREAM_IMU2))?;
     let slow = SlowSensors::new(card, env, scenario.gnss_rate_hz, seed)?
-        .with_outputs(scenario.mag_expected, scenario.gnss_velocity);
+        .with_outputs(scenario.mag_expected, scenario.gnss_velocity, scenario.baro_motion);
     let slow = match scenario.gnss_latency_s {
         Some(l) => slow.with_gnss_latency_s(l),
         None => slow,
@@ -1336,6 +1336,7 @@ every row's time is scenario time (the flight code's clock was scenario time + {
         match name.as_str() {
             "psc_posz_p" => tuning.psc_posz_p = *v,
             "psc_velz_p" => tuning.psc_velz_p = *v,
+            "nav_baro_sigma_m" => tuning.nav_baro_sigma_m = *v,
             _ => tuning.psc_velz_i = *v,
         }
     }
@@ -1362,7 +1363,7 @@ every row's time is scenario time (the flight code's clock was scenario time + {
             let f = env.magnetic_field_ned.v.ok_or("magnetic_field.ned is \"ask\"")?;
             t.nav_mag_declination_rad = f[1].atan2(f[0]) as f32;
             let core: &'static mut Eskf = Box::leak(Box::new(Eskf::new(&t).map_err(|e| format!("Eskf: {e:?}"))?));
-            let vert: &'static mut EskfZ = Box::leak(Box::new(EskfZ::with_aiding(&t, Aiding::ImuBaro).map_err(|e| format!("EskfZ: {e:?}"))?));
+            let vert: &'static mut Eskf = Box::leak(Box::new(Eskf::with_aiding(&t, Aiding::ImuBaro).map_err(|e| format!("Eskf (vertical): {e:?}"))?));
             let h = EskfSteer::new(core, &t).map_err(|e| format!("EskfSteer: {e:?}"))?;
             let est = Mix3 { mix: SteerMix::new(h, vert), info: info3.clone() };
             let flight = Flight::new(est, CascadedPid::new(&tuning), CardAllocator::new(), &tuning, handshake);

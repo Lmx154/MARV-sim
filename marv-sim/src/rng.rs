@@ -37,6 +37,11 @@ impl Rng {
         result
     }
 
+    /// Uniform on [0, 1).
+    pub fn uniform(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+    }
+
     /// Standard normal: mean 0, sd 1.
     pub fn gaussian(&mut self) -> f64 {
         if let Some(z) = self.spare.take() {

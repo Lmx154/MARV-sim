@@ -287,8 +287,8 @@ fn rates_latency_and_fresh_once() {
 fn latency_in_ticks_is_the_cards() {
     let (card, env) = (card(), env());
     let s = SlowSensors::new(&card, &env, 5, 1).unwrap();
-    // 11.5 ms, 5 ms and 0.43 s at 125 us.
-    assert_eq!((s.baro.latency_ticks, s.mag.latency_ticks, s.gnss.latency_ticks), (92, 40, 3440));
+    // 11.5 ms, 5 ms and 0.07 s at 125 us.
+    assert_eq!((s.baro.latency_ticks, s.mag.latency_ticks, s.gnss.latency_ticks), (92, 40, 560));
     // The truth delay returns exactly that many ticks ago.
     let mut d = TruthDelay::new(3440);
     for k in 0..5000 {
@@ -328,7 +328,7 @@ fn compass_expected_is_the_env_field_and_the_default_tolerances() {
     assert!(a.expected.is_some() && b.expected.is_none());
     assert_eq!((a.reading, a.t_us, a.seq), (b.reading, b.t_us, b.seq));
     // The runner's switches reach the samples.
-    let mut s = SlowSensors::new(&card, &env, 5, 1).unwrap().with_outputs(false, true);
+    let mut s = SlowSensors::new(&card, &env, 5, 1).unwrap().with_outputs(false, true, true);
     let mut seen = (0, 0);
     for t in (1..=2000u64).map(|k| k * TICK_US) {
         s.tick(&truth(t, [0.0; 3], [0.0; 3]));
@@ -442,4 +442,62 @@ fn the_velocity_draws_leave_the_old_fields_unchanged() {
         assert_eq!((old(&x), old(&y)), (old(&z), old(&z)), "sample {k}");
         assert_ne!(x.reading.vel_ned_mm_s, y.reading.vel_ned_mm_s);
     }
+}
+
+/// The motion-related height error (card `baro.motion_*`): the same model with and without it, same seed, differ by the
+/// term alone. Its rms is `motion_error_per_deg` x tilt (400 seeds x 600 s, within 5 %), it is zero on the ground and
+/// with the tilt zero, and its power is inside the band (the mean square of a 25 s window's band-limited part, taken
+/// by a Fourier sum over the band's bins, is all of it within 10 %).
+#[test]
+fn baro_motion_error_scales_with_tilt_and_stays_in_the_band() {
+    let (card, env) = (card(), env());
+    let per_deg = card.baro.motion_error_per_deg.v.unwrap();
+    let tilted = |deg: f64, on_ground: bool| {
+        let h = deg.to_radians() / 2.0;
+        Snapshot { position_m: [0.0, 0.0, -5.0], velocity_ms: [0.0; 3], attitude: [h.cos(), h.sin(), 0.0, 0.0], on_ground }
+    };
+    let height_of = |p: f32, b: &BaroModel| {
+        let (p_true, t) = b.isa(env.origin_altitude.v.unwrap() + 5.0);
+        -(f64::from(p) - p_true) / (p_true / (287.05287 * t) * env.gravity.v.unwrap())
+    };
+    let series = |seed: u64, deg: f64, on_ground: bool, n: u64| -> Vec<f64> {
+        let mut with = BaroModel::new(&card, &env, Rng::new(seed, STREAM_BARO)).unwrap().with_motion(&card, Rng::new(seed, STREAM_BARO_MOTION)).unwrap();
+        let mut without = BaroModel::new(&card, &env, Rng::new(seed, STREAM_BARO)).unwrap();
+        (0..n)
+            .map(|k| {
+                let (a, b) = (with.sample(k * BARO_PERIOD_US, &tilted(deg, on_ground)), without.sample(k * BARO_PERIOD_US, &tilted(deg, on_ground)));
+                height_of(a.reading.pressure_pa, &with) - height_of(b.reading.pressure_pa, &without)
+            })
+            .collect()
+    };
+    let n = 30_000; // 600 s at 50 Hz
+    let (mut ms10, mut ms5, mut inband) = (0.0, 0.0, 0.0);
+    for seed in 0..400 {
+        let x10 = series(seed, 10.0, false, n);
+        ms10 += x10.iter().map(|v| v * v).sum::<f64>() / n as f64;
+        ms5 += series(seed, 5.0, false, n).iter().map(|v| v * v).sum::<f64>() / n as f64;
+        if seed < 20 {
+            // Project the first 25 s onto sinusoids at the band's 0.04 Hz bins (0.08 to 0.5 Hz); the rest is outside.
+            let w = &x10[..1250];
+            let m = w.iter().sum::<f64>() / 1250.0;
+            let mut p = 0.0;
+            for kk in 2..=12 {
+                let f = kk as f64 * 0.04;
+                let (c, s) = w.iter().enumerate().fold((0.0, 0.0), |(c, s), (i, v)| {
+                    let a = std::f64::consts::TAU * f * i as f64 / 50.0;
+                    (c + (v - m) * a.cos(), s + (v - m) * a.sin())
+                });
+                p += 2.0 * (c * c + s * s) / (1250.0 * 1250.0);
+            }
+            let tot = w.iter().map(|v| (v - m) * (v - m)).sum::<f64>() / 1250.0;
+            inband += p / tot;
+        }
+    }
+    let rms10 = (ms10 / 400.0).sqrt();
+    let rms5 = (ms5 / 400.0).sqrt();
+    assert!((rms10 / (per_deg * 10.0) - 1.0).abs() < 0.05, "rms {rms10} want {}", per_deg * 10.0);
+    assert!((rms5 / rms10 - 0.5).abs() < 0.01, "5 deg / 10 deg {}", rms5 / rms10);
+    assert!(series(1, 10.0, true, 2000).iter().all(|v| v.abs() < 0.01));
+    assert!(series(1, 0.0, false, 2000).iter().all(|v| v.abs() < 0.01));
+    assert!(inband / 20.0 > 0.9, "in-band share {}", inband / 20.0);
 }

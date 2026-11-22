@@ -66,7 +66,7 @@ draws from its own noise stream (3, 4, 5; the IMUs keep 1 and 2), so every exist
 - Barometer: the ISA troposphere (env `[atmosphere]`, specific gas constant 287.05287 J/(kg K) of ISO 2533) at the origin
   altitude minus down, after adding two height errors: a drift random walk whose 1-sigma size after `baro.drift_time` (840
   s) is `baro.drift_sd` (0.77 m), and, while not on the ground, white noise `baro.airborne_height_noise_sd` (0.11 m); then
-  `baro.pressure_bias` and white noise `baro.pressure_noise_sd`. Temperature: ISA at that height. Not modelled: the
+  `baro.pressure_bias` and white noise `baro.pressure_noise_sd`. Also, while not on the ground, a motion-related height error (own stream 7): band-limited noise (`baro.motion_band_lo_hz` to `_hi_hz`, 0.08 to 0.5 Hz) of 1-sigma `baro.motion_error_per_deg` (0.0476 m/deg, fitted on logs 278 and 281) x the truth tilt; `[scenario] baro_motion = false` leaves it out. The mechanism is unknown. Temperature: ISA at that height. Not modelled: the
   ground-effect error (0.47 m near the ground under thrust) and the speed error (+0.6 m above 3 m/s).
 - Compass: the env field turned into body FRD by the true attitude, then the TRUE distortion `compass.soft_iron x field +
   compass.hard_iron_bias` plus white noise `compass.field_noise_sd`, then the CALIBRATION APPLIED, `correction x (raw -
