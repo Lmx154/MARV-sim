@@ -1,7 +1,7 @@
 //! `marv-replay`: replays a flown flight log (`.BIN`) through the flight code's own estimators and checks them against
 //! what the board logged. See `--help` and the README.
 
-use fw_flight::eskf::{Aiding, Eskf, EskfStats};
+use fw_flight::eskf::{Aiding, Eskf, EskfStats, Experiment};
 use fw_flight::gnc::{Estimator, NavState, Valid};
 use fw_flight::mahony::Mahony;
 use fw_flight::mahony_baro::MahonyBaro;
@@ -73,13 +73,27 @@ fn row(name: &'static str, armed_at: ArmedAt, est: Box<dyn Replayed>) -> Row {
 /// The estimators to run: one line each.
 /// `steer_eskf2`: eskf2 steers (the state after the previous step, as `Flight::step` sets it); else it is a shadow.
 fn table(t: &Tuning, steer_eskf2: bool) -> Vec<Row> {
+    let e2_at = if steer_eskf2 { ArmedAt::Before } else { ArmedAt::After };
     vec![
         row("Mahony", ArmedAt::Before, Box::new(Mahony::new(t))),
         row("MahonyBaro", ArmedAt::Before, Box::new(MahonyBaro::new(t))),
         row("eskf1", ArmedAt::After, Box::new(Eskf::with_aiding(t, Aiding::Imu).expect("Tuning::DEFAULT is accepted"))),
         row("eskf2", if steer_eskf2 { ArmedAt::Before } else { ArmedAt::After }, Box::new(Eskf::with_aiding(t, Aiding::ImuBaro).expect("Tuning::DEFAULT is accepted"))),
         row("eskf3", ArmedAt::After, Box::new(Eskf::new(t).expect("Tuning::DEFAULT is accepted"))),
+        // EXPERIMENT X1 (branch exp-eskf2-variants): zero-delay variants with experiment switches.
+        row("eskf2_v", e2_at, Box::new(eskf_x(t, Aiding::ImuBaro, Experiment { baro_vertical_only: true, ..Experiment::default() }))),
+        row("eskf2_z", e2_at, Box::new(eskf_x(t, Aiding::ImuBaro, Experiment { no_gyro_bias_z: true, ..Experiment::default() }))),
+        row("eskf2_vz", e2_at, Box::new(eskf_x(t, Aiding::ImuBaro, Experiment { baro_vertical_only: true, no_gyro_bias_z: true, ..Experiment::default() }))),
+        row("eskf2_vzh", e2_at, Box::new(eskf_x(t, Aiding::ImuBaro, Experiment { baro_vertical_only: true, no_gyro_bias_z: true, hold_no_gyro_bias: true }))),
+        row("eskf1_z", ArmedAt::After, Box::new(eskf_x(t, Aiding::Imu, Experiment { no_gyro_bias_z: true, ..Experiment::default() }))),
+        row("eskf1_zh", ArmedAt::After, Box::new(eskf_x(t, Aiding::Imu, Experiment { no_gyro_bias_z: true, hold_no_gyro_bias: true, ..Experiment::default() }))),
     ]
+}
+
+fn eskf_x(t: &Tuning, aiding: Aiding, exp: Experiment) -> Eskf {
+    let mut e = Eskf::with_aiding(t, aiding).expect("Tuning::DEFAULT is accepted");
+    e.set_experiment(exp);
+    e
 }
 
 struct Args {
