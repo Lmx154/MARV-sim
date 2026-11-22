@@ -62,6 +62,9 @@ pub struct Scenario {
     pub mag_fault: Option<MagFault>,
     /// `[scenario] gnss_latency_s` (G4): replaces the model's latency (the card's); `None` leaves it.
     pub gnss_latency_s: Option<f64>,
+    /// `[scenario] wind_steps = [[t_s, d_north, d_east, d_down], ...]` (Amendment P, P6 and P7): from scenario time `t_s`
+    /// on, the wind the plant sees is the mean wind plus this delta (m/s), summed over every step whose time has come.
+    pub wind_steps: Vec<(u64, [f64; 3])>,
     pub disturbances: Vec<Disturbance>,
     pub verdict: Verdict,
 }
@@ -159,6 +162,8 @@ pub struct Phase {
     pub yaw: f32,
     /// `xy = "hold"`: the pilot's drift correction on roll and pitch.
     pub xy_hold: bool,
+    /// The channel-6 switch from this phase on; `None` keeps the previous phase's (Low at the start).
+    pub mode: Option<Switch3>,
 }
 
 /// A body torque added to the plant's wrench over `[from_us, to_us)`.
@@ -236,6 +241,18 @@ pub enum Verdict {
         enter_bound_s: f64,
         baro_lost_from_s: f64,
         baro_lost_to_s: f64,
+    },
+    /// Amendment P, P7 (PS1): position hold, c1 to c7 over the hold windows. The thresholds are the file's; the tilt
+    /// limit and the ground threshold are the flight code's `Tuning::DEFAULT`.
+    PosHold {
+        windows: Vec<(f64, f64)>,
+        max_arm_to_position_s: f64,
+        max_hold_error_m: f64,
+        max_nav_gap_m: f64,
+        max_height_error_m: f64,
+        releases_s: Vec<f64>,
+        modes: Vec<u8>,
+        selected: Vec<u8>,
     },
     /// decision-sim-takeoff-landing, section 3. `airborne_m` is `[pilot] airborne_m`, the verdict's lift-off height.
     TakeoffLand {
@@ -436,7 +453,7 @@ const PILOT_KEYS: [&str; 14] = ["delay_s", "stick_rate_per_s", "ramp_stick_per_s
 
 fn rc_phases(rc: &Table) -> Result<Vec<Phase>, String> {
     let keys = ["name", "after_s", "event", "below_m", "timeout_s", "arm", "throttle", "height_m", "descend_ms", "xy",
-        "roll", "pitch", "yaw"];
+        "roll", "pitch", "yaw", "mode"];
     let mut phases: Vec<Phase> = Vec::new();
     for (i, row) in rows(rc, "rc", "phase", &keys)?.into_iter().enumerate() {
         let at = format!("rc.phase[{i}]");
@@ -492,8 +509,15 @@ fn rc_phases(rc: &Table) -> Result<Vec<Phase>, String> {
             None => None,
             Some(v) => Some(v.as_bool().ok_or(format!("{at}.arm: must be true or false"))?),
         };
+        let mode = match row.get("mode") {
+            None => None,
+            Some(Value::String(m)) if m == "low" => Some(Switch3::Low),
+            Some(Value::String(m)) if m == "middle" => Some(Switch3::Middle),
+            Some(Value::String(m)) if m == "high" => Some(Switch3::High),
+            Some(_) => return Err(format!("{at}.mode: must be \"low\", \"middle\" or \"high\"")),
+        };
         phases.push(Phase { name, end, arm, throttle, roll: stick("roll")?, pitch: stick("pitch")?, yaw: stick("yaw")?,
-            xy_hold });
+            xy_hold, mode });
     }
     if phases.is_empty() {
         return Err("rc.phase: empty".to_string());
@@ -518,13 +542,15 @@ fn verdict(root: &Table) -> Result<Verdict, String> {
             "resume_s", "rearm_s", "off_s", "off_bound_s"],
         "alt_hold" => &["windows", "max_height_error_m", "max_nav_gap_m", "climb_from_s", "climb_to_s",
             "descent_from_s", "descent_to_s", "enter_s", "enter_bound_s", "baro_lost_from_s", "baro_lost_to_s"],
+        "pos_hold" => &["windows", "max_arm_to_position_s", "max_hold_error_m", "max_nav_gap_m", "max_height_error_m",
+            "releases_s", "modes", "selected"],
         "takeoff_land" => &["arm_bound_s", "r_stance_m", "stance_floor_weight", "max_stance_ratio",
             "max_light_after_td_s", "max_peak_height_m", "max_peak_climb_ms", "liftoff_window_s",
             "max_liftoff_tilt_deg", "height_band_m", "max_tilt_deg",
             "max_speed_h_ms", "max_nav_gap_deg",
             "max_td_vz_ms", "max_td_vh_ms", "max_td_tilt_deg", "max_td_rate_dps", "idle_after_s", "stop_bound_s",
             "hover_trim_tolerance"],
-        _ => return Err("verdict.check: must be \"hover\", \"steps\", \"stick_sign\", \"rc_loss\", \"alt_hold\" or \"takeoff_land\""
+        _ => return Err("verdict.check: must be \"hover\", \"steps\", \"stick_sign\", \"rc_loss\", \"alt_hold\", \"pos_hold\" or \"takeoff_land\""
             .to_string()),
     };
     known_keys(v, "verdict", &[&["check"], keys].concat())?;
@@ -588,6 +614,16 @@ fn verdict(root: &Table) -> Result<Verdict, String> {
             baro_lost_from_s: f("baro_lost_from_s")?,
             baro_lost_to_s: f("baro_lost_to_s")?,
         },
+        "pos_hold" => Verdict::PosHold {
+            windows: pairs(v, "verdict", "windows")?,
+            max_arm_to_position_s: f("max_arm_to_position_s")?,
+            max_hold_error_m: f("max_hold_error_m")?,
+            max_nav_gap_m: f("max_nav_gap_m")?,
+            max_height_error_m: f("max_height_error_m")?,
+            releases_s: numbers(v, "verdict", "releases_s")?,
+            modes: codes(v, "verdict", "modes")?,
+            selected: codes(v, "verdict", "selected")?,
+        },
         "takeoff_land" => Verdict::TakeoffLand {
             airborne_m: root
                 .get("pilot")
@@ -644,6 +680,19 @@ fn pairs(t: &Table, table: &str, key: &str) -> Result<Vec<(f64, f64)>, String> {
     Ok(out)
 }
 
+/// A list of numbers.
+fn numbers(t: &Table, table: &str, key: &str) -> Result<Vec<f64>, String> {
+    let bad = || format!("{table}.{key}: must be a list of numbers");
+    get(t, table, key)?.as_array().ok_or_else(bad)?.iter().map(|v| number(v).ok_or_else(bad)).collect()
+}
+
+/// A list of mode codes, 1 Angle, 2 Altitude, 3 Position.
+fn codes(t: &Table, table: &str, key: &str) -> Result<Vec<u8>, String> {
+    let bad = || format!("{table}.{key}: must be a list of mode codes 1, 2 or 3");
+    let list = get(t, table, key)?.as_array().ok_or_else(bad)?;
+    list.iter().map(|v| v.as_integer().filter(|c| (1..=3).contains(c)).map(|c| c as u8).ok_or_else(bad)).collect()
+}
+
 fn number(v: &Value) -> Option<f64> {
     match v {
         Value::Float(x) if x.is_finite() => Some(*x),
@@ -698,7 +747,7 @@ impl Scenario {
                 return Err(format!("{key}: unknown table"));
             }
         }
-        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz", "mag_expected", "gnss_velocity", "baro_motion", "baro_lost", "gnss_lost", "gnss_hold", "mag_fault", "gnss_latency_s"])?;
+        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz", "mag_expected", "gnss_velocity", "baro_motion", "baro_lost", "gnss_lost", "gnss_hold", "mag_fault", "gnss_latency_s", "wind_steps"])?;
         let ground = match root.get("initial").and_then(Value::as_table).and_then(|i| i.get("contact")) {
             None => false,
             Some(Value::String(c)) if c == "air" => false,
@@ -782,6 +831,22 @@ impl Scenario {
         if gnss_latency_s.is_some_and(|l| !(0.0..=1.0).contains(&l)) {
             return Err("scenario.gnss_latency_s: must be in [0, 1] s".to_string());
         }
+        let wind_steps = match s.get("wind_steps") {
+            None => Vec::new(),
+            Some(v) => {
+                let bad = || "scenario.wind_steps: must be a list of [t_s, d_north, d_east, d_down] rows, t_s >= 0".to_string();
+                let mut out = Vec::new();
+                for row in v.as_array().ok_or_else(bad)? {
+                    let r: Vec<f64> = row.as_array().ok_or_else(bad)?.iter().map(|x| number(x).ok_or_else(bad)).collect::<Result<_, _>>()?;
+                    let [t, n, e, d] = r.as_slice() else { return Err(bad()) };
+                    if *t < 0.0 {
+                        return Err(bad());
+                    }
+                    out.push(((t * 1e6).round() as u64, [*n, *e, *d]));
+                }
+                out
+            }
+        };
         let mag_fault = match s.get("mag_fault") {
             None => None,
             Some(Value::Table(t)) => {
@@ -864,6 +929,7 @@ impl Scenario {
             gnss_hold,
             mag_fault,
             gnss_latency_s,
+            wind_steps,
             disturbances,
             verdict: verdict(&root)?,
         })

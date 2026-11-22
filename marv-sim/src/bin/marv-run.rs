@@ -922,8 +922,15 @@ fn sample(truth: &Truth, out: &StepOut, baro_drift_m: f64) -> Sample {
     });
     let target_d = match out.setpoint {
         Setpoint::Altitude { down_m, .. } => f64::from(down_m),
+        Setpoint::Position { position_m, .. } => f64::from(position_m[2]),
         _ => f64::NAN,
     };
+    let pos_target_ne = match out.setpoint {
+        Setpoint::Position { position_m, .. } => [f64::from(position_m[0]), f64::from(position_m[1])],
+        _ => [f64::NAN; 2],
+    };
+    let position_covered = out.nav.valid.covers(
+        &Setpoint::Position { position_m: [0.0; 3], velocity_ms: [0.0; 3], heading_rad: 0.0, heading_rate_rads: 0.0 }.requires());
     let mut logged: Vec<f32> = [out.nav.attitude.as_slice(), &out.nav.rates_rads, &out.nav.velocity_ms, &out.nav.position_m].concat();
     match out.setpoint {
         Setpoint::Attitude { attitude, heading_rate_rads, thrust_n } => {
@@ -933,6 +940,12 @@ fn sample(truth: &Truth, out: &StepOut, baro_drift_m: f64) -> Sample {
         Setpoint::Altitude { attitude, heading_rate_rads, down_m, velocity_d_ms } => {
             logged.extend(attitude);
             logged.extend([heading_rate_rads, down_m, velocity_d_ms]);
+        }
+        Setpoint::Position { position_m, velocity_ms, heading_rad, heading_rate_rads } => {
+            logged.extend(position_m);
+            logged.extend(velocity_ms);
+            logged.extend([heading_rad, heading_rate_rads]);
+            logged.extend(out.attitude_sp);
         }
         _ => {}
     }
@@ -964,6 +977,10 @@ fn sample(truth: &Truth, out: &StepOut, baro_drift_m: f64) -> Sample {
         thrust_n: out.demand.map_or(0.0, |d| f64::from(d.thrust_n)),
         finite: logged.iter().all(|x| x.is_finite()),
         baro_drift_m,
+        nav_ne: [f64::from(out.nav.position_m[0]), f64::from(out.nav.position_m[1])],
+        pos_target_ne,
+        position_covered,
+        attitude_sp: out.attitude_sp.map(f64::from),
     }
 }
 
@@ -1104,7 +1121,14 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
                 log.rc(now, [given.roll, given.pitch, given.throttle, given.yaw], given.arm);
             }
         }
-        let mut wrench = world.plant.step(levels, world.backend.truth(), world.wind_ned_ms, TICK_US);
+        // The scenario's wind steps (P7): the mean wind plus every step whose time has come.
+        let mut wind = world.wind_ned_ms;
+        for &(_, delta) in scenario.wind_steps.iter().filter(|(at_us, _)| now >= *at_us) {
+            for k in 0..3 {
+                wind[k] += delta[k];
+            }
+        }
+        let mut wrench = world.plant.step(levels, world.backend.truth(), wind, TICK_US);
         for d in scenario.disturbances.iter().filter(|d| now >= d.from_us && now < d.to_us) {
             for i in 0..3 {
                 wrench.torque_nm[i] += d.torque_nm[i];
@@ -1181,7 +1205,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
                 log.mode(&out);
                 mode_log.done(&out);
             }
-            if due.block && matches!(out.setpoint, Setpoint::Altitude { .. }) {
+            if due.block && matches!(out.setpoint, Setpoint::Altitude { .. } | Setpoint::Position { .. }) {
                 log.spn(&out);
             }
             if pilot.is_some() {

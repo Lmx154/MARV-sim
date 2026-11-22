@@ -114,6 +114,8 @@ pub struct Pilot {
     index: usize,
     start_us: u64,
     arm: bool,
+    /// The channel-6 switch (the phase table's `mode`, Low until a phase sets it).
+    mode: fw_core::rc::Switch3,
     /// Roll, pitch, throttle, yaw as last sent.
     sticks: [f64; 4],
     integrator: f64,
@@ -144,6 +146,7 @@ impl Pilot {
         let first = phases.first().ok_or("pilot: no phases")?;
         let timeline = vec![PhaseRun { name: first.name.clone(), start_us: 0, end: None }];
         let arm = first.arm.unwrap_or(false);
+        let mode = first.mode.unwrap_or(fw_core::rc::Switch3::Low);
         Ok(Pilot {
             delay_reports: (p.delay_s * 1e6 / REPORT_US as f64).round() as usize,
             p,
@@ -154,6 +157,7 @@ impl Pilot {
             index: 0,
             start_us: 0,
             arm,
+            mode,
             sticks: [0.0; 4],
             integrator: 0.0,
             xy_int: [0.0; 2],
@@ -201,6 +205,7 @@ impl Pilot {
         let Some(ph) = self.phases.get(i) else { return };
         self.timeline.push(PhaseRun { name: ph.name.clone(), start_us: now_us, end: None });
         self.arm = ph.arm.unwrap_or(self.arm);
+        self.mode = ph.mode.unwrap_or(self.mode);
         if was == Throttle::Ramp && matches!(ph.throttle, Throttle::Height(_) | Throttle::Descend(_)) {
             let now = stick_to_ratio(self.sticks[2], self.full);
             self.switch_ratio = Some(now);
@@ -295,7 +300,7 @@ impl Pilot {
         }
         let [roll, pitch, throttle, yaw] = self.sticks.map(|x| x as f32);
         Some(Report {
-            row: RcRow { t_us: now_us, roll, pitch, yaw, throttle, arm: self.arm, mode: fw_core::rc::Switch3::Low },
+            row: RcRow { t_us: now_us, roll, pitch, yaw, throttle, arm: self.arm, mode: self.mode },
             phase: self.index,
             mode,
             reference,

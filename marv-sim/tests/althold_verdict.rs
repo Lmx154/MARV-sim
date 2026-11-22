@@ -39,6 +39,10 @@ fn trace(drop_us: u64, back_us: u64, mode: impl Fn(u64, bool) -> u8) -> Trace {
                 thrust_n: 8.96,
                 finite: true,
                 baro_drift_m: 0.0,
+                nav_ne: [0.0; 2],
+                pos_target_ne: [f64::NAN; 2],
+                position_covered: false,
+                attitude_sp: [0.0; 4],
             }
         })
         .collect();

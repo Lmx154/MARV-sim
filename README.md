@@ -128,7 +128,7 @@ load. Times are seconds; each script row holds until the next.
     ...
     [rc]
     script = [ { t_s = 0.0, roll = 0.0, pitch = 0.0, yaw = 0.0, throttle = 0.0, arm = false }, ... ]
-                                  # a row may add mode = "low" (Angle, the default) | "middle" (Altitude) | "high" (Position, capped to Altitude): the channel-6 switch
+                                  # a row may add mode = "low" (Angle, the default) | "middle" (Altitude) | "high" (Position, as the flight code serves it): the channel-6 switch
     lost = [ { from_s = 3.0, to_s = 5.0 } ]          # optional: no report in [from, to)
     [[disturbance]]                                  # optional: body torque from from_s (to to_s if given)
     from_s = 5.0
@@ -235,7 +235,8 @@ deg, below_m, axis }` (`rotate`: the calibrated field vector turned about body `
 negative `from_s` reaches into the pre-roll; `below_m`: only while the truth height above the start is below it.
 `stuck`: the field of the first sample at or after `from_s` is repeated while the sample's time and sequence advance;
 a rotation about z keeps the field's strength and inclination, so it passes the compass health test, a rotation about x
-or y does not), `gnss_latency_s` (replaces the GNSS model's 0.43 s).
+or y does not), `gnss_latency_s` (replaces the GNSS model's 0.43 s), `wind_steps = [[t_s, d_north, d_east, d_down], ...]`
+(Amendment P: from `t_s` on the plant's wind is the mean wind plus the delta, m/s; every step whose time has come adds).
 
 `--preroll <seconds>` (decision-nav-eskf D5; air-start scenarios with a script only: a ground start or a pilot scenario has
 its own ground phase and is a usage error, as is a non-zero initial velocity or rate) steps the flight code (and the

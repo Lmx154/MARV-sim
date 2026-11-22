@@ -1,0 +1,41 @@
+# PS2 (P7, diagnostic): the compass turned 30 deg about body z from the start of the pre-roll. 15 deg must pass; the others measure
+# the heading tolerance (U-P3). Same script and verdict as pos-hold.toml. Run with `--estimator eskf3 --preroll 60` in scenarios/pos-hold-diag.toml.
+[scenario]
+name = "pos-hold-rot30"
+duration_s = 140.0
+mag_fault = { from_s = -60.0, kind = "rotate", deg = 30.0 }
+wind_steps = [[90.0, 2.0, 0.0, 0.0]]   # P7: +2 m/s at 90 s (north: P7 does not name the direction; the step is the same in every air cell)
+gnss_lost = [[105.0, 115.0]]       # P7: no GNSS sample reaches the flight code
+
+[initial]
+position_ned_m = [0.0, 0.0, 0.0]
+velocity_ned_ms = [0.0, 0.0, 0.0]
+roll_pitch_yaw_deg = [0.0, 0.0, 0.0]
+rates_rads = [0.0, 0.0, 0.0]
+rotors = "hover"
+
+[rc]
+script = [
+  { t_s = 0.0   , roll = 0, pitch = 0, yaw = 0, throttle = 0.0, arm = false },   # P7 PS1: preamble, switch low, throttle 0
+  { t_s = 0.02  , roll = 0, pitch = 0, yaw = 0, throttle = 0.0, arm = true },   # arm
+  { t_s = 0.04  , roll = 0, pitch = 0, yaw = 0, throttle = 0.5, arm = true, mode = "high" },   # throttle 0.5 and the switch high (Position) from here on, as alt-hold.toml selects Altitude
+  { t_s = 20.0  , roll = 0, pitch = 0.5, yaw = 0, throttle = 0.5, arm = true, mode = "high" },   # pitch 0.5 (forward): 2.2 m/s in the heading frame, north (yaw 0)
+  { t_s = 23.0  , roll = 0, pitch = 0, yaw = 0, throttle = 0.5, arm = true, mode = "high" },   # release
+  { t_s = 40.0  , roll = 1.0, pitch = 0, yaw = 0, throttle = 0.5, arm = true, mode = "high" },   # roll 1.0 (right): 5 m/s, east
+  { t_s = 42.5  , roll = 0, pitch = 0, yaw = 0, throttle = 0.5, arm = true, mode = "high" },   # release
+  { t_s = 60.0  , roll = 0, pitch = 0, yaw = 0.5, throttle = 0.5, arm = true, mode = "high" },   # yaw 0.5: a full turn in 4.8 s (360 deg)
+  { t_s = 64.8  , roll = 0, pitch = 0, yaw = 0, throttle = 0.5, arm = true, mode = "high" },   # yaw centred
+  { t_s = 75.0  , roll = 0, pitch = 0, yaw = 0, throttle = 0.8, arm = true, mode = "high" },   # throttle 0.8: climb for 1 s
+  { t_s = 76.0  , roll = 0, pitch = 0, yaw = 0, throttle = 0.5, arm = true, mode = "high" },   # throttle centred
+]
+
+[verdict]
+check = "pos_hold"
+windows = [[10.0, 20.0], [33.0, 40.0], [52.5, 60.0], [60.0, 75.0], [75.0, 90.0], [90.0, 105.0], [131.0, 140.0]]   # P7 hold windows
+max_arm_to_position_s = 1.0     # c1 (derived; the lead may adjust on the first run): Eff 2 -> 3 within this of arming
+max_hold_error_m = 1.5          # c4: |truth N, E - truth N, E at the capture| (9g mark, not yet approved)
+max_nav_gap_m = 1.0             # c5: |nav N, E - truth N, E| with the constant origin offset (the mean over all the hold windows) removed (9g mark, not yet approved)
+max_height_error_m = 0.5        # c6: |truth D - target D| REPORTED, NOT JUDGED (Addendum P-1)
+releases_s = [23.0, 42.5]         # the stick releases whose brake is reported
+modes = [1, 2, 3, 2, 3]                 # c7: the effective mode's changes (1 Angle, 2 Altitude, 3 Position): into Altitude, into Position, then out and back with the GNSS loss (or the receiver hold); no other change
+selected = [1, 3]                # c7: the switch's changes: Angle, then Position at 0.04 s

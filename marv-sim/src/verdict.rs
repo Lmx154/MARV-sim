@@ -46,6 +46,15 @@ pub struct Sample {
     pub finite: bool,
     /// The barometer model's drift state at this step, m.
     pub baro_drift_m: f64,
+    /// The estimate's north and east position, m (its own origin).
+    pub nav_ne: [f64; 2],
+    /// `Setpoint::Position.position_m` north and east (the held target, or this step's position while unlocked); NaN
+    /// when the setpoint is not Position.
+    pub pos_target_ne: [f64; 2],
+    /// `nav.valid` covers what `Setpoint::Position` needs (`Setpoint::requires`).
+    pub position_covered: bool,
+    /// The attitude setpoint the controller made from a Position setpoint (`StepOut.attitude_sp`); zeros otherwise.
+    pub attitude_sp: [f64; 4],
 }
 
 /// A value read from one flight step (degrees or degrees per second).
@@ -230,6 +239,7 @@ pub fn judge(verdict: &Verdict, trace: &Trace) -> (Vec<Check>, Vec<String>) {
             (checks, Vec::new())
         }
         Verdict::AltHold { .. } => alt_hold(verdict, trace),
+        Verdict::PosHold { .. } => pos_hold(verdict, trace),
         Verdict::TakeoffLand { .. } => takeoff_land(verdict, trace),
     }
 }
@@ -560,7 +570,277 @@ fn takeoff_land(verdict: &Verdict, trace: &Trace) -> (Vec<Check>, Vec<String>) {
     notes.push(format!("INFO stance_in_settle {in_settle:.4} (largest stance ratio skipped while the ground settle runs)"));
     notes.push(format!("INFO lift-off {:.4} s, touchdown {:.4} s, backend touchdowns {}",
         t_lo.map_or(f64::NAN, secs), t_td.map_or(f64::NAN, secs), trace.touchdowns.len()));
+    // Amendment P, P7 PS5: with the switch ever at Position, c2 (Position in effect only when covered and not grounded)
+    // is judged too. No such check exists in a run that never selects Position.
+    if trace.steps.iter().any(|s| s.selected == MODE_POSITION) {
+        let expected = pos_expected(trace);
+        let bad = trace.steps.iter().zip(&expected).filter(|(s, e)| s.mode == MODE_POSITION && !**e).count();
+        checks.push(count_check("pos_c2_position_uncovered_or_grounded_steps", Some(bad)));
+        let (_, longest_low) = airborne_latch(trace);
+        notes.push(format!("INFO pos longest in-air low-collective interval {longest_low:.4} s"));
+        // Touchdown to the effective mode leaving Position, and the worst stance ratio over that interval.
+        if let Some(td) = t_td {
+            let first_pos_after = trace.steps.iter().find(|s| s.t_us >= td && s.mode != MODE_POSITION);
+            match first_pos_after {
+                Some(e) => {
+                    let w = trace.steps.iter().filter(|s| s.t_us >= td && s.t_us <= e.t_us).filter(loaded).map(ratio);
+                    notes.push(format!("INFO pos touchdown {:.4} s to Eff {} at {:.4} s: {:.4} s; stance ratio over it {:.4}",
+                        secs(td), e.mode, secs(e.t_us), secs(e.t_us) - secs(td), largest_or_zero(w)));
+                }
+                None => notes.push(format!("INFO pos touchdown {:.4} s: Position still in effect at the end", secs(td))),
+            }
+        }
+    }
     (checks, notes)
+}
+
+const MODE_POSITION: u8 = 3;
+
+/// The airborne latch as the firmware keeps it (step.rs, Amendment P, P3 replaced), recomputed from the logged armed state
+/// and demanded thrust: after each step, low = thrust below `ground_thrust_g x m g` (a refused demand logs 0 N); disarmed
+/// clears it; not low sets it; low adds the step's dt (capped at `DT_MAX_US`) to `low_us`, and `low_us >= land_detect_us`
+/// clears it. Returns, per step, the latch as step i sees it (the value left by step i-1; false at the first step), and the
+/// longest `low_us` reached while the latch was still set (the in-air low-collective interval).
+fn airborne_latch(trace: &Trace) -> (Vec<bool>, f64) {
+    let tuning = fw_flight::tuning::Tuning::DEFAULT;
+    let threshold = tuning.ground_thrust_g as f64 * trace.weight_n;
+    let st = &trace.steps;
+    let (mut airborne, mut low_us, mut longest) = (false, 0u64, 0u64);
+    let mut seen = Vec::with_capacity(st.len());
+    for i in 0..st.len() {
+        seen.push(airborne);
+        let dt = if i == 0 { 0 } else { (st[i].t_us - st[i - 1].t_us).min(fw_flight::mahony::DT_MAX_US) };
+        if !st[i].armed {
+            airborne = false;
+            low_us = 0;
+        } else if st[i].thrust_n >= threshold {
+            airborne = true;
+            low_us = 0;
+        } else {
+            low_us += dt;
+            if airborne {
+                longest = longest.max(low_us);
+            }
+            if low_us >= tuning.land_detect_us {
+                airborne = false;
+            }
+        }
+    }
+    (seen, longest as f64 * 1e-6)
+}
+
+/// Per flight step: whether the firmware's rule (P3 replaced) gives Position: selected, `nav.valid` covers
+/// `Setpoint::Position`, and the airborne latch is set.
+fn pos_expected(trace: &Trace) -> Vec<bool> {
+    let (airborne, _) = airborne_latch(trace);
+    trace.steps.iter().zip(airborne).map(|(s, a)| s.selected == MODE_POSITION && s.position_covered && a).collect()
+}
+
+/// The steps where the position target is locked (Position in effect two steps running with the same target N, E:
+/// unlocked, the target is this step's position and changes every step), and for each its capture point, the truth N, E
+/// at the step before the lock run began (the step that set the target).
+fn pos_locks(trace: &Trace) -> Vec<Option<[f64; 2]>> {
+    let st = &trace.steps;
+    let mut out: Vec<Option<[f64; 2]>> = vec![None; st.len()];
+    for i in 1..st.len() {
+        let locked = st[i].mode == MODE_POSITION && st[i - 1].mode == MODE_POSITION
+            && st[i].pos_target_ne == st[i - 1].pos_target_ne;
+        if locked {
+            out[i] = out[i - 1].or(Some([st[i - 1].truth_pos[0], st[i - 1].truth_pos[1]]));
+        }
+    }
+    out
+}
+
+fn speed_h(s: &Sample) -> f64 {
+    s.truth_vel[0].hypot(s.truth_vel[1])
+}
+
+fn compress(codes: impl Iterator<Item = u8>) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    for c in codes {
+        if out.last() != Some(&c) {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn codes_text(c: &[u8]) -> String {
+    c.iter().map(u8::to_string).collect::<Vec<_>>().join(">")
+}
+
+/// Amendment P, P7 (PS1) with Addendum P-1: over the hold windows c1 (Eff 2 -> 3 within `max_arm_to_position_s` of
+/// arming), c2 (Eff 3 only when covered and not grounded), c3 (Eff follows the flags within one step), c4 (truth N, E
+/// within `max_hold_error_m` of the truth at the capture, and locked throughout), c5 (estimate against truth N, E with the
+/// constant origin offset, the mean gap over all the hold windows, removed), c7 (tilt setpoint within the flight
+/// code's angle limit, every number finite, armed from the first arming on, exactly the scripted mode changes). c6 (truth
+/// D against the target D) is reported, not judged (P-1). The brake figures after each release and the wind offset in each
+/// window's last 5 s are reported.
+fn pos_hold(verdict: &Verdict, trace: &Trace) -> (Vec<Check>, Vec<String>) {
+    let Verdict::PosHold { ref windows, max_arm_to_position_s, max_hold_error_m, max_nav_gap_m, max_height_error_m,
+        ref releases_s, ref modes, ref selected } = *verdict else { unreachable!() };
+    let st = &trace.steps;
+    let tuning = fw_flight::tuning::Tuning::DEFAULT;
+    let expected = pos_expected(trace);
+    let locks = pos_locks(trace);
+    let in_windows = |s: &Sample| windows.iter().any(|&(a, b)| s.t_us >= us(a) && s.t_us < us(b));
+    let judged: Vec<usize> = (0..st.len()).filter(|&i| in_windows(&st[i])).collect();
+
+    // c1: the first Position step that follows an Altitude step, from the first armed step.
+    let t_arm = st.iter().find(|s| s.armed).map(|s| s.t_us);
+    let t_pos = (1..st.len()).find(|&i| st[i].mode == MODE_POSITION && st[i - 1].mode == 2).map(|i| st[i].t_us);
+    let c1 = match (t_arm, t_pos) {
+        (Some(a), Some(p)) => secs(p) - secs(a),
+        _ => f64::NAN,
+    };
+    let (_, longest_low) = airborne_latch(trace);
+    // c2 and c3.
+    let c2 = st.iter().zip(&expected).filter(|(s, e)| s.mode == MODE_POSITION && !**e).count();
+    let c3 = (1..st.len())
+        .filter(|&i| (st[i].mode == MODE_POSITION) != expected[i] && expected[i] == expected[i - 1])
+        .count();
+    // c4: over the judged steps where the target is locked, the truth within the bound of the truth at the capture. A step
+    // without a lock (Position not in effect) is not measured here (c2, c3 and c7 judge the mode); a window with no locked
+    // step at all is NaN and fails.
+    let held_err = |i: usize| locks[i].map(|c| (st[i].truth_pos[0] - c[0]).hypot(st[i].truth_pos[1] - c[1]));
+    let c4 = windows
+        .iter()
+        .map(|&(a, b)| {
+            let errs: Vec<f64> = (0..st.len()).filter(|&i| st[i].t_us >= us(a) && st[i].t_us < us(b)).filter_map(held_err).collect();
+            if errs.is_empty() { f64::NAN } else { largest(errs.into_iter()) }
+        })
+        .fold(0.0, |acc: f64, w| if acc.is_nan() || w.is_nan() { f64::NAN } else { acc.max(w) });
+    // c5: the estimate's N, E against the truth's, the constant origin offset removed: the mean gap over all the judged steps.
+    let gap = |s: &Sample| [s.nav_ne[0] - s.truth_pos[0], s.nav_ne[1] - s.truth_pos[1]];
+    let mean_gap = |idx: &mut dyn Iterator<Item = [f64; 2]>| {
+        let (sum, n) = idx.fold(([0.0, 0.0], 0.0), |(s, n), g| ([s[0] + g[0], s[1] + g[1]], n + 1.0));
+        [sum[0] / n, sum[1] / n]
+    };
+    let offset = mean_gap(&mut judged.iter().map(|&i| gap(&st[i])));
+    let c5 = largest(judged.iter().map(|&i| {
+        let g = gap(&st[i]);
+        (g[0] - offset[0]).hypot(g[1] - offset[1])
+    }));
+    // c7.
+    let angle_max_deg = f64::from(tuning.angle_max_rad).to_degrees();
+    let tilt_sp = largest(st.iter().filter(|s| s.mode == MODE_POSITION).map(|s| tilt_deg(s.attitude_sp)));
+    let disarmed_after = t_arm.map_or(usize::MAX, |a| st.iter().filter(|s| s.t_us >= a && !s.armed).count());
+    let non_finite = st.iter().filter(|s| !s.finite).count();
+    let seq_mode = compress(st.iter().map(|s| s.mode));
+    let seq_selected = compress(st.iter().map(|s| s.selected));
+    let seq_ok = seq_mode == *modes && seq_selected == *selected;
+
+    let checks = vec![
+        at_most("pos_c1_arm_to_position_s", c1, max_arm_to_position_s),
+        count_check("pos_c2_position_uncovered_or_grounded_steps", Some(c2)),
+        count_check("pos_c3_mode_not_following_flags_steps", Some(c3)),
+        at_most("pos_c4_hold_error_m", c4, max_hold_error_m),
+        at_most("pos_c5_nav_gap_m", c5, max_nav_gap_m),
+        at_most("pos_c7_tilt_setpoint_deg", tilt_sp, angle_max_deg + SETPOINT_TOLERANCE),
+        count_check("pos_c7_non_finite_steps", Some(non_finite)),
+        count_check("pos_c7_disarmed_steps", Some(disarmed_after).filter(|&n| n != usize::MAX)),
+        Check {
+            name: "pos_c7_mode_changes".into(),
+            measured: format!("effective {} selected {}", codes_text(&seq_mode), codes_text(&seq_selected)),
+            limit: format!("=effective {} selected {}", codes_text(modes), codes_text(selected)),
+            pass: seq_ok,
+        },
+    ];
+
+    // Reported, not judged.
+    let mut notes = Vec::new();
+    notes.push(format!("INFO pos longest in-air low-collective interval {longest_low:.4} s (margin to land_detect_us {:.4} s: {:.4} s)",
+        tuning.land_detect_us as f64 * 1e-6, tuning.land_detect_us as f64 * 1e-6 - longest_low));
+    notes.push(format!("INFO pos c1 arm {:.4} s, first Position after Altitude {:.4} s", t_arm.map_or(f64::NAN, secs),
+        t_pos.map_or(f64::NAN, secs)));
+    notes.push(format!("INFO pos c5 origin offset removed (mean nav - truth N, E over all the hold windows): [{:.4}, {:.4}] m", offset[0], offset[1]));
+    let c6 = |a: f64, b: f64| largest(window(trace, a, b).map(|s| (s.truth_pos[2] - s.target_d).abs()));
+    let by_window: Vec<String> = windows
+        .iter()
+        .map(|&(a, b)| {
+            let idx: Vec<usize> = (0..st.len()).filter(|&i| st[i].t_us >= us(a) && st[i].t_us < us(b)).collect();
+            let h = largest(idx.iter().filter_map(|&i| held_err(i)));
+            let unlocked = idx.iter().filter(|&&i| locks[i].is_none()).count();
+            format!("[{a}, {b}] {h:.4} ({unlocked} of {} steps not locked)", idx.len())
+        })
+        .collect();
+    notes.push(format!("INFO pos c4 hold error by window: {} m", by_window.join(", ")));
+    let c5_by: Vec<String> = windows
+        .iter()
+        .map(|&(a, b)| {
+            let m = largest(window(trace, a, b).map(|s| {
+                let g = gap(s);
+                (g[0] - offset[0]).hypot(g[1] - offset[1])
+            }));
+            format!("[{a}, {b}] {m:.4}")
+        })
+        .collect();
+    notes.push(format!("INFO pos c5 nav gap by window: {} m", c5_by.join(", ")));
+    if let Some(&(a, b)) = windows.first() {
+        let first = mean_gap(&mut window(trace, a, b).map(gap));
+        notes.push(format!("INFO pos c5 with the offset taken as the mean over the first hold window [{a}, {b}] instead: offset [{:.4}, {:.4}] m, largest gap {:.4} m (not judged)",
+            first[0], first[1], largest(judged.iter().map(|&i| { let g = gap(&st[i]); (g[0] - first[0]).hypot(g[1] - first[1]) }))));
+    }
+    let changes: Vec<String> = (1..st.len())
+        .filter(|&i| st[i].mode != st[i - 1].mode)
+        .map(|i| format!("{:.4} s {}>{} (previous collective {:.3} m g, ground threshold {:.3} m g, covered {})", secs(st[i].t_us),
+            st[i - 1].mode, st[i].mode, st[i - 1].thrust_n / trace.weight_n, tuning.ground_thrust_g, st[i].position_covered))
+        .collect();
+    notes.push(format!("INFO pos effective mode changes: {}", changes.join(", ")));
+    let c6_by: Vec<String> = windows.iter().map(|&(a, b)| format!("[{a}, {b}] {:.4}", c6(a, b))).collect();
+    notes.push(format!("INFO pos c6 |truth D - target D| by window: {} m; mark {max_height_error_m} m, REPORTED NOT JUDGED (Addendum P-1)",
+        c6_by.join(", ")));
+    notes.push(format!("INFO pos c6 over all windows {:.4} m", largest(judged.iter().map(|&i| (st[i].truth_pos[2] - st[i].target_d).abs()))));
+    // The wind offset in each window's last 5 s: the mean of truth N, E minus the capture's, over locked steps.
+    for &(a, b) in windows {
+        let last: Vec<[f64; 2]> = (0..st.len())
+            .filter(|&i| st[i].t_us >= us(b - 5.0) && st[i].t_us < us(b))
+            .filter_map(|i| locks[i].map(|c| [st[i].truth_pos[0] - c[0], st[i].truth_pos[1] - c[1]]))
+            .collect();
+        let m = last.len() as f64;
+        let (mn, me) = (last.iter().map(|d| d[0]).sum::<f64>() / m, last.iter().map(|d| d[1]).sum::<f64>() / m);
+        notes.push(format!("INFO pos wind offset [{a}, {b}] last 5 s: mean truth - capture N {mn:.4} E {me:.4} |.| {:.4} m ({} locked steps)",
+            mn.hypot(me), last.len()));
+    }
+    // The brake after each release: the first lock after it, the distance travelled, the overshoot past the capture along
+    // the release velocity, the peak tilt, the height dip.
+    for &r in releases_s {
+        let Some(i0) = st.iter().position(|s| s.t_us >= us(r)) else { continue };
+        let peak_speed = largest_or_zero(st.iter().filter(|s| s.t_us >= us(r - 5.0) && s.t_us < us(r + 2.0)).map(speed_h));
+        let v0 = [st[i0].truth_vel[0], st[i0].truth_vel[1]];
+        let vn = v0[0].hypot(v0[1]).max(1e-9);
+        let u = [v0[0] / vn, v0[1] / vn];
+        let p0 = [st[i0].truth_pos[0], st[i0].truth_pos[1]];
+        let ilock = (i0..st.len()).find(|&i| locks[i].is_some());
+        let stop = (i0..st.len()).find(|&i| speed_h(&st[i]) < f64::from(tuning.pilot_hold_speed_ms));
+        let end = us(r + 10.0);
+        let tilt_truth = st[i0..].iter().take_while(|s| s.t_us < end).map(|s| tilt_deg(s.truth_q)).fold(0.0, f64::max);
+        let tilt_cmd = st[i0..].iter().take_while(|s| s.t_us < end).filter(|s| s.mode == MODE_POSITION)
+            .map(|s| tilt_deg(s.attitude_sp)).fold(0.0, f64::max);
+        let dip = st[i0..].iter().take_while(|s| s.t_us < end).map(|s| s.truth_pos[2] - s.target_d).fold(f64::NEG_INFINITY, f64::max);
+        let rise = st[i0..].iter().take_while(|s| s.t_us < end).map(|s| s.truth_pos[2] - s.target_d).fold(f64::INFINITY, f64::min);
+        let line = match ilock {
+            Some(il) => {
+                let cap = locks[il].unwrap();
+                let over = st[il..].iter().take_while(|s| s.t_us < us(secs(st[il].t_us) + 10.0))
+                    .map(|s| (s.truth_pos[0] - cap[0]) * u[0] + (s.truth_pos[1] - cap[1]) * u[1]).fold(0.0, f64::max);
+                format!("lock {:.3} s after release, capture {:.3} m from the release point, overshoot past the capture {:.3} m (10 s)",
+                    secs(st[il].t_us) - r, (cap[0] - p0[0]).hypot(cap[1] - p0[1]), over)
+            }
+            None => "no lock".to_string(),
+        };
+        notes.push(format!("INFO pos brake release {r} s: speed reached {peak_speed:.3} m/s, speed at release {:.3} m/s; {line}; coasting to speed < {:.1} m/s {:.3} s, {:.3} m; peak tilt truth {tilt_truth:.2} deg setpoint {tilt_cmd:.2} deg, height dip {dip:.3} m below the target (rise {:.3} m) within 10 s",
+            vn, tuning.pilot_hold_speed_ms,
+            stop.map_or(f64::NAN, |i| secs(st[i].t_us) - r),
+            stop.map_or(f64::NAN, |i| (st[i].truth_pos[0] - p0[0]).hypot(st[i].truth_pos[1] - p0[1])), -rise));
+    }
+    (checks, notes)
+}
+
+/// The largest value, 0 when there is none.
+fn largest_or_zero(values: impl Iterator<Item = f64>) -> f64 {
+    values.fold(0.0, f64::max)
 }
 
 /// Hover: the largest change of truth heading from its value at the first step at or after `from_s`, to the end.

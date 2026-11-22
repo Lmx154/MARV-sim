@@ -1,0 +1,15 @@
+# Position hold diagnostics, P7: PS2 compass 15/30/45/60 deg (15 must pass), PS3 gnss_hold 10 s while holding, PS4 GNSS latency 0.059 and
+# 0.091 s (both must pass). Nominal point, the three air cells of pos-hold-spread.toml, seeds 1-3. Run with `--estimator eskf3 --preroll 60`.
+scenarios = ["fault/pos-hold-rot15.toml", "fault/pos-hold-rot30.toml", "fault/pos-hold-rot45.toml", "fault/pos-hold-rot60.toml",
+  "fault/pos-hold-gnsshold10.toml", "fault/pos-hold-lat059.toml", "fault/pos-hold-lat091.toml"]
+points = [
+  { kf_scale = 1.0, inertia_scale = 1.0 },                    # P0: nominal card
+]
+# Air (P7; Addendum P-1: no Position cell with zero drag). Linear rotor drag 0.197 N/(m/s) (the amendment's number; the drag
+# measured on log 281, 0.19 N/(m/s), band 0.15..0.23, lies inside it). Wind is the plant's constant wind, NED m/s, the direction the air moves toward.
+air = [
+  { drag = 0.197 },                                    # 1: calm
+  { drag = 0.197, wind_ned = [5.0, 0.0, 0.0] },        # 2: 5 m/s toward the north
+  { drag = 0.197, wind_ned = [0.0, 5.0, 0.0] },        # 3: 5 m/s toward the east
+]
+seeds = [1, 2, 3]

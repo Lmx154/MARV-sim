@@ -1,0 +1,11 @@
+# Position hold, P7 PS5: ground start with the switch high (takeoff-land with the pilot's switch at Position): c2 (Position never in effect
+# uncovered or grounded), stance_margin, liftoff_tilt and the rest of takeoff-land's checks. Nominal point, the calm air cell (drag 0.197), seeds 1-3.
+# Run with `--estimator eskf3` and no --preroll (a ground start has its own ground phase).
+scenarios = ["fault/takeoff-land-pos.toml"]
+points = [
+  { kf_scale = 1.0, inertia_scale = 1.0 },                    # P0: nominal card
+]
+air = [
+  { drag = 0.197 },                                    # 1: calm
+]
+seeds = [1, 2, 3]
