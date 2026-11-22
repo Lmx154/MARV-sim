@@ -11,7 +11,8 @@ use fw_flight::gate::MotorCommand;
 use fw_flight::gnc::{Allocator, Controller, Estimator, Sensors, Setpoint};
 use fw_flight::gnc::NavState;
 use fw_flight::mahony::Mahony;
-use fw_flight::eskf::{Aiding, Eskf};
+use fw_flight::eskf::{Aiding, Eskf, EskfStats, EskfZ, code};
+use fw_flight::eskf_out::{EskfSteer, SteerMix};
 use fw_flight::mahony_baro::MahonyBaro;
 use fw_flight::pid::CascadedPid;
 use fw_flight::step::{Flight, FlightInputs, ModeLog, StepOut, log_due, mode_code};
@@ -20,12 +21,12 @@ use marv_card::{Card, Env};
 use marv_sim::log::Log;
 use marv_sim::pilot::{Ending, Pilot, PilotView};
 use marv_sim::rng::Rng;
-use marv_sim::scenario::{Air, Cell, Ground, Map, Point, RcRow, Rotors, Scenario, Spread};
+use marv_sim::scenario::{Air, Cell, Ground, MagFaultKind, Map, Point, RcRow, Rotors, Scenario, Spread};
 use marv_sim::sensors::{IMU_PERIOD_US, ImuModel};
 use marv_sim::slow_sensors::{Origin, SlowSensors, ned_from_geo};
 use marv_sim::verdict::{Check, Sample, Trace, judge};
 use marv_sim::{Backend, NativeBackend, Plant, Reaction, Start, Truth};
-use std::cell::Cell as StdCell;
+use std::cell::{Cell as StdCell, RefCell};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -48,7 +49,7 @@ const USAGE: &str = "usage: marv-run --card <marv.toml> --env <env.toml> --seed 
 (--seed is given exactly when the spread file has no seeds axis)
 Either form takes --shadow mahony-baro or --shadow eskf: that estimator runs in the shadow slot and one `shadow` line
 reports it, and --preroll <seconds> (air-start scenarios only, not a ground start: that has its own ground phase; the
-flight code is stepped that long with the plant pinned at the initial state, disarmed, before scenario time 0), and --estimator mahony|eskf1|eskf2 (the flight step's estimator; one `steer` line reports it) with
+flight code is stepped that long with the plant pinned at the initial state, disarmed, before scenario time 0), and --estimator mahony|eskf1|eskf2|eskf3 (the flight step's estimator, eskf3 = SteerMix; one `steer` line reports it; --window <from_s>,<to_s>, repeatable, adds a `window` line per interval) with
 and --noaid-sigma <m> (replaces
 Tuning::nav_noaid_sigma_m, the armed no-aid position hold's sigma).";
 
@@ -71,6 +72,8 @@ struct Args {
     steer: Option<SteerCfg>,
     /// `--preroll <s>`: the runner's pre-roll before scenario time 0 (decision-nav-eskf D5), in base ticks.
     preroll: Option<u64>,
+    /// `--window <from_s>,<to_s>` (repeatable): scenario-time intervals the `steer` run reports one `window` line for.
+    windows: Vec<(u64, u64)>,
     job: Job,
 }
 
@@ -80,6 +83,8 @@ enum EstKind {
     Mahony,
     Eskf1,
     Eskf2,
+    /// G-1b: `SteerMix` of `EskfSteer` around an `Eskf::new` core (attitude, rates, horizontal) and an `EskfZ` (vertical).
+    Eskf3,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -106,6 +111,7 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
     let (mut only, mut logs, mut home) = (None, None, None);
     let mut shadow = None;
     let (mut estimator, mut preroll) = (None, None);
+    let mut windows = Vec::new();
     let mut it = args.iter();
     while let Some(flag) = it.next() {
         if flag == "--help" || flag == "-h" {
@@ -145,12 +151,22 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
                 }
                 preroll = Some((s * 1e6 / TICK_US as f64).round() as u64);
             }
+            "--window" => {
+                let bad = || format!("--window: {value} is not <from_s>,<to_s> with 0 <= from_s < to_s");
+                let (a, b) = value.split_once(',').ok_or_else(bad)?;
+                let (a, b) = (a.parse::<f64>().map_err(|_| bad())?, b.parse::<f64>().map_err(|_| bad())?);
+                if !(a.is_finite() && b.is_finite() && a >= 0.0 && a < b) {
+                    return Err(bad());
+                }
+                windows.push(((a * 1e6).round() as u64, (b * 1e6).round() as u64));
+            }
             "--estimator" => {
                 estimator = Some(match value.as_str() {
                     "mahony" => EstKind::Mahony,
                     "eskf1" => EstKind::Eskf1,
                     "eskf2" => EstKind::Eskf2,
-                    _ => return Err(format!("--estimator: {value} is not mahony, eskf1 or eskf2")),
+                    "eskf3" => EstKind::Eskf3,
+                    _ => return Err(format!("--estimator: {value} is not mahony, eskf1, eskf2 or eskf3")),
                 })
             }
             "--logs" => {
@@ -181,6 +197,7 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
     Ok(Some(Args {
         steer,
         preroll,
+        windows,
         card: card.ok_or("--card is required")?,
         env: env.ok_or("--env is required")?,
         home,
@@ -613,6 +630,91 @@ impl Estimator for Steering {
     }
 }
 
+/// What the eskf3 run reads of the composite after each step (the `Flight` owns it): the core's counters, the output's
+/// tracking errors at each correction, the G6-B latch time and the origin the horizontal position refers to.
+#[derive(Default)]
+struct Info3 {
+    /// The pre-roll's offset: board time minus scenario time, us.
+    off_us: u64,
+    stats: EskfStats,
+    vert_reinits: u32,
+    skipped: u32,
+    ring_dropped: u32,
+    corrected: u32,
+    origin: Option<fw_flight::gnc::GeoPoint>,
+    /// Scenario time (us) of the first G6-B latch record (NKI Src 8, Ok 0) and of the first yaw alignment.
+    latch_t_us: Option<u64>,
+    align_t_us: Option<u64>,
+    /// Tracking error at each correction: attitude (rad), velocity (m/s), position (m): count, sums of squares, largest.
+    track: [(u64, f64, f64); 3],
+    /// Largest |gyro bias| component of the core, rad/s.
+    bias_max: f32,
+}
+
+/// `SteerMix` over leaked storage (the host is not memory-constrained), wrapped to fill `Info3`.
+struct Mix3 {
+    mix: SteerMix<'static>,
+    info: Rc<RefCell<Info3>>,
+}
+
+impl Estimator for Mix3 {
+    fn update(&mut self, sensors: &Sensors) -> NavState {
+        let nav = self.mix.update(sensors);
+        let steer = self.mix.steer();
+        let core = steer.core();
+        let mut i = self.info.borrow_mut();
+        let t = nav.t_us.saturating_sub(i.off_us);
+        i.stats = *core.stats();
+        i.vert_reinits = self.mix.vert().stats().reinits;
+        i.skipped = steer.skipped();
+        i.ring_dropped = steer.ring_dropped();
+        if steer.corrected() != i.corrected {
+            i.corrected = steer.corrected();
+            let tr = steer.tracking();
+            for (k, x) in [tr.att_rad, tr.vel_ms, tr.pos_m].into_iter().enumerate() {
+                let x = f64::from(x);
+                let a = i.track[k];
+                i.track[k] = (a.0 + 1, a.1 + x * x, a.2.max(x));
+            }
+        }
+        if i.latch_t_us.is_none() && core.events().any(|e| e.src == code::YAW_RESET && e.ok == code::GATED) {
+            i.latch_t_us = Some(t);
+        }
+        if i.align_t_us.is_none() && i.stats.yaw_aligns > 0 {
+            i.align_t_us = Some(t);
+        }
+        i.bias_max = core.biases().0.iter().fold(i.bias_max, |a, b| a.max(b.abs()));
+        i.origin = self.mix.origin();
+        nav
+    }
+    fn origin(&self) -> Option<fw_flight::gnc::GeoPoint> {
+        self.mix.origin()
+    }
+    fn set_armed(&mut self, armed: bool) {
+        self.mix.set_armed(armed);
+    }
+}
+
+/// The eskf3 additions of the `steer` line: heading error against truth while `heading` is valid and the horizontal
+/// position error against truth (current time) while `position_ne` is valid, and every valid step's figures for the
+/// `--window` lines.
+struct Ext {
+    info: Rc<RefCell<Info3>>,
+    sim_origin: Origin,
+    /// (steps, sum of squares, largest), rad and m.
+    hdg: (u64, f64, f64),
+    ne: (u64, f64, f64),
+    /// Steps with the heading flag, with the NE flags.
+    hdg_flag_steps: u64,
+    ne_flag_steps: u64,
+    steps: u64,
+    /// Per step: t_us, tilt error (None if tilt invalid), heading error, horizontal error, truth tilt, all rad or m.
+    rows: Vec<(u64, Option<f64>, Option<f64>, Option<f64>, f64)>,
+    /// Scenario times of the first and last step with NE flags dropped after having been valid, and of NE valid again.
+    ne_prev: bool,
+    ne_drops: Vec<(u64, bool)>,
+}
+
 /// The `steer` line's accumulators: the steering estimator's tilt error against truth at the same step (rad), split at
 /// 5 s after its tilt first becomes valid, and the step-to-step change of the motor levels.
 #[derive(Default)]
@@ -631,12 +733,41 @@ struct Steer {
     t_arm: Option<u64>,
     /// Largest |yaw difference| between the estimate and truth over the valid-tilt steps, rad.
     yaw_max: f64,
+    /// eskf3 only.
+    ext: Option<Ext>,
 }
 
 impl Steer {
     fn feed(&mut self, out: &StepOut, truth: &Truth) {
         if out.armed && self.t_arm.is_none() {
             self.t_arm = Some(out.t_us);
+        }
+        if let Some(x) = self.ext.as_mut() {
+            x.steps += 1;
+            let v = &out.nav.valid;
+            let tilt = v.tilt.then(|| tilt_err(out.nav.attitude.map(f64::from), truth.attitude));
+            let hdg = v.heading.then(|| wrap_pi(yaw_of(out.nav.attitude.map(f64::from)) - yaw_of(truth.attitude)).abs());
+            let ne = v.position_ne.then(|| {
+                let off = x.info.borrow().origin.map_or([0.0; 3], |o| ned_from_geo(&x.sim_origin, o.lat_e7, o.lon_e7, o.alt_mm));
+                let pe = [f64::from(out.nav.position_m[0]) + off[0] - truth.position_m[0],
+                    f64::from(out.nav.position_m[1]) + off[1] - truth.position_m[1]];
+                pe[0].hypot(pe[1])
+            });
+            if let Some(h) = hdg {
+                x.hdg = (x.hdg.0 + 1, x.hdg.1 + h * h, x.hdg.2.max(h));
+            }
+            if let Some(h) = ne {
+                x.ne = (x.ne.0 + 1, x.ne.1 + h * h, x.ne.2.max(h));
+            }
+            x.hdg_flag_steps += u64::from(v.heading);
+            x.ne_flag_steps += u64::from(v.position_ne);
+            if v.position_ne != x.ne_prev {
+                x.ne_drops.push((out.t_us, v.position_ne));
+                x.ne_prev = v.position_ne;
+            }
+            let z = truth.attitude;
+            let truth_tilt = (1.0 - 2.0 * (z[1] * z[1] + z[2] * z[2])).clamp(-1.0, 1.0).acos();
+            x.rows.push((out.t_us, tilt, hdg, ne, truth_tilt));
         }
         if out.nav.valid.tilt {
             let e = tilt_err(out.nav.attitude.map(f64::from), truth.attitude);
@@ -658,7 +789,7 @@ impl Steer {
         self.prev = now;
     }
 
-    fn line(&self, cfg: SteerCfg, info: Option<(f32, u32)>, t_lo: Option<u64>) -> String {
+    fn line(&self, cfg: SteerCfg, info: Option<(f32, u32)>, t_lo: Option<u64>, windows: &[(u64, u64)]) -> String {
         let d = f64::to_degrees;
         let rms = |t: (u64, f64, f64)| d((t.1 / t.0.max(1) as f64).sqrt());
         let (bias, reinits) = info.unwrap_or((0.0, 0));
@@ -666,6 +797,7 @@ impl Steer {
             EstKind::Mahony => "mahony",
             EstKind::Eskf1 => "eskf1",
             EstKind::Eskf2 => "eskf2",
+            EstKind::Eskf3 => "eskf3",
         };
         // The take-off window: tilt error (valid steps) from the first armed step to 3 s after the first lift-off.
         let w: Vec<f64> = match (self.t_arm, t_lo) {
@@ -674,12 +806,61 @@ impl Steer {
         };
         let to_rms = d((w.iter().map(|e| e * e).sum::<f64>() / w.len().max(1) as f64).sqrt());
         let to_max = d(w.iter().copied().fold(0.0, f64::max));
-        format!(
+        let mut text = format!(
             "steer {est} tilt_rms_first5_deg {:.4} tilt_max_first5_deg {:.4} tilt_rms_after_deg {:.4} tilt_max_after_deg {:.4} \
 tilt_n_first5 {} tilt_n_after {} bias_max_dps {:.4} motor_dlevel_rms {:.4} motor_dlevel_n {} reinits {} takeoff_rms_deg {:.4} takeoff_max_deg {:.4} takeoff_n {} yaw_diff_max_deg {:.3}",
             rms(self.tilt[0]), d(self.tilt[0].2), rms(self.tilt[1]), d(self.tilt[1].2), self.tilt[0].0, self.tilt[1].0,
             d(f64::from(bias)), (self.dm2 / self.dm_n.max(1) as f64).sqrt(), self.dm_n, reinits, to_rms, to_max, w.len(), d(self.yaw_max)
-        )
+        );
+        if let Some(x) = &self.ext {
+            let i = x.info.borrow();
+            let s = &i.stats;
+            let rms3 = |t: (u64, f64, f64)| (t.1 / t.0.max(1) as f64).sqrt();
+            let tr = |k: usize, unit: fn(f64) -> f64| (unit(rms3(i.track[k])), unit(i.track[k].2));
+            let (a_rms, a_max) = tr(0, f64::to_degrees);
+            let (v_rms, v_max) = tr(1, |x| x);
+            let (p_rms, p_max) = tr(2, |x| x);
+            let secs = |t: Option<u64>| t.map_or("none".to_string(), |t| format!("{:.2}", t as f64 * 1e-6));
+            let all: Vec<f64> = x.rows.iter().filter_map(|r| r.1).collect();
+            let tmax = d(all.iter().copied().fold(0.0, f64::max));
+            let trms = d((all.iter().map(|e| e * e).sum::<f64>() / all.len().max(1) as f64).sqrt());
+            let airborne = match (i.align_t_us, t_lo) {
+                (Some(a), Some(l)) => if a > l { "yes" } else { "no" },
+                (Some(_), None) => "no",
+                _ => "n/a",
+            };
+            let after: Vec<f64> = i.align_t_us.map_or(Vec::new(), |a| {
+                x.rows.iter().filter(|r| r.0 >= a && r.0 < a + 5_000_000).filter_map(|r| r.1).collect()
+            });
+            let edges: Vec<String> = x.ne_drops.iter().take(8).map(|(t, v)| format!("{:.1}:{}", *t as f64 * 1e-6, if *v { "T" } else { "F" })).collect();
+            text += &format!(
+                " | out_att_track_rms_deg {a_rms:.4} out_att_track_max_deg {a_max:.4} out_vel_track_rms {v_rms:.4} out_vel_track_max {v_max:.4} \
+out_pos_track_rms {p_rms:.4} out_pos_track_max {p_max:.4} corrections {} skipped {} ring_dropped {} yaw_aligns {} yaw_align_s {} \
+align_airborne {airborne} tilt_5s_after_align_rms_deg {:.4} tilt_5s_after_align_max_deg {:.4} yaw_resets {} gps_pos_fused {} gps_resets {} \
+reinits {} vert_reinits {} latch {} latch_s {} tilt_all_rms_deg {trms:.4} tilt_all_max_deg {tmax:.4} hdg_rms_deg {:.4} hdg_max_deg {:.4} hdg_flag_steps {} \
+ne_rms_m {:.4} ne_max_m {:.4} ne_flag_steps {} steps {} ne_flag_edges {}",
+                i.corrected, i.skipped, i.ring_dropped, s.yaw_aligns, secs(i.align_t_us),
+                d((after.iter().map(|e| e * e).sum::<f64>() / after.len().max(1) as f64).sqrt()), d(after.iter().copied().fold(0.0, f64::max)),
+                s.yaw_resets, s.gps_pos_fused, s.gps_resets, s.reinits, i.vert_reinits,
+                if i.latch_t_us.is_some() { "yes" } else { "no" }, secs(i.latch_t_us),
+                d(rms3(x.hdg)), d(x.hdg.2), x.hdg_flag_steps, rms3(x.ne), x.ne.2, x.ne_flag_steps, x.steps,
+                if edges.is_empty() { "none".to_string() } else { edges.join(",") }
+            );
+            for &(a, b) in windows {
+                let r: Vec<_> = x.rows.iter().filter(|r| r.0 >= a && r.0 < b).collect();
+                let tl: Vec<f64> = r.iter().filter_map(|r| r.1).collect();
+                let hl: Vec<f64> = r.iter().filter_map(|r| r.2).collect();
+                let nl: Vec<f64> = r.iter().filter_map(|r| r.3).collect();
+                let mx = |v: &[f64]| v.iter().copied().fold(0.0, f64::max);
+                let rm = |v: &[f64]| (v.iter().map(|e| e * e).sum::<f64>() / v.len().max(1) as f64).sqrt();
+                text += &format!(
+                    "\nwindow {:.2}-{:.2} s tilt_rms_deg {:.4} tilt_max_deg {:.4} tilt_n {} truth_tilt_max_deg {:.3} hdg_max_deg {:.3} hdg_n {} ne_rms_m {:.4} ne_max_m {:.4} ne_n {}",
+                    a as f64 * 1e-6, b as f64 * 1e-6, d(rm(&tl)), d(mx(&tl)), tl.len(),
+                    d(r.iter().map(|r| r.4).fold(0.0, f64::max)), d(mx(&hl)), hl.len(), rm(&nl), mx(&nl), nl.len()
+                );
+            }
+        }
+        text
     }
 }
 
@@ -780,6 +961,9 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
     let mut mode_log = ModeLog::new();
     let mut flight_steps: u64 = 0;
     let mut ran = 0;
+    // The scenario's GNSS hold and compass faults (G4): the last GNSS sample outside a hold, the stuck compass field.
+    let mut gnss_prev: Option<fw_core::sample::GnssSample> = None;
+    let mut mag_stuck: Option<[f32; 3]> = None;
     // Contact at any tick since the last stick report: what the pilot's eye catches between reports (Amendment B1).
     let mut touched = false;
     // Contact at any tick since the last flight step, for the shadow's airborne time.
@@ -877,6 +1061,37 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             if scenario.baro_lost.iter().any(|&(from, to)| truth.t_us >= from && truth.t_us < to) {
                 sensors_f.baro = None;
             }
+            let within = |w: &[(u64, u64)]| w.iter().any(|&(from, to)| truth.t_us >= from && truth.t_us < to);
+            if within(&scenario.gnss_lost) {
+                sensors_f.gnss = None;
+            } else if let Some(g) = sensors_f.gnss.as_mut() {
+                match gnss_prev.as_ref().filter(|_| within(&scenario.gnss_hold)) {
+                    Some(prev) => {
+                        g.reading.lat_e7 = prev.reading.lat_e7;
+                        g.reading.lon_e7 = prev.reading.lon_e7;
+                        g.reading.alt_mm = prev.reading.alt_mm;
+                        g.reading.speed_mm_s = Some(0);
+                        g.reading.vel_ned_mm_s = g.reading.vel_ned_mm_s.map(|_| [0; 3]);
+                    }
+                    None if within(&scenario.gnss_hold) => {}
+                    None => gnss_prev = Some(*g),
+                }
+            }
+            if let (Some(f), Some(m)) = (scenario.mag_fault, sensors_f.mag.as_mut()) {
+                if truth.t_us >= f.from_us {
+                    match f.kind {
+                        MagFaultKind::Rotate if f.below_m.is_none_or(|b| -truth.position_m[2] < b) => {
+                            let (a, b) = ((f.axis + 1) % 3, (f.axis + 2) % 3);
+                            let (sn, cs) = (f.deg_rad.sin() as f32, f.deg_rad.cos() as f32);
+                            let v = m.reading.field_ut;
+                            m.reading.field_ut[a] = cs * v[a] - sn * v[b];
+                            m.reading.field_ut[b] = sn * v[a] + cs * v[b];
+                        }
+                        MagFaultKind::Rotate => {}
+                        MagFaultKind::Stuck => m.reading.field_ut = *mag_stuck.get_or_insert(m.reading.field_ut),
+                    }
+                }
+            }
             if sensors_f.baro.is_some() && drift0.is_none() {
                 drift0 = Some(world.slow.baro.drift_m());
             }
@@ -964,7 +1179,7 @@ struct Run<'a> {
 /// when `keep` or when a check fails.
 #[allow(clippy::too_many_arguments)]
 fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option<Point>, cell: Option<&Run>, out: &Path,
-    keep: bool, shadow: Option<ShadowKind>, steer_cfg: Option<SteerCfg>, preroll: Option<u64>) -> Result<Outcome, String> {
+    keep: bool, shadow: Option<ShadowKind>, steer_cfg: Option<SteerCfg>, preroll: Option<u64>, windows: &[(u64, u64)]) -> Result<Outcome, String> {
     let (map, air, ground) = cell.map_or((Map::default(), Air::default(), Ground::default()), |r| (r.map, r.air, r.ground));
     let sloped;
     let scenario = match ground.roll_pitch_deg {
@@ -1004,6 +1219,10 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
     let imu2 = ImuModel::new("imu2", &card.imu2, env, Rng::new(seed, STREAM_IMU2))?;
     let slow = SlowSensors::new(card, env, scenario.gnss_rate_hz, seed)?
         .with_outputs(scenario.mag_expected, scenario.gnss_velocity);
+    let slow = match scenario.gnss_latency_s {
+        Some(l) => slow.with_gnss_latency_s(l),
+        None => slow,
+    };
     // Wind for this step is the mean only; gusts come in step 7.
     let wind = match air.wind_ned_ms {
         Some(w) => w,
@@ -1071,9 +1290,25 @@ every row's time is scenario time (the flight code's clock was scenario time + {
     };
     let mut steer = steer_cfg.map(|_| Steer::default());
     let info = Rc::new(StdCell::new((0.0f32, 0u32)));
+    let info3 = Rc::new(RefCell::new(Info3 { off_us: preroll.unwrap_or(0) * TICK_US, ..Info3::default() }));
+    if let (Some(st), Some(SteerCfg { est: EstKind::Eskf3 })) = (steer.as_mut(), steer_cfg) {
+        st.ext = Some(Ext { info: info3.clone(), sim_origin: Origin::from_env(env)?, hdg: (0, 0.0, 0.0), ne: (0, 0.0, 0.0),
+            hdg_flag_steps: 0, ne_flag_steps: 0, steps: 0, rows: Vec::new(), ne_prev: false, ne_drops: Vec::new() });
+    }
     let (ran, flight_steps, mut trace) = match steer_cfg {
         None | Some(SteerCfg { est: EstKind::Mahony, .. }) => {
             let flight = Flight::new(Mahony::new(&tuning), CascadedPid::new(&tuning), CardAllocator::new(), &tuning, handshake);
+            run(flight, &mut world, scenario, pilot.as_mut(), ticks, &mut log, shadow.as_deref_mut(), steer.as_mut(), preroll.unwrap_or(0))
+        }
+        Some(SteerCfg { est: EstKind::Eskf3 }) => {
+            let mut t = tuning;
+            let f = env.magnetic_field_ned.v.ok_or("magnetic_field.ned is \"ask\"")?;
+            t.nav_mag_declination_rad = f[1].atan2(f[0]) as f32;
+            let core: &'static mut Eskf = Box::leak(Box::new(Eskf::new(&t).map_err(|e| format!("Eskf: {e:?}"))?));
+            let vert: &'static mut EskfZ = Box::leak(Box::new(EskfZ::with_aiding(&t, Aiding::ImuBaro).map_err(|e| format!("EskfZ: {e:?}"))?));
+            let h = EskfSteer::new(core, &t).map_err(|e| format!("EskfSteer: {e:?}"))?;
+            let est = Mix3 { mix: SteerMix::new(h, vert), info: info3.clone() };
+            let flight = Flight::new(est, CascadedPid::new(&tuning), CardAllocator::new(), &tuning, handshake);
             run(flight, &mut world, scenario, pilot.as_mut(), ticks, &mut log, shadow.as_deref_mut(), steer.as_mut(), preroll.unwrap_or(0))
         }
         Some(cfg) => {
@@ -1158,7 +1393,15 @@ vh_ms {:.4} vz_ms {:.4}",
         }
     }
     let steer = steer_cfg.zip(steer).map(|(cfg, st)| {
-        st.line(cfg, (cfg.est != EstKind::Mahony).then(|| info.get()), trace.liftoffs.first().copied())
+        let info = match cfg.est {
+            EstKind::Mahony => None,
+            EstKind::Eskf3 => {
+                let i = info3.borrow();
+                Some((i.bias_max, i.stats.reinits))
+            }
+            _ => Some(info.get()),
+        };
+        st.line(cfg, info, trace.liftoffs.first().copied(), windows)
     });
     Ok(Outcome { summary, checks, notes, shadow: shadow.map(|s| s.line()), steer })
 }
@@ -1243,7 +1486,7 @@ fn go(args: &Args) -> Result<bool, Failure> {
             if args.preroll.is_some() {
                 preroll_ok(&scenario).map_err(Failure::Usage)?;
             }
-            let o = run_one(&card, &env, &scenario, seed, *point, None, out, true, args.shadow, args.steer, args.preroll)?;
+            let o = run_one(&card, &env, &scenario, seed, *point, None, out, true, args.shadow, args.steer, args.preroll, &args.windows)?;
             for line in o.summary.iter().chain(&o.notes).chain(&o.shadow).chain(&o.steer) {
                 println!("{line}");
             }
@@ -1303,7 +1546,7 @@ fn go(args: &Args) -> Result<bool, Failure> {
                 let out = out_dir.join(format!("{}.BIN", cell.name));
                 let keep = only.is_some() || *logs == Logs::All;
                 let o = run_one(&card, &env, &scenarios[cell.scenario], cell.seed, Some(spread.points[cell.point]),
-                    Some(&run), &out, keep, args.shadow, args.steer, args.preroll)?;
+                    Some(&run), &out, keep, args.shadow, args.steer, args.preroll, &args.windows)?;
                 if only.is_some() {
                     for line in o.summary.iter().chain(&o.notes) {
                         println!("{line}");

@@ -491,6 +491,15 @@ impl SlowSensors {
         self
     }
 
+    /// A scenario's `gnss_latency_s` (G4): replaces the GNSS model's latency and sizes the truth history for it. Not
+    /// called for a scenario without it, so every other run is unchanged.
+    pub fn with_gnss_latency_s(mut self, seconds: f64) -> SlowSensors {
+        self.gnss.latency_ticks = ticks(seconds);
+        let depth = self.baro.latency_ticks.max(self.mag.latency_ticks).max(self.gnss.latency_ticks);
+        self.history = TruthDelay::new(depth);
+        self
+    }
+
     /// Once per base tick, after the backend step: records the truth; each device whose period ends at this tick makes a
     /// sample, which replaces any not yet taken (newest only, as the board's triple buffers).
     pub fn tick(&mut self, truth: &Truth) {

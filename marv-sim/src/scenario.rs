@@ -48,8 +48,40 @@ pub struct Scenario {
     /// `[scenario] baro_lost = [[from_s, to_s], ...]`: `[from_us, to_us)` intervals in which no barometer sample reaches
     /// the flight code (the model keeps running).
     pub baro_lost: Vec<(u64, u64)>,
+    /// `[scenario] gnss_lost = [[from_s, to_s], ...]` (G4, diagnostic runs): `[from_us, to_us)` intervals in which no GNSS
+    /// sample reaches the flight code (the model keeps running).
+    pub gnss_lost: Vec<(u64, u64)>,
+    /// `[scenario] gnss_hold = [[from_s, to_s], ...]` (G4): in these intervals the samples repeat the last position
+    /// before the interval and report zero speed and velocity (the receiver's low-speed freeze); after it the model's
+    /// true solution returns with the jump.
+    pub gnss_hold: Vec<(u64, u64)>,
+    /// `[scenario] mag_fault = { from_s, kind, deg, below_m, axis }` (G4).
+    pub mag_fault: Option<MagFault>,
+    /// `[scenario] gnss_latency_s` (G4): replaces the model's latency (the card's); `None` leaves it.
+    pub gnss_latency_s: Option<f64>,
     pub disturbances: Vec<Disturbance>,
     pub verdict: Verdict,
+}
+
+/// `[scenario] mag_fault` (G4): what is done to the compass sample the flight code gets, from `from_us` on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MagFault {
+    pub from_us: u64,
+    pub kind: MagFaultKind,
+    /// `Rotate`: the angle, rad; unused by `Stuck`.
+    pub deg_rad: f64,
+    /// `Rotate` only: the field is rotated only while the truth height above the start is below this, m.
+    pub below_m: Option<f64>,
+    /// `Rotate` only: the body axis (0 x, 1 y, 2 z) the field is rotated about; z when not given.
+    pub axis: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MagFaultKind {
+    /// The calibrated field vector turned about a body axis by `deg`.
+    Rotate,
+    /// The field vector of the first sample at or after `from_us` is repeated; the sample's time and sequence advance.
+    Stuck,
 }
 
 /// One row of `[rc] script`. Roll, pitch, yaw -1..1 (right, forward, clockwise +); throttle 0..1; arm = the switch;
@@ -662,7 +694,7 @@ impl Scenario {
                 return Err(format!("{key}: unknown table"));
             }
         }
-        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz", "mag_expected", "gnss_velocity", "baro_lost"])?;
+        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz", "mag_expected", "gnss_velocity", "baro_lost", "gnss_lost", "gnss_hold", "mag_fault", "gnss_latency_s"])?;
         let ground = match root.get("initial").and_then(Value::as_table).and_then(|i| i.get("contact")) {
             None => false,
             Some(Value::String(c)) if c == "air" => false,
@@ -730,6 +762,51 @@ impl Scenario {
                 .map(|(from, to)| ((from * 1e6).round() as u64, (to * 1e6).round() as u64))
                 .collect(),
         };
+        let intervals = |key: &str| -> Result<Vec<(u64, u64)>, String> {
+            match s.get(key) {
+                None => Ok(Vec::new()),
+                Some(_) => Ok(pairs(s, "scenario", key)?
+                    .into_iter()
+                    .map(|(from, to)| ((from * 1e6).round() as u64, (to * 1e6).round() as u64))
+                    .collect()),
+            }
+        };
+        let gnss_lost = intervals("gnss_lost")?;
+        let gnss_hold = intervals("gnss_hold")?;
+        let gnss_latency_s = optional_scalar(s, "scenario", "gnss_latency_s")?;
+        if gnss_latency_s.is_some_and(|l| !(0.0..=1.0).contains(&l)) {
+            return Err("scenario.gnss_latency_s: must be in [0, 1] s".to_string());
+        }
+        let mag_fault = match s.get("mag_fault") {
+            None => None,
+            Some(Value::Table(t)) => {
+                known_keys(t, "scenario.mag_fault", &["from_s", "kind", "deg", "below_m", "axis"])?;
+                let kind = match t.get("kind").and_then(Value::as_str) {
+                    Some("rotate") => MagFaultKind::Rotate,
+                    Some("stuck") => MagFaultKind::Stuck,
+                    _ => return Err("scenario.mag_fault.kind: must be \"rotate\" or \"stuck\"".to_string()),
+                };
+                let from_s = scalar(t, "scenario.mag_fault", "from_s")?;
+                if from_s < 0.0 {
+                    return Err("scenario.mag_fault.from_s: must be >= 0".to_string());
+                }
+                let deg = if kind == MagFaultKind::Rotate { scalar(t, "scenario.mag_fault", "deg")? } else { 0.0 };
+                let axis = match t.get("axis").map(Value::as_str) {
+                    None | Some(Some("z")) => 2,
+                    Some(Some("x")) => 0,
+                    Some(Some("y")) => 1,
+                    _ => return Err("scenario.mag_fault.axis: must be \"x\", \"y\" or \"z\"".to_string()),
+                };
+                Some(MagFault {
+                    from_us: (from_s * 1e6).round() as u64,
+                    kind,
+                    deg_rad: deg.to_radians(),
+                    below_m: optional_scalar(t, "scenario.mag_fault", "below_m")?,
+                    axis,
+                })
+            }
+            Some(_) => return Err("scenario.mag_fault: must be an inline table".to_string()),
+        };
         let mut disturbances = Vec::new();
         for (i, row) in rows(&root, "", "disturbance", &["from_s", "to_s", "torque_nm"])?.into_iter().enumerate() {
             let name = format!("disturbance[{i}]");
@@ -780,6 +857,10 @@ impl Scenario {
             pilot,
             rc_lost,
             baro_lost,
+            gnss_lost,
+            gnss_hold,
+            mag_fault,
+            gnss_latency_s,
             disturbances,
             verdict: verdict(&root)?,
         })
