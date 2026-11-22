@@ -58,6 +58,10 @@ static NOAID_SIGMA: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
 
 /// `--tuning-override <name>=<value>` (a negative-control option, not for the flight's own runs): replaces one of
 /// `psc_posz_p`, `psc_velz_p`, `psc_velz_i` in the flight code's `Tuning`.
+/// `--ground-s <s>` (P-G4b): replaces the `after_s` of a pilot scenario's first phase (the ground phase, disarmed) and
+/// lengthens `duration_s` by the difference; the scenario files are not changed.
+static GROUND_S: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+
 static TUNING_OVERRIDE: std::sync::OnceLock<(String, f32)> = std::sync::OnceLock::new();
 
 struct Args {
@@ -150,6 +154,10 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
                     return Err(format!("--preroll: {value} is not in (0, 60] seconds"));
                 }
                 preroll = Some((s * 1e6 / TICK_US as f64).round() as u64);
+            }
+            "--ground-s" => {
+                let v = value.parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0 && *v <= 300.0).ok_or(format!("--ground-s: {value} is not in (0, 300] seconds"))?;
+                let _ = GROUND_S.set(v);
             }
             "--window" => {
                 let bad = || format!("--window: {value} is not <from_s>,<to_s> with 0 <= from_s < to_s");
@@ -647,8 +655,12 @@ struct Info3 {
     align_t_us: Option<u64>,
     /// Tracking error at each correction: attitude (rad), velocity (m/s), position (m): count, sums of squares, largest.
     track: [(u64, f64, f64); 3],
-    /// Largest |gyro bias| component of the core, rad/s.
+    /// Largest |gyro bias| component of the core, rad/s, the board time (us) and the axis where it was first reached.
     bias_max: f32,
+    bias_max_t_us: u64,
+    bias_max_axis: usize,
+    /// The core's gyro bias (rad/s) at the last step of each whole board second.
+    bias_by_s: Vec<(u64, [f32; 3])>,
 }
 
 /// `SteerMix` over leaked storage (the host is not memory-constrained), wrapped to fill `Info3`.
@@ -683,7 +695,18 @@ impl Estimator for Mix3 {
         if i.align_t_us.is_none() && i.stats.yaw_aligns > 0 {
             i.align_t_us = Some(t);
         }
-        i.bias_max = core.biases().0.iter().fold(i.bias_max, |a, b| a.max(b.abs()));
+        let bg = core.biases().0;
+        for (k, b) in bg.iter().enumerate() {
+            if b.abs() > i.bias_max {
+                i.bias_max = b.abs();
+                i.bias_max_t_us = nav.t_us;
+                i.bias_max_axis = k;
+            }
+        }
+        match i.bias_by_s.last_mut() {
+            Some(l) if l.0 == nav.t_us / 1_000_000 => l.1 = bg,
+            _ => i.bias_by_s.push((nav.t_us / 1_000_000, bg)),
+        }
         i.origin = self.mix.origin();
         nav
     }
@@ -833,12 +856,18 @@ tilt_n_first5 {} tilt_n_after {} bias_max_dps {:.4} motor_dlevel_rms {:.4} motor
                 x.rows.iter().filter(|r| r.0 >= a && r.0 < a + 5_000_000).filter_map(|r| r.1).collect()
             });
             let edges: Vec<String> = x.ne_drops.iter().take(8).map(|(t, v)| format!("{:.1}:{}", *t as f64 * 1e-6, if *v { "T" } else { "F" })).collect();
+            let bias_at: Vec<String> = [1u64, 2, 3, 5, 10, 20, 40, 60, 62, 65, 70, 80]
+                .iter()
+                .filter_map(|&b| i.bias_by_s.iter().find(|e| e.0 == b))
+                .map(|e| format!("{}:{:.2}/{:.2}/{:.2}", e.0, d(f64::from(e.1[0])), d(f64::from(e.1[1])), d(f64::from(e.1[2]))))
+                .collect();
             text += &format!(
-                " | out_att_track_rms_deg {a_rms:.4} out_att_track_max_deg {a_max:.4} out_vel_track_rms {v_rms:.4} out_vel_track_max {v_max:.4} \
+                " | bias_max_board_s {:.2} bias_max_axis {} scenario_start_board_s {:.2} bias_dps_xyz_by_board_s {} out_att_track_rms_deg {a_rms:.4} out_att_track_max_deg {a_max:.4} out_vel_track_rms {v_rms:.4} out_vel_track_max {v_max:.4} \
 out_pos_track_rms {p_rms:.4} out_pos_track_max {p_max:.4} corrections {} skipped {} ring_dropped {} yaw_aligns {} yaw_align_s {} \
 align_airborne {airborne} tilt_5s_after_align_rms_deg {:.4} tilt_5s_after_align_max_deg {:.4} yaw_resets {} gps_pos_fused {} gps_resets {} \
 reinits {} vert_reinits {} latch {} latch_s {} tilt_all_rms_deg {trms:.4} tilt_all_max_deg {tmax:.4} hdg_rms_deg {:.4} hdg_max_deg {:.4} hdg_flag_steps {} \
 ne_rms_m {:.4} ne_max_m {:.4} ne_flag_steps {} steps {} ne_flag_edges {}",
+                i.bias_max_t_us as f64 * 1e-6, ["x", "y", "z"][i.bias_max_axis], i.off_us as f64 * 1e-6, bias_at.join(","),
                 i.corrected, i.skipped, i.ring_dropped, s.yaw_aligns, secs(i.align_t_us),
                 d((after.iter().map(|e| e * e).sum::<f64>() / after.len().max(1) as f64).sqrt()), d(after.iter().copied().fold(0.0, f64::max)),
                 s.yaw_resets, s.gps_pos_fused, s.gps_resets, s.reinits, i.vert_reinits,
@@ -1203,6 +1232,19 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
             &sloped
         }
         None => scenario,
+    };
+    let lengthened;
+    let scenario = match (GROUND_S.get(), scenario.phases.first()) {
+        (Some(&g), Some(first)) if matches!(first.end, marv_sim::scenario::PhaseEnd::After { .. }) => {
+            let mut sc = scenario.clone();
+            let marv_sim::scenario::PhaseEnd::After { us } = sc.phases[0].end else { unreachable!() };
+            let new = (g * 1e6).round() as u64;
+            sc.phases[0].end = marv_sim::scenario::PhaseEnd::After { us: new };
+            sc.duration_s += (new as f64 - us as f64) * 1e-6;
+            lengthened = sc;
+            &lengthened
+        }
+        _ => scenario,
     };
     let plant_card = plant_card(card, point, &map, &air);
     let mut plant = Plant::new(&plant_card, env)?;
