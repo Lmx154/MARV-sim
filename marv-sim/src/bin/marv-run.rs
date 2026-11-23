@@ -6,6 +6,7 @@
 use fw_core::handshake::Handshake;
 use fw_core::rc::{RcSample, Sticks};
 use fw_flight::alloc::CardAllocator;
+use fw_core::esc::{LINES, line_of_element};
 use fw_flight::esc::hold;
 use fw_flight::gate::MotorCommand;
 use fw_flight::gnc::{Allocator, Controller, Estimator, Sensors, Setpoint};
@@ -36,6 +37,25 @@ use std::time::Instant;
 const TICK_US: u64 = 125;
 /// The ESC exchange: every 8 ticks, 1 kHz.
 const ESC_TICKS: u64 = 8;
+/// The controller's sample rate: the IMU models' rate.
+const IMU_RATE_HZ: f32 = 1.0e6 / IMU_PERIOD_US as f32;
+/// The motors' pole count (poles, not pole pairs; the firmware's `MOT_POLES` default): the one place the sim takes it from,
+/// for the eRPM it hands the flight step and for `set_notch`.
+const MOTOR_POLES: i32 = 14;
+/// `--notch`: the flight step's RPM notch is switched on (before arming).
+static NOTCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The eRPM the ESCs report, by DShot line, from the plant's rotor speeds (rad/s, element `e` = motor `e + 1`, which is
+/// line `line_of_element(e)`): rev/min times pole pairs, stamped `t_us` on the flight step's clock.
+fn erpm_lines(speeds_rads: [f64; 4], t_us: u64) -> [Option<(u32, u64)>; LINES] {
+    let mut erpm = [None; LINES];
+    for (e, w) in speeds_rads.iter().enumerate() {
+        let line = line_of_element(e).expect("four elements");
+        let rpm = w.abs() * 60.0 / std::f64::consts::TAU;
+        erpm[line] = Some(((rpm * f64::from(MOTOR_POLES / 2)).round() as u32, t_us));
+    }
+    erpm
+}
 /// A stick report: every 32 ticks, 4 ms (B10).
 const RC_TICKS: u64 = 32;
 /// Noise streams, one per sensor (src/rng.rs).
@@ -43,9 +63,9 @@ const STREAM_IMU1: u64 = 1;
 const STREAM_IMU2: u64 = 2;
 
 const USAGE: &str = "usage: marv-run --card <marv.toml> --env <env.toml> --seed <u64> --scenario <file> --out <file.BIN> \
-[--point <kf_scale>,<inertia_scale>,<lag_s or ->] [--home <env/home.local.toml>]
+[--point <kf_scale>,<inertia_scale>,<lag_s or ->] [--home <env/home.local.toml>] [--notch]
        marv-run --card <marv.toml> --env <env.toml> [--seed <u64>] --spread <file> --out-dir <dir> \
-[--only <cell>] [--logs fail|all] [--home <env/home.local.toml>]
+[--only <cell>] [--logs fail|all] [--home <env/home.local.toml>] [--notch]
 (--seed is given exactly when the spread file has no seeds axis)
 Either form takes --shadow mahony-baro or --shadow eskf: that estimator runs in the shadow slot and one `shadow` line
 reports it, and --preroll <seconds> (air-start scenarios only, not a ground start: that has its own ground phase; the
@@ -62,7 +82,7 @@ static NOAID_SIGMA: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
 /// lengthens `duration_s` by the difference; the scenario files are not changed.
 static GROUND_S: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
 
-static TUNING_OVERRIDE: std::sync::OnceLock<(String, f32)> = std::sync::OnceLock::new();
+static TUNING_OVERRIDE: std::sync::Mutex<Vec<(String, f32)>> = std::sync::Mutex::new(Vec::new());
 
 struct Args {
     card: PathBuf,
@@ -121,6 +141,10 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
         if flag == "--help" || flag == "-h" {
             return Ok(None);
         }
+        if flag == "--notch" {
+            NOTCH.store(true, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
         let value = it.next().ok_or(format!("{flag}: needs a value"))?;
         match flag.as_str() {
             "--card" => card = Some(PathBuf::from(value)),
@@ -143,10 +167,13 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
             "--tuning-override" => {
                 let (name, v) = value.split_once('=').ok_or(format!("--tuning-override: {value} is not name=value"))?;
                 let v = v.parse::<f32>().ok().filter(|v| v.is_finite()).ok_or(format!("--tuning-override: {value}: not a number"))?;
-                if !["psc_posz_p", "psc_velz_p", "psc_velz_i", "nav_baro_sigma_m"].contains(&name) {
-                    return Err(format!("--tuning-override: {name} is not psc_posz_p, psc_velz_p, psc_velz_i or nav_baro_sigma_m"));
+                if !["psc_posz_p", "psc_velz_p", "psc_velz_i", "nav_baro_sigma_m", "notch_harmonics", "notch_min_hz", "notch_fade_hz"].contains(&name) {
+                    return Err(format!("--tuning-override: {name} is not psc_posz_p, psc_velz_p, psc_velz_i, nav_baro_sigma_m, notch_harmonics, notch_min_hz or notch_fade_hz"));
                 }
-                let _ = TUNING_OVERRIDE.set((name.to_string(), v));
+                if name == "notch_harmonics" && ![1.0, 2.0, 3.0].contains(&v) {
+                    return Err(format!("--tuning-override: {value}: notch_harmonics is 1, 2 or 3"));
+                }
+                TUNING_OVERRIDE.lock().unwrap().push((name.to_string(), v));
             }
             "--preroll" => {
                 let s = value.parse::<f64>().map_err(|_| format!("--preroll: {value} is not a number"))?;
@@ -1062,6 +1089,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
     // initial state; the scenario then starts at board time `off`. The flight code, the shadow and the sensors' stamps
     // see board time = scenario time + off; the log, the verdict trace and the ESC rule see scenario time.
     let off = preroll_ticks * TICK_US;
+    flight.set_notch(NOTCH.load(std::sync::atomic::Ordering::Relaxed), MOTOR_POLES);
     if preroll_ticks > 0 {
         let mut pinned = world.backend.truth().clone();
         let row = row_at(&scenario.rc_script, 0);
@@ -1083,7 +1111,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
                 if baro.is_some() && drift0.is_none() {
                     drift0 = Some(world.slow.baro.drift_m());
                 }
-                let out = flight.step(&FlightInputs { sensors, rc: pending.take() });
+                let out = flight.step(&FlightInputs { sensors, rc: pending.take(), erpm: erpm_lines(world.plant.rotor_speeds(), pinned.t_us) });
                 if let Some(sh) = shadow.as_deref_mut() {
                     sh.feed(&sensors, &out, &pinned, world.slow.baro.drift_m(), std::mem::replace(&mut contact, false));
                 }
@@ -1172,7 +1200,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             if let Some(g) = sensors_f.gnss.as_mut() {
                 g.t_us += off;
             }
-            let out_f = flight.step(&FlightInputs { sensors: sensors_f, rc: pending.take() });
+            let out_f = flight.step(&FlightInputs { sensors: sensors_f, rc: pending.take(), erpm: erpm_lines(world.plant.rotor_speeds(), sensors_f.imu1.t_us) });
             let mut out = out_f;
             out.t_us -= off;
             out.nav.t_us -= off;
@@ -1356,11 +1384,14 @@ every row's time is scenario time (the flight code's clock was scenario time + {
     if let Some(s) = NOAID_SIGMA.get() {
         tuning.nav_noaid_sigma_m = *s;
     }
-    if let Some((name, v)) = TUNING_OVERRIDE.get() {
+    for (name, v) in TUNING_OVERRIDE.lock().unwrap().iter() {
         match name.as_str() {
             "psc_posz_p" => tuning.psc_posz_p = *v,
             "psc_velz_p" => tuning.psc_velz_p = *v,
             "nav_baro_sigma_m" => tuning.nav_baro_sigma_m = *v,
+            "notch_harmonics" => tuning.notch_harmonics = *v as usize,
+            "notch_min_hz" => tuning.notch_min_hz = *v,
+            "notch_fade_hz" => tuning.notch_fade_hz = *v,
             _ => tuning.psc_velz_i = *v,
         }
     }
@@ -1379,7 +1410,7 @@ every row's time is scenario time (the flight code's clock was scenario time + {
     }
     let (ran, flight_steps, mut trace) = match steer_cfg {
         None | Some(SteerCfg { est: EstKind::Mahony, .. }) => {
-            let flight = Flight::new(Mahony::new(&tuning), CascadedPid::new(&tuning), CardAllocator::new(), &tuning, handshake);
+            let flight = Flight::new(Mahony::new(&tuning), CascadedPid::new(&tuning, IMU_RATE_HZ), CardAllocator::new(), &tuning, handshake);
             run(flight, &mut world, scenario, pilot.as_mut(), ticks, &mut log, shadow.as_deref_mut(), steer.as_mut(), preroll.unwrap_or(0))
         }
         Some(SteerCfg { est: EstKind::Eskf3 }) => {
@@ -1390,7 +1421,7 @@ every row's time is scenario time (the flight code's clock was scenario time + {
             let vert: &'static mut Eskf = Box::leak(Box::new(Eskf::with_aiding(&t, Aiding::ImuBaro).map_err(|e| format!("Eskf (vertical): {e:?}"))?));
             let h = EskfSteer::new(core, &t).map_err(|e| format!("EskfSteer: {e:?}"))?;
             let est = Mix3 { mix: SteerMix::new(h, vert), info: info3.clone() };
-            let flight = Flight::new(est, CascadedPid::new(&tuning), CardAllocator::new(), &tuning, handshake);
+            let flight = Flight::new(est, CascadedPid::new(&tuning, IMU_RATE_HZ), CardAllocator::new(), &tuning, handshake);
             run(flight, &mut world, scenario, pilot.as_mut(), ticks, &mut log, shadow.as_deref_mut(), steer.as_mut(), preroll.unwrap_or(0))
         }
         Some(cfg) => {
@@ -1400,7 +1431,7 @@ every row's time is scenario time (the flight code's clock was scenario time + {
             let aiding = if cfg.est == EstKind::Eskf1 { Aiding::Imu } else { Aiding::ImuBaro };
             let eskf = Eskf::with_aiding(&t, aiding).map_err(|e| format!("Eskf: {e:?}"))?;
             let est = Steering { eskf, info: info.clone() };
-            let flight = Flight::new(est, CascadedPid::new(&tuning), CardAllocator::new(), &tuning, handshake);
+            let flight = Flight::new(est, CascadedPid::new(&tuning, IMU_RATE_HZ), CardAllocator::new(), &tuning, handshake);
             run(flight, &mut world, scenario, pilot.as_mut(), ticks, &mut log, shadow.as_deref_mut(), steer.as_mut(), preroll.unwrap_or(0))
         }
     };
