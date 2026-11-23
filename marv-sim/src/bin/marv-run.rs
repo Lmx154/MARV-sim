@@ -9,7 +9,8 @@ use fw_flight::alloc::CardAllocator;
 use fw_core::esc::{LINES, line_of_element};
 use fw_flight::esc::hold;
 use fw_flight::gate::MotorCommand;
-use fw_flight::gnc::{Allocator, Controller, Estimator, Sensors, Setpoint};
+use fw_flight::gnc::{Allocator, Controller, Estimator, GeoPoint, Sensors, Setpoint};
+use fw_flight::guidance::Guidance;
 use fw_flight::gnc::NavState;
 use fw_flight::mahony::Mahony;
 use fw_flight::eskf::{Aiding, Eskf, EskfStats, RING, code};
@@ -24,7 +25,7 @@ use marv_sim::pilot::{Ending, Pilot, PilotView};
 use marv_sim::rng::Rng;
 use marv_sim::scenario::{Air, Cell, Ground, MagFaultKind, Map, Point, RcRow, Rotors, Scenario, Spread};
 use marv_sim::sensors::{IMU_PERIOD_US, ImuModel};
-use marv_sim::slow_sensors::{Origin, SlowSensors, ned_from_geo};
+use marv_sim::slow_sensors::{Origin, SlowSensors, geo_from_ned, ned_from_geo};
 use marv_sim::verdict::{Check, Sample, Trace, judge};
 use marv_sim::{Backend, NativeBackend, Plant, Reaction, Start, Truth};
 use std::cell::{Cell as StdCell, RefCell};
@@ -71,7 +72,10 @@ Either form takes --shadow mahony-baro or --shadow eskf: that estimator runs in 
 reports it, and --preroll <seconds> (air-start scenarios only, not a ground start: that has its own ground phase; the
 flight code is stepped that long with the plant pinned at the initial state, disarmed, before scenario time 0), and --estimator mahony|eskf1|eskf2|eskf3 (the flight step's estimator, eskf3 = SteerMix; one `steer` line reports it; --window <from_s>,<to_s>, repeatable, adds a `window` line per interval) with
 and --noaid-sigma <m> (replaces
-Tuning::nav_noaid_sigma_m, the armed no-aid position hold's sigma).";
+Tuning::nav_noaid_sigma_m, the armed no-aid position hold's sigma).
+--gdn <north_m>,<east_m> (repeatable, at most 4; one run only) runs the firmware's shadow guidance as the board does, with targets
+at those offsets from the origin the estimator reports, and --gdn-radius <m> (default 2.0) the arrival radius: one GDN record
+every 8th step, and one `gdn` line. Without --gdn the guidance is not called and no GDN record is written.";
 
 /// `--noaid-sigma`: replaces `Tuning::nav_noaid_sigma_m` (the armed no-aid position hold's sigma) for every estimator.
 static NOAID_SIGMA: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -81,6 +85,13 @@ static NOAID_SIGMA: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
 /// `--ground-s <s>` (P-G4b): replaces the `after_s` of a pilot scenario's first phase (the ground phase, disarmed) and
 /// lengthens `duration_s` by the difference; the scenario files are not changed.
 static GROUND_S: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+
+/// `--gdn <north_m>,<east_m>` (repeatable): the shadow guidance's targets, as offsets from the estimator's origin.
+static GDN_TARGETS: std::sync::Mutex<Vec<[f64; 2]>> = std::sync::Mutex::new(Vec::new());
+/// `--gdn-radius <m>`: the shadow guidance's arrival radius.
+static GDN_RADIUS: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+/// The sim world's origin (the env's), set by `run_one` when targets are given, for the `gdn` line.
+static GDN_SIM_ORIGIN: std::sync::OnceLock<Origin> = std::sync::OnceLock::new();
 
 static TUNING_OVERRIDE: std::sync::Mutex<Vec<(String, f32)>> = std::sync::Mutex::new(Vec::new());
 
@@ -182,6 +193,23 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
                 }
                 preroll = Some((s * 1e6 / TICK_US as f64).round() as u64);
             }
+            "--gdn" => {
+                let bad = || format!("--gdn: {value} is not <north_m>,<east_m>");
+                let (a, b) = value.split_once(',').ok_or_else(bad)?;
+                let (a, b) = (a.parse::<f64>().map_err(|_| bad())?, b.parse::<f64>().map_err(|_| bad())?);
+                if !(a.is_finite() && b.is_finite()) {
+                    return Err(bad());
+                }
+                let mut t = GDN_TARGETS.lock().unwrap();
+                if t.len() >= GDN_SLOTS {
+                    return Err(format!("--gdn: at most {GDN_SLOTS} targets"));
+                }
+                t.push([a, b]);
+            }
+            "--gdn-radius" => {
+                let v = value.parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0).ok_or(format!("--gdn-radius: {value} is not a number >= 0"))?;
+                let _ = GDN_RADIUS.set(v);
+            }
             "--ground-s" => {
                 let v = value.parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0 && *v <= 300.0).ok_or(format!("--ground-s: {value} is not in (0, 300] seconds"))?;
                 let _ = GROUND_S.set(v);
@@ -227,6 +255,12 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
     };
     if matches!(job, Job::One { .. }) && seed.is_none() {
         return Err("--seed is required with --scenario".into());
+    }
+    if GDN_TARGETS.lock().unwrap().is_empty() && GDN_RADIUS.get().is_some() {
+        return Err("--gdn-radius needs --gdn".into());
+    }
+    if !GDN_TARGETS.lock().unwrap().is_empty() && !matches!(job, Job::One { .. }) {
+        return Err("--gdn is for --scenario runs only".into());
     }
     let steer = estimator.map(|est| SteerCfg { est });
     Ok(Some(Args {
@@ -1056,6 +1090,85 @@ impl Faults {
     }
 }
 
+/// The shadow guidance's slots on the board (`fw_settings::flight::GDN_SLOTS`).
+const GDN_SLOTS: usize = 4;
+
+/// `--gdn`: the board's `Stepper::guide` (src/flight.rs) around `Guidance`, owned outside `Flight`. The targets are taken on
+/// the first disarmed step that has an origin (the board takes new targets on a disarmed step); arming resets; from then
+/// on, every 8th step, `anchor`, `step` and one GDN record. Nothing of it reaches the flight code.
+struct GdnShadow {
+    offsets: Vec<[f64; 2]>,
+    radius_m: f32,
+    guidance: Guidance<GDN_SLOTS>,
+    was_armed: bool,
+    /// The estimator's origin and the time (scenario) the targets were taken, with the targets' GeoPoints.
+    taken: Option<(GeoPoint, u64, Vec<GeoPoint>)>,
+}
+
+impl GdnShadow {
+    fn from_args() -> Option<GdnShadow> {
+        let offsets = GDN_TARGETS.lock().unwrap().clone();
+        (!offsets.is_empty()).then(|| GdnShadow {
+            offsets,
+            radius_m: GDN_RADIUS.get().copied().unwrap_or(2.0),
+            guidance: Guidance::new(),
+            was_armed: false,
+            taken: None,
+        })
+    }
+
+    fn guide<E: Estimator, C: Controller, A: Allocator>(&mut self, flight: &Flight<E, C, A>, out: &StepOut, step: u32, log: &mut Log) {
+        let origin = flight.estimator().origin();
+        if self.taken.is_none() && !out.armed {
+            if let Some(o) = origin {
+                let base = Origin { lat_e7: o.lat_e7, lon_e7: o.lon_e7, alt_mm: o.alt_mm };
+                let targets: Vec<GeoPoint> = self
+                    .offsets
+                    .iter()
+                    .map(|&[n, e]| {
+                        let (lat_e7, lon_e7, alt_mm) = geo_from_ned(&base, [n, e, 0.0]);
+                        GeoPoint { lat_e7, lon_e7, alt_mm }
+                    })
+                    .collect();
+                self.guidance.set_targets(&targets, self.radius_m);
+                self.taken = Some((o, out.t_us, targets));
+            }
+        }
+        if out.armed && !self.was_armed {
+            self.guidance.reset();
+        }
+        self.was_armed = out.armed;
+        if self.taken.is_none() || step % 8 != 0 {
+            return;
+        }
+        let nav = out.nav;
+        let speed = flight.speed_xy_in_force();
+        self.guidance.anchor(&nav);
+        let g = self.guidance.step(&nav, origin, speed, out.t_us);
+        let (position, velocity) = match g.setpoint {
+            Some(Setpoint::Position { position_m, velocity_ms, .. }) => ([position_m[0], position_m[1]], [velocity_ms[0], velocity_ms[1]]),
+            _ => ([0.0; 2], [0.0; 2]),
+        };
+        log.gdn(out.t_us, g.active, g.status, g.target_ne, position, velocity, g.dist_m, g.bearing_rad);
+    }
+
+    /// The `gdn` line: where the estimator's origin is in the sim world (north, east, m), and each target's NE in the sim
+    /// world, from its own geodetic point.
+    fn line(&self, log: &Log) -> String {
+        let Some((o, t_us, targets)) = &self.taken else {
+            return "gdn targets never taken (no estimator origin on a disarmed step), 0 records".to_string();
+        };
+        let Some(sim) = GDN_SIM_ORIGIN.get() else { return "gdn no sim origin".to_string() };
+        let at = |p: &GeoPoint| ned_from_geo(sim, p.lat_e7, p.lon_e7, p.alt_mm);
+        let eo = at(o);
+        let ts: Vec<String> = targets.iter().map(|p| { let v = at(p); format!("{:.3},{:.3}", v[0], v[1]) }).collect();
+        format!(
+            "gdn radius_m {} taken_t_s {:.3} est_origin_in_sim_ne_m {:.3},{:.3} targets_true_ne_m {} records {}",
+            self.radius_m, *t_us as f64 * 1e-6, eo[0], eo[1], ts.join(" "), log.counts.gdn
+        )
+    }
+}
+
 /// Runs at most `ticks` base ticks (with a pilot, until its phase table ends); returns how many ticks and flight steps
 /// it made and what the verdict needs.
 fn run<E: Estimator, C: Controller, A: Allocator>(
@@ -1077,6 +1190,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
     // The barometer model's drift when the flight code is first given a barometer sample (the pre-roll's included).
     let mut drift0: Option<f64> = None;
     let mut mode_log = ModeLog::new();
+    let mut gdn = GdnShadow::from_args();
     let mut flight_steps: u64 = 0;
     let mut ran = 0;
     // The scenario's GNSS hold and compass faults (G4): the last GNSS sample outside a hold, the stuck compass field.
@@ -1239,10 +1353,16 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             if pilot.is_some() {
                 log.ground(&truth);
             }
+            if let Some(g) = gdn.as_mut() {
+                g.guide(&flight, &out, (flight_steps - 1) as u32, log);
+            }
             trace.steps.push(sample(&truth, &out, world.slow.baro.drift_m()));
         }
     }
     trace.baro_drift0_m = drift0.unwrap_or(0.0);
+    if let Some(g) = &gdn {
+        println!("{}", g.line(log));
+    }
     (ran, flight_steps, trace)
 }
 
@@ -1338,6 +1458,9 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
         None => env.wind_mean_ned.v.ok_or("wind.mean_ned is \"ask\"")?,
     };
 
+    if !GDN_TARGETS.lock().unwrap().is_empty() {
+        let _ = GDN_SIM_ORIGIN.set(Origin::from_env(env)?);
+    }
     let mut log = Log::with_header();
     log.msg(0, &format!("marv-sim {}", env!("CARGO_PKG_VERSION")));
     log.msg(0, &firmware_text());
