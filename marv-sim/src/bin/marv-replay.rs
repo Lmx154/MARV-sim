@@ -3,9 +3,10 @@
 
 use fw_flight::eskf::{Aiding, Eskf, EskfStats, Nki};
 use fw_flight::eskf_out::EskfSteer;
-use fw_flight::gnc::{Estimator, NavState, Valid};
+use fw_flight::gnc::{Controller, Estimator, NavState, Saturation, Setpoint, Valid};
 use fw_flight::mahony::Mahony;
 use fw_flight::mahony_baro::MahonyBaro;
+use fw_flight::pid::CascadedPid;
 use fw_flight::tuning::Tuning;
 use marv_sim::replay::{ExpectedFrom, Log, Stream, StreamOpts, Table, build_stream};
 use std::collections::HashMap;
@@ -14,7 +15,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 const HELP: &str = "\
-marv-replay <log.BIN> <outdir> [--every N] [--imu-period-us US] [--mag-expected UT,INC_DEG,STR_PCT,TOL_DEG] [--noaid-sigma M] [--no-baro-from-armed N] [--gps-delay-ms MS] [--gps-min-rate-hz HZ] [--no-mag] [--nki] [--steering mahony-baro|eskf2|eskf3] [--veld] [--holdout-vd-odd] [--vd-sigma M_S]
+marv-replay <log.BIN> <outdir> [--every N] [--imu-period-us US] [--mag-expected UT,INC_DEG,STR_PCT,TOL_DEG] [--noaid-sigma M] [--no-baro-from-armed N] [--gps-delay-ms MS] [--gps-min-rate-hz HZ] [--no-mag] [--nki] [--steering mahony-baro|eskf2|eskf3] [--veld] [--holdout-vd-odd] [--vd-sigma M_S] [--notch] [--notch-harmonics 1|3] [--notch-fs HZ]
 
 Replays a flight log through the flight code's estimators (the real Rust code, Tuning::DEFAULT) and prints a
 validation table against the log's own NAV and NKF1 records. One CSV per estimator goes into <outdir>
@@ -27,6 +28,15 @@ Baro, compass and GNSS samples (GNSS from GPS + GPA + GPV; GPA gives only sqrt(l
 the lat and lon deviations) go to the first step whose IMU time is >= their own, the newest only. The armed state is
 MOT.Arm. The compass's expected field comes from the log's PARM records (MAG_CAL_TYPE, MAG_FLD_UT, MAG_FLD_INC,
 MAG_HLT_STR, MAG_HLT_INC); only a log without MAG_CAL_TYPE uses --mag-expected. The source is printed.
+
+--notch: no estimator runs. The log's NAV rates (GX, GY, GZ, the measured rate of the rate loop) and the ESC eRPM (each
+ESC record held until the next, an eRPM 100 ms or more older than the step counts as missing; f1 = eRPM x 2 / (14 x 60))
+go through the firmware's own CascadedPid (Tuning::DEFAULT, sample rate 803.86 Hz): once with the notch off, once on,
+and once on with every eRPM withheld (negative control: its rates must equal the input bit for bit). Writes
+<outdir>/notch_h<N>.csv (every NAV step) and prints, for the two hover windows of t292-notch.py, the rms of the D torque
+above 50 Hz (Welch, Hann, 2048 samples, 50 % overlap, mean removed, 803.86 Hz) on X and Y. --notch-harmonics 1|3 sets
+Tuning::notch_harmonics (default 3, as built). --notch-fs HZ is the sample rate the controller is built for
+(default 800.0 = 1e6 / 1250 us, the board's configured IMU1 period); the metric always uses the measured 803.86 Hz.
 ";
 
 /// When the estimator is told the armed state: the steering estimator gets the gate's state after the previous step
@@ -146,6 +156,12 @@ struct Args {
     holdout_vd_odd: bool,
     /// `--vd-sigma M_S`: replaces `Tuning::nav_gps_vd_sigma_ms` for the `eskf2vd` row only.
     vd_sigma: Option<f32>,
+    /// `--notch`: replay the log's NAV rates and ESC eRPM through the firmware's notch and D path (no estimators).
+    notch: bool,
+    /// `--notch-harmonics N`: `Tuning::notch_harmonics` for `--notch` (1 or 3).
+    notch_harmonics: usize,
+    /// `--notch-fs HZ`: the `fs_hz` of `CascadedPid::new` for `--notch` (default 800.0, the board's).
+    notch_fs: f32,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -158,6 +174,7 @@ fn parse_args() -> Result<Args, String> {
     let mut steer_eskf3 = false;
     let (mut veld, mut holdout_vd_odd) = (false, false);
     let mut vd_sigma = None;
+    let (mut notch, mut notch_harmonics, mut notch_fs) = (false, 3usize, 800.0f32);
     let mut opts = StreamOpts { imu_period_us: None, expected_cli: None };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -183,6 +200,9 @@ fn parse_args() -> Result<Args, String> {
             "--veld" => veld = true,
             "--holdout-vd-odd" => holdout_vd_odd = true,
             "--vd-sigma" => vd_sigma = Some(it.next().and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite() && *v > 0.0).ok_or("--vd-sigma M_S")?),
+            "--notch" => notch = true,
+            "--notch-harmonics" => notch_harmonics = it.next().and_then(|v| v.parse::<usize>().ok()).filter(|v| [1, 3].contains(v)).ok_or("--notch-harmonics 1|3")?,
+            "--notch-fs" => notch_fs = it.next().and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite() && *v > 0.0).ok_or("--notch-fs HZ")?,
             "--steering" => match it.next().as_deref() {
                 Some("eskf2") => steering = Some(true),
                 Some("mahony-baro") => steering = Some(false),
@@ -207,7 +227,7 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     let [log, out]: [String; 2] = pos.try_into().map_err(|_| "usage: marv-replay <log.BIN> <outdir> [options]; --help")?;
-    Ok(Args { log: log.into(), out: out.into(), every, opts, noaid, no_baro_from_armed, gps_delay_ms, gps_min_rate_hz, no_mag, nki, steering, steer_eskf3, veld, holdout_vd_odd, vd_sigma })
+    Ok(Args { log: log.into(), out: out.into(), every, opts, noaid, no_baro_from_armed, gps_delay_ms, gps_min_rate_hz, no_mag, nki, steering, steer_eskf3, veld, holdout_vd_odd, vd_sigma, notch, notch_harmonics, notch_fs })
 }
 
 fn bits(v: &Valid) -> [u8; 7] {
@@ -384,6 +404,211 @@ fn report(c: &Comparison, iv: &[(u64, u64)], settle: bool) -> String {
     out
 }
 
+/// `--notch`: the sample rate of the D-torque metric, Hz: the 803.86 Hz of t292-notch.py (the log's measured IMU1 step is 1244 us).
+const METRIC_FS_HZ: f32 = 803.86;
+/// `--notch`: the hover windows of t292-notch.py, s: name, from, to, and its what-if figures (D torque above 50 Hz, N.m,
+/// X and Y) from t292-notch.out: without the notch, h1 only (no fade, minimum 60 Hz), h1-h3 (no fade, minimum 60 Hz).
+const NOTCH_WINDOWS: [(&str, f64, f64, [[f64; 2]; 3]); 2] = [
+    ("Pos hover", 753.0, 825.0, [[0.0155, 0.0215], [0.0061, 0.0099], [0.0044, 0.0072]]),
+    ("Alt hover", 398.0, 412.5, [[0.0149, 0.0227], [0.0052, 0.0073], [0.0037, 0.0057]]),
+];
+
+/// In-place radix-2 FFT of `re` + i `im` (length a power of 2).
+fn fft(re: &mut [f64], im: &mut [f64]) {
+    let n = re.len();
+    let mut j = 0;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j |= bit;
+        if i < j {
+            re.swap(i, j);
+            im.swap(i, j);
+        }
+    }
+    let mut len = 2;
+    while len <= n {
+        let ang = -2.0 * std::f64::consts::PI / len as f64;
+        for s in (0..n).step_by(len) {
+            for k in 0..len / 2 {
+                let (wr, wi) = ((ang * k as f64).cos(), (ang * k as f64).sin());
+                let (a, b) = (s + k, s + k + len / 2);
+                let (tr, ti) = (re[b] * wr - im[b] * wi, re[b] * wi + im[b] * wr);
+                re[b] = re[a] - tr;
+                im[b] = im[a] - ti;
+                re[a] += tr;
+                im[a] += ti;
+            }
+        }
+        len <<= 1;
+    }
+}
+
+/// The rms of `x` above `lo_hz`, as t292-notch.py `hf`: `scipy.signal.welch(x - mean(x), fs, nperseg=2048)` (Hann, 50 %
+/// overlap, constant detrend per segment, one-sided density, the DC and Nyquist bins not doubled), then
+/// sqrt(sum of the density over the bins at or above `lo_hz` x the bin width).
+fn hf_rms(x: &[f32], fs: f64, lo_hz: f64) -> Result<f64, String> {
+    const N: usize = 2048;
+    const HOP: usize = N / 2;
+    if x.len() < N {
+        return Err(format!("window of {} samples is shorter than one 2048-sample segment", x.len()));
+    }
+    let mean = x.iter().map(|&v| f64::from(v)).sum::<f64>() / x.len() as f64;
+    let win: Vec<f64> = (0..N).map(|j| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * j as f64 / N as f64).cos()).collect();
+    let scale = 1.0 / (fs * win.iter().map(|w| w * w).sum::<f64>());
+    let nseg = (x.len() - HOP) / HOP;
+    let mut acc = vec![0.0f64; N / 2 + 1];
+    for s in 0..nseg {
+        let seg: Vec<f64> = x[s * HOP..s * HOP + N].iter().map(|&v| f64::from(v) - mean).collect();
+        let m = seg.iter().sum::<f64>() / N as f64;
+        let mut re: Vec<f64> = seg.iter().zip(&win).map(|(v, w)| (v - m) * w).collect();
+        let mut im = vec![0.0; N];
+        fft(&mut re, &mut im);
+        for (k, a) in acc.iter_mut().enumerate() {
+            *a += re[k] * re[k] + im[k] * im[k];
+        }
+    }
+    let df = fs / N as f64;
+    let mut sum = 0.0;
+    for (k, a) in acc.iter().enumerate() {
+        if k as f64 * df >= lo_hz {
+            let dbl = if k == 0 || k == N / 2 { 1.0 } else { 2.0 };
+            sum += a / nseg as f64 * scale * dbl;
+        }
+    }
+    Ok((sum * df).sqrt())
+}
+
+/// What one pass of the rate loop left for one NAV step.
+#[derive(Clone, Copy)]
+struct Pass {
+    rate: [f32; 3],
+    d: [f32; 3],
+}
+
+/// `--notch`: the log's NAV rates and ESC eRPM through the firmware's `CascadedPid` (the notch, the rate error and the D
+/// path), as `Flight::step` drives it: `reset` when the gate was disarmed at the start of the step, then `set_rotor_hz`,
+/// then `update`. Three controllers see the same steps: notch off, notch on, notch on with every eRPM withheld.
+fn notch_replay(log: &Log, args: &Args) -> Result<(), String> {
+    let nav = log.table("NAV")?;
+    let (cgx, cgy, cgz) = (nav.col("GX")?, nav.col("GY")?, nav.col("GZ")?);
+    let mot = log.table("MOT")?;
+    let carm = mot.col("Arm")?;
+    let esc = log.table("ESC")?;
+    let ce = [esc.col("E0")?, esc.col("E1")?, esc.col("E2")?, esc.col("E3")?];
+    if mot.rows() != nav.rows() || (0..nav.rows()).any(|k| mot.time(k) != nav.time(k)) {
+        return Err("NAV and MOT records are not one per step with the same TimeUS".into());
+    }
+    let mut tuning = Tuning::DEFAULT;
+    tuning.notch_harmonics = args.notch_harmonics;
+    let poles = 14.0f32; // MOT_POLES default (step.rs NOTCH_POLES_DEFAULT)
+    let sat = Saturation { roll: false, pitch: false, yaw: false, thrust_low: false, thrust_high: false };
+    let mut off = CascadedPid::new(&tuning, args.notch_fs);
+    let mut on = CascadedPid::new(&tuning, args.notch_fs);
+    let mut ctl = CascadedPid::new(&tuning, args.notch_fs);
+    let n = nav.rows();
+    let (mut p_off, mut p_on, mut p_ctl) = (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+    let mut f1_used = Vec::with_capacity(n);
+    let mut input = Vec::with_capacity(n);
+    let mut j = 0usize; // newest ESC record with TimeUS <= the step's
+    let (mut armed_steps, mut armed_all4) = (0usize, 0usize);
+    for k in 0..n {
+        let t = nav.time(k);
+        while j + 1 < esc.rows() && esc.time(j + 1) <= t {
+            j += 1;
+        }
+        let f1: [Option<f32>; 4] = std::array::from_fn(|l| {
+            if esc.time(j) > t || t - esc.time(j) >= tuning.notch_hold_us {
+                return None;
+            }
+            Some(esc.u32(j, ce[l]) as f32 * 2.0 / (poles * 60.0))
+        });
+        let rates = [nav.f32(k, cgx), nav.f32(k, cgy), nav.f32(k, cgz)];
+        let n_state = NavState {
+            t_us: t,
+            attitude: [1.0, 0.0, 0.0, 0.0],
+            rates_rads: rates,
+            velocity_ms: [0.0; 3],
+            position_m: [0.0; 3],
+            valid: Valid { tilt: true, rates: true, ..Valid::NONE },
+            sigma: None,
+        };
+        let sp = Setpoint::Rates { rates_rads: [0.0; 3], thrust_n: marv_card::MASS * fw_core::calib::GRAVITY_MSS };
+        let armed_before = k > 0 && mot.u8(k - 1, carm) != 0;
+        let one = |c: &mut CascadedPid, f: [Option<f32>; 4], sw: bool| -> Result<Pass, String> {
+            if !armed_before {
+                c.reset();
+            }
+            c.set_rotor_hz(f, sw);
+            c.update(&n_state, &sp, &sat).map_err(|_| format!("step {k}: the controller refused a rate setpoint"))?;
+            let l = c.rate_log();
+            Ok(Pass { rate: l.rate_rads, d: l.d_nm })
+        };
+        p_off.push(one(&mut off, f1, false)?);
+        p_on.push(one(&mut on, f1, true)?);
+        p_ctl.push(one(&mut ctl, [None; 4], true)?);
+        f1_used.push(f1.map(|f| f.unwrap_or(0.0)));
+        input.push(rates);
+        if mot.u8(k, carm) != 0 {
+            armed_steps += 1;
+            armed_all4 += usize::from(f1.iter().all(Option::is_some));
+        }
+    }
+    println!("notch replay: {n} NAV steps ({armed_steps} armed, of which {armed_all4} with all four eRPM usable), harmonics {}, controller fs {} Hz, Tuning::DEFAULT otherwise", tuning.notch_harmonics, args.notch_fs);
+
+    // Negative control: every eRPM withheld -> the rates the loop used are the input, bit for bit, and the D torque is the
+    // notch-off one.
+    let (mut rate_diff, mut d_diff) = (0usize, 0usize);
+    for k in 0..n {
+        rate_diff += (0..3).filter(|&a| p_ctl[k].rate[a].to_bits() != input[k][a].to_bits()).count();
+        d_diff += (0..3).filter(|&a| p_ctl[k].d[a].to_bits() != p_off[k].d[a].to_bits()).count();
+    }
+    println!(
+        "negative control (notch on, every eRPM withheld): rates differing from the input bit for bit: {rate_diff} of {} values; D torque differing from notch-off: {d_diff} of {}: {}",
+        3 * n,
+        3 * n,
+        if rate_diff == 0 && d_diff == 0 { "PASS" } else { "FAIL" }
+    );
+    let off_diff = (0..n).flat_map(|k| (0..3).map(move |a| (k, a))).filter(|&(k, a)| p_off[k].rate[a].to_bits() != input[k][a].to_bits()).count();
+    println!("notch off: rates differing from the input bit for bit: {off_diff} of {} values", 3 * n);
+
+    let path = args.out.join(format!("notch_h{}.csv", tuning.notch_harmonics));
+    let mut w = std::io::BufWriter::new(std::fs::File::create(&path).map_err(|e| format!("{}: {e}", path.display()))?);
+    writeln!(w, "t_us,armed,f1_0,f1_1,f1_2,f1_3,gx_in,gy_in,gz_in,gx_off,gy_off,gz_off,gx_on,gy_on,gz_on,dx_off,dy_off,dz_off,dx_on,dy_on,dz_on").map_err(|e| e.to_string())?;
+    for k in 0..n {
+        let mut l = format!("{},{}", nav.time(k), mot.u8(k, carm));
+        for v in f1_used[k].iter().chain(&input[k]).chain(&p_off[k].rate).chain(&p_on[k].rate).chain(&p_off[k].d).chain(&p_on[k].d) {
+            let _ = write!(l, ",{v}");
+        }
+        writeln!(w, "{l}").map_err(|e| e.to_string())?;
+    }
+    w.flush().map_err(|e| e.to_string())?;
+    println!("wrote {}", path.display());
+
+    println!("\nD torque above 50 Hz (rms of the Welch density from 50 Hz up, N.m; Hann, 2048 samples, 50 % overlap, mean removed, {METRIC_FS_HZ} Hz); what-if = t292-notch.out");
+    println!("  {:<10} {:>26} {:>12} {:>12} {:>9}  {:>12} {:>12}", "window", "case", "X", "Y", "cut X/Y %", "what-if X", "what-if Y");
+    let fs = f64::from(METRIC_FS_HZ);
+    for (name, a, b, whatif) in NOTCH_WINDOWS {
+        let sel: Vec<usize> = (0..n).filter(|&k| nav.time(k) as f64 * 1e-6 >= a && (nav.time(k) as f64 * 1e-6) < b).collect();
+        let hf = |p: &[Pass], axis: usize| hf_rms(&sel.iter().map(|&k| p[k].d[axis]).collect::<Vec<f32>>(), fs, 50.0);
+        let base = [hf(&p_off, 0)?, hf(&p_off, 1)?];
+        let withh = [hf(&p_on, 0)?, hf(&p_on, 1)?];
+        let cut = |i: usize| 100.0 * (1.0 - withh[i] / base[i]);
+        let h_label = if tuning.notch_harmonics == 1 { "notch h1" } else { "notch h1-h3" };
+        let w_idx = if tuning.notch_harmonics == 1 { 1 } else { 2 };
+        println!("  {:<10} {:>26} {:>12.4} {:>12.4} {:>9}  {:>12.4} {:>12.4}   ({} samples)", name, "no notch", base[0], base[1], "", whatif[0][0], whatif[0][1], sel.len());
+        println!(
+            "  {:<10} {:>26} {:>12.4} {:>12.4} {:>4.1}/{:<4.1}  {:>12.4} {:>12.4}   what-if cut {:.1}/{:.1} %",
+            name, h_label, withh[0], withh[1], cut(0), cut(1), whatif[w_idx][0], whatif[w_idx][1],
+            100.0 * (1.0 - whatif[w_idx][0] / whatif[0][0]), 100.0 * (1.0 - whatif[w_idx][1] / whatif[0][1])
+        );
+    }
+    Ok(())
+}
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("marv-replay: {e}");
@@ -397,6 +622,9 @@ fn run() -> Result<(), String> {
     let log = Log::parse(&bytes)?;
     drop(bytes);
     std::fs::create_dir_all(&args.out).map_err(|e| format!("{}: {e}", args.out.display()))?;
+    if args.notch {
+        return notch_replay(&log, &args);
+    }
     let mut stream = build_stream(&log, &args.opts)?;
     if let Some(n) = args.no_baro_from_armed {
         let (mut seen, mut prev, mut from) = (0usize, false, None);
