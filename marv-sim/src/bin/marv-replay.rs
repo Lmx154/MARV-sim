@@ -7,7 +7,7 @@ use fw_flight::gnc::{Controller, Estimator, NavState, Saturation, Setpoint, Vali
 use fw_flight::mahony::Mahony;
 use fw_flight::mahony_baro::MahonyBaro;
 use fw_flight::pid::CascadedPid;
-use fw_flight::tuning::Tuning;
+use fw_flight::tuning::{GAIN_NAMES, Gains, Tuning};
 use marv_sim::replay::{ExpectedFrom, Log, Stream, StreamOpts, Table, build_stream};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -489,6 +489,27 @@ struct Pass {
     d: [f32; 3],
 }
 
+/// The log's ATC_* gain PARM records as (TimeUS, the 14 gains in force after it): each record changes its gain on top of the
+/// previous set (the defaults at the start). `None` when the log has no PARM record of any of the 14. A value outside
+/// `Gains::MIN`..`Gains::MAX` is an error.
+fn parm_gains(log: &Log) -> Result<Option<Vec<(u64, Gains)>>, String> {
+    let Ok(t) = log.table("PARM") else { return Ok(None) };
+    let (cn, cv) = (t.col("Name")?, t.col("Value")?);
+    let mut g = Gains::of(&Tuning::DEFAULT);
+    let mut ev = Vec::new();
+    for r in 0..t.rows() {
+        let name = t.text(r, cn);
+        let Some(i) = GAIN_NAMES.iter().position(|n| *n == name) else { continue };
+        let v = t.f32(r, cv);
+        if !(Gains::MIN.0[i]..=Gains::MAX.0[i]).contains(&v) {
+            return Err(format!("PARM {name} = {v} at {} us is outside {} to {}", t.time(r), Gains::MIN.0[i], Gains::MAX.0[i]));
+        }
+        g.0[i] = v;
+        ev.push((t.time(r), g));
+    }
+    Ok(if ev.is_empty() { None } else { Some(ev) })
+}
+
 /// `--notch`: the log's NAV rates and ESC eRPM through the firmware's `CascadedPid` (the notch, the rate error and the D
 /// path), as `Flight::step` drives it: `reset` when the gate was disarmed at the start of the step, then `set_rotor_hz`,
 /// then `update`. Three controllers see the same steps: notch off, notch on, notch on with every eRPM withheld.
@@ -504,6 +525,14 @@ fn notch_replay(log: &Log, args: &Args) -> Result<(), String> {
     }
     let mut tuning = Tuning::DEFAULT;
     tuning.notch_harmonics = args.notch_harmonics;
+    // The gains in force: the newest ATC_* PARM at or before each arming (the board latches them on disarmed steps);
+    // Tuning::DEFAULT when the log carries none (log 292 and older).
+    let gain_events = parm_gains(log)?;
+    println!("gains source: {}", match &gain_events {
+        None => "Tuning::DEFAULT (the log has no ATC_* PARM records)".to_string(),
+        Some(ev) => format!("the log's PARM records ({} ATC_* records; a gain the log lacks stays at its default)", ev.len()),
+    });
+    let mut next_ev = 0usize;
     let poles = 14.0f32; // MOT_POLES default (step.rs NOTCH_POLES_DEFAULT)
     let sat = Saturation { roll: false, pitch: false, yaw: false, thrust_low: false, thrust_high: false };
     let mut off = CascadedPid::new(&tuning, args.notch_fs);
@@ -538,6 +567,16 @@ fn notch_replay(log: &Log, args: &Args) -> Result<(), String> {
         };
         let sp = Setpoint::Rates { rates_rads: [0.0; 3], thrust_n: marv_card::MASS * fw_core::calib::GRAVITY_MSS };
         let armed_before = k > 0 && mot.u8(k - 1, carm) != 0;
+        if let (Some(ev), false) = (&gain_events, armed_before) {
+            while next_ev < ev.len() && ev[next_ev].0 <= nav.time(k) {
+                next_ev += 1;
+            }
+            if next_ev > 0 {
+                for c in [&mut off, &mut on, &mut ctl] {
+                    c.set_gains(&ev[next_ev - 1].1);
+                }
+            }
+        }
         let one = |c: &mut CascadedPid, f: [Option<f32>; 4], sw: bool| -> Result<Pass, String> {
             if !armed_before {
                 c.reset();

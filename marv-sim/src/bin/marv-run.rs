@@ -18,7 +18,7 @@ use fw_flight::eskf_out::{EskfSteer, SteerMix};
 use fw_flight::mahony_baro::MahonyBaro;
 use fw_flight::pid::CascadedPid;
 use fw_flight::step::{Flight, FlightInputs, ModeLog, StepOut, log_due, mode_code};
-use fw_flight::tuning::Tuning;
+use fw_flight::tuning::{GAIN_NAMES, Gains, Tuning};
 use marv_card::{Card, Env};
 use marv_sim::log::Log;
 use marv_sim::pilot::{Ending, Pilot, PilotView};
@@ -64,9 +64,12 @@ const STREAM_IMU1: u64 = 1;
 const STREAM_IMU2: u64 = 2;
 
 const USAGE: &str = "usage: marv-run --card <marv.toml> --env <env.toml> --seed <u64> --scenario <file> --out <file.BIN> \
-[--point <kf_scale>,<inertia_scale>,<lag_s or ->] [--home <env/home.local.toml>] [--notch]
+[--point <kf_scale>,<inertia_scale>,<lag_s or ->] [--home <env/home.local.toml>] [--notch] [--params <file>]
        marv-run --card <marv.toml> --env <env.toml> [--seed <u64>] --spread <file> --out-dir <dir> \
-[--only <cell>] [--logs fail|all] [--home <env/home.local.toml>] [--notch]
+[--only <cell>] [--logs fail|all] [--home <env/home.local.toml>] [--notch] [--params <file>]
+--params <file>: the ground station's parameter file (NAME,VALUE per line, # comments); the 14 ATC_* gains in it reach the flight
+step through Flight::set_gains before arming, as on the board; others are ignored, missing gains keep their defaults; a gain
+out of range or not a number stops the run; the summary lists the gains that differ from Tuning::DEFAULT.
 (--seed is given exactly when the spread file has no seeds axis)
 Either form takes --shadow mahony-baro or --shadow eskf: that estimator runs in the shadow slot and one `shadow` line
 reports it, and --preroll <seconds> (air-start scenarios only, not a ground start: that has its own ground phase; the
@@ -92,6 +95,66 @@ static GDN_TARGETS: std::sync::Mutex<Vec<[f64; 2]>> = std::sync::Mutex::new(Vec:
 static GDN_RADIUS: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
 /// The sim world's origin (the env's), set by `run_one` when targets are given, for the `gdn` line.
 static GDN_SIM_ORIGIN: std::sync::OnceLock<Origin> = std::sync::OnceLock::new();
+
+/// `--params <file>`: the 14 gains the file gives (the defaults for those it lacks).
+static PARAM_GAINS: std::sync::OnceLock<Gains> = std::sync::OnceLock::new();
+
+/// The station's parameter file (`gcs-mavlink` param_file.rs `parse`): one `NAME,VALUE` per line, `#` starts a comment,
+/// blank lines skipped, an optional BOM, name up to 16 characters ended by a comma or whitespace, the value a finite f64.
+fn parse_param_file(text: &str) -> Result<Vec<(String, f64)>, String> {
+    let mut entries = Vec::new();
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    for (number, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let at = |m: String| format!("line {}: {m}", number + 1);
+        let name_end = line.find(|c: char| c == ',' || c.is_whitespace()).unwrap_or(line.len());
+        let (name, rest) = line.split_at(name_end);
+        if name.is_empty() {
+            return Err(at("no parameter name".to_owned()));
+        }
+        if name.len() > 16 {
+            return Err(at(format!("name {name} is longer than 16 characters")));
+        }
+        let rest = rest.trim_start();
+        let rest = rest.strip_prefix(',').unwrap_or(rest).trim();
+        if rest.is_empty() {
+            return Err(at(format!("no value for {name}")));
+        }
+        match rest.parse::<f64>() {
+            Ok(value) if value.is_finite() => entries.push((name.to_owned(), value)),
+            _ => return Err(at(format!("{rest} is not a number"))),
+        }
+    }
+    Ok(entries)
+}
+
+/// The gains a parameter file gives: the defaults, with the ATC_* gains of the file (the last line of a name wins) in place.
+/// A value that is not an f32 or is outside `Gains::MIN`..`Gains::MAX` is an error naming the parameter.
+fn gains_from_param_file(text: &str) -> Result<Gains, String> {
+    let mut g = Gains::of(&Tuning::DEFAULT);
+    for (name, number) in parse_param_file(text)? {
+        let Some(i) = GAIN_NAMES.iter().position(|n| *n == name) else { continue };
+        let v = number as f32;
+        if !v.is_finite() || !(Gains::MIN.0[i]..=Gains::MAX.0[i]).contains(&v) {
+            return Err(format!("{name}: {number} is outside {} to {}", Gains::MIN.0[i], Gains::MAX.0[i]));
+        }
+        g.0[i] = v;
+    }
+    Ok(g)
+}
+
+/// Hands `PARAM_GAINS` (if given) to the flight step, as the board does before arming.
+fn apply_param_gains<E: Estimator, C: Controller, A: Allocator>(mut flight: Flight<E, C, A>) -> Result<Flight<E, C, A>, String> {
+    if let Some(g) = PARAM_GAINS.get() {
+        if !flight.set_gains(*g) {
+            return Err("--params: Flight::set_gains refused the gains".to_string());
+        }
+    }
+    Ok(flight)
+}
 
 static TUNING_OVERRIDE: std::sync::Mutex<Vec<(String, f32)>> = std::sync::Mutex::new(Vec::new());
 
@@ -171,6 +234,11 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
             "--shadow" if value == "mahony-baro" => shadow = Some(ShadowKind::MahonyBaro),
             "--shadow" if value == "eskf" => shadow = Some(ShadowKind::Eskf),
             "--shadow" => return Err(format!("--shadow: {value} is not mahony-baro or eskf")),
+            "--params" => {
+                let text = std::fs::read_to_string(value).map_err(|e| format!("--params {value}: {e}"))?;
+                let g = gains_from_param_file(&text).map_err(|e| format!("--params {value}: {e}"))?;
+                let _ = PARAM_GAINS.set(g);
+            }
             "--noaid-sigma" => {
                 let v = value.parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0).ok_or(format!("--noaid-sigma: {value} is not a positive number"))?;
                 let _ = NOAID_SIGMA.set(v);
@@ -1534,6 +1602,7 @@ every row's time is scenario time (the flight code's clock was scenario time + {
     let (ran, flight_steps, mut trace) = match steer_cfg {
         None | Some(SteerCfg { est: EstKind::Mahony, .. }) => {
             let flight = Flight::new(Mahony::new(&tuning), CascadedPid::new(&tuning, IMU_RATE_HZ), CardAllocator::new(), &tuning, handshake);
+            let flight = apply_param_gains(flight)?;
             run(flight, &mut world, scenario, pilot.as_mut(), ticks, &mut log, shadow.as_deref_mut(), steer.as_mut(), preroll.unwrap_or(0))
         }
         Some(SteerCfg { est: EstKind::Eskf3 }) => {
@@ -1545,6 +1614,7 @@ every row's time is scenario time (the flight code's clock was scenario time + {
             let h = EskfSteer::new(core, &t).map_err(|e| format!("EskfSteer: {e:?}"))?;
             let est = Mix3 { mix: SteerMix::new(h, vert), info: info3.clone() };
             let flight = Flight::new(est, CascadedPid::new(&tuning, IMU_RATE_HZ), CardAllocator::new(), &tuning, handshake);
+            let flight = apply_param_gains(flight)?;
             run(flight, &mut world, scenario, pilot.as_mut(), ticks, &mut log, shadow.as_deref_mut(), steer.as_mut(), preroll.unwrap_or(0))
         }
         Some(cfg) => {
@@ -1555,6 +1625,7 @@ every row's time is scenario time (the flight code's clock was scenario time + {
             let eskf = Eskf::with_aiding(&t, aiding).map_err(|e| format!("Eskf: {e:?}"))?;
             let est = Steering { eskf, info: info.clone() };
             let flight = Flight::new(est, CascadedPid::new(&tuning, IMU_RATE_HZ), CardAllocator::new(), &tuning, handshake);
+            let flight = apply_param_gains(flight)?;
             run(flight, &mut world, scenario, pilot.as_mut(), ticks, &mut log, shadow.as_deref_mut(), steer.as_mut(), preroll.unwrap_or(0))
         }
     };
@@ -1590,6 +1661,12 @@ vh_ms {:.4} vz_ms {:.4}",
                 d.velocity_ms[0].hypot(d.velocity_ms[1]), d.velocity_ms[2]));
         }
     }
+    let gains_line = PARAM_GAINS.get().map(|g| {
+        let d = Gains::of(&Tuning::DEFAULT);
+        let diff: Vec<String> = (0..GAIN_NAMES.len()).filter(|&i| g.0[i].to_bits() != d.0[i].to_bits())
+            .map(|i| format!("{} {} (default {})", GAIN_NAMES[i], g.0[i], d.0[i])).collect();
+        if diff.is_empty() { "gains         from --params: all 14 at the defaults".to_string() } else { format!("gains         from --params, differing from the defaults: {}", diff.join(", ")) }
+    });
     let kept = keep || checks.iter().any(|c| !c.pass);
     if kept {
         log.write(out)?;
@@ -1609,6 +1686,7 @@ vh_ms {:.4} vz_ms {:.4}",
         format!("final velocity NED {:.4?} m/s", last.velocity_ms),
         if kept { format!("log           {}", out.display()) } else { "log           not kept (every check passed)".to_string() },
     ];
+    summary.extend(gains_line);
     if let Some(p) = &pilot {
         summary.push(format!("records       GND {}, PIL {}", c.gnd, c.pil));
         summary.push(format!("pilot         full collective / m g = {:.4} (nominal card)", p.full_ratio()));
