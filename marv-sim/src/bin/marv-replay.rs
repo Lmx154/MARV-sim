@@ -14,7 +14,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 const HELP: &str = "\
-marv-replay <log.BIN> <outdir> [--every N] [--imu-period-us US] [--mag-expected UT,INC_DEG,STR_PCT,TOL_DEG] [--noaid-sigma M] [--no-baro-from-armed N] [--gps-delay-ms MS] [--gps-min-rate-hz HZ] [--no-mag] [--nki] [--steering mahony-baro|eskf2|eskf3]
+marv-replay <log.BIN> <outdir> [--every N] [--imu-period-us US] [--mag-expected UT,INC_DEG,STR_PCT,TOL_DEG] [--noaid-sigma M] [--no-baro-from-armed N] [--gps-delay-ms MS] [--gps-min-rate-hz HZ] [--no-mag] [--nki] [--steering mahony-baro|eskf2|eskf3] [--veld] [--holdout-vd-odd]
 
 Replays a flight log through the flight code's estimators (the real Rust code, Tuning::DEFAULT) and prints a
 validation table against the log's own NAV and NKF1 records. One CSV per estimator goes into <outdir>
@@ -140,6 +140,10 @@ struct Args {
     /// `--steering eskf3`: eskf3out is the steering estimator of the log (armed state after the previous step). No flown log
     /// has it yet; the old rows' steering is then read from the log as without the option.
     steer_eskf3: bool,
+    /// `--veld`: also run `eskf2vd`, ESKF2 with the GPS VelD option (`Eskf::with_gps_vd`, Amendment V), armed as eskf2.
+    veld: bool,
+    /// `--holdout-vd-odd`: the `eskf2vd` row is handed the odd GNSS epochs (`seq` odd) without a velocity; no other row sees a difference.
+    holdout_vd_odd: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -150,6 +154,7 @@ fn parse_args() -> Result<Args, String> {
     let (mut gps_delay_ms, mut gps_min_rate_hz, mut no_mag, mut nki) = (None, None, false, false);
     let mut steering = None;
     let mut steer_eskf3 = false;
+    let (mut veld, mut holdout_vd_odd) = (false, false);
     let mut opts = StreamOpts { imu_period_us: None, expected_cli: None };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -172,6 +177,8 @@ fn parse_args() -> Result<Args, String> {
             }
             "--no-mag" => no_mag = true,
             "--nki" => nki = true,
+            "--veld" => veld = true,
+            "--holdout-vd-odd" => holdout_vd_odd = true,
             "--steering" => match it.next().as_deref() {
                 Some("eskf2") => steering = Some(true),
                 Some("mahony-baro") => steering = Some(false),
@@ -196,7 +203,7 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     let [log, out]: [String; 2] = pos.try_into().map_err(|_| "usage: marv-replay <log.BIN> <outdir> [options]; --help")?;
-    Ok(Args { log: log.into(), out: out.into(), every, opts, noaid, no_baro_from_armed, gps_delay_ms, gps_min_rate_hz, no_mag, nki, steering, steer_eskf3 })
+    Ok(Args { log: log.into(), out: out.into(), every, opts, noaid, no_baro_from_armed, gps_delay_ms, gps_min_rate_hz, no_mag, nki, steering, steer_eskf3, veld, holdout_vd_odd })
 }
 
 fn bits(v: &Valid) -> [u8; 7] {
@@ -470,6 +477,10 @@ fn run() -> Result<(), String> {
     };
     println!("steering estimator: {} ({why})", if steer { "eskf2" } else { "mahony-baro" });
     let mut rows = table(&tuning, steer, args.steer_eskf3);
+    if args.veld {
+        let at = if steer { ArmedAt::Before } else { ArmedAt::After };
+        rows.push(row("eskf2vd", at, Box::new(Eskf::with_gps_vd(&tuning).expect("Tuning::DEFAULT is accepted"))));
+    }
     for r in &mut rows {
         r.nav.reserve(stream.steps.len());
     }
@@ -477,7 +488,13 @@ fn run() -> Result<(), String> {
     for s in &stream.steps {
         for r in &mut rows {
             r.est.set_armed(if r.armed_at == ArmedAt::Before { prev_armed } else { s.armed });
-            r.nav.push(r.est.update(&s.sensors));
+            let mut held = None;
+            if args.holdout_vd_odd && r.name == "eskf2vd" && s.sensors.gnss.is_some_and(|g| g.seq % 2 == 1) {
+                let mut h = s.sensors.clone();
+                h.gnss.as_mut().map(|g| g.reading.vel_ned_mm_s = None);
+                held = Some(h);
+            }
+            r.nav.push(r.est.update(held.as_ref().unwrap_or(&s.sensors)));
             if let Some(x) = r.est.extras() {
                 r.extra.push(x);
             }
