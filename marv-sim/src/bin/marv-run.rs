@@ -1333,6 +1333,10 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
     // The barometer model's drift when the flight code is first given a barometer sample (the pre-roll's included).
     let mut drift0: Option<f64> = None;
     let mut mode_log = ModeLog::new();
+    // N2 plumbing state.
+    MSN.with(|m| *m.borrow_mut() = MsnRec::default());
+    let mut msvc = fw_core::mission::MissionService::new();
+    let (mut mission_done, mut plan_in, mut hb_last, mut cmd_next, mut armed_prev) = (false, None, None, 0usize, false);
     let mut gdn = GdnShadow::from_args();
     let mut flight_steps: u64 = 0;
     let mut ran = 0;
@@ -1505,7 +1509,48 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
                 flight.set_last_radio_status_us(Some(newest + off));
             }
             TRUTH_YAW.store(yaw_of(truth.attitude).to_bits(), std::sync::atomic::Ordering::Relaxed);
+            if let Some(m) = scenario.mission.as_ref().filter(|m| !mission_done && truth.t_us >= m.at_us) {
+                mission_done = true;
+                let origin = GDN_SIM_ORIGIN.get().expect("sim origin for the mission");
+                let (ack, g) = upload(&mut msvc, m, sensors_f.imu1.t_us, armed_prev, origin);
+                plan_in = fw_flight::station::plan_id_of(if msvc.count() == 0 { 0 } else { msvc.plan_id() });
+                MSN.with(|r| r.borrow_mut().upload = Some((truth.t_us, ack, msvc.count(), msvc.plan_id(), g.count,
+                    g.alts_m[..usize::from(g.count)].to_vec(), g.return_m)));
+            }
+            if scenario.mission.is_some() {
+                flight.set_plan_id(plan_in);
+            }
+            if let Some((a, b)) = scenario.station_hb {
+                if truth.t_us >= a && truth.t_us < b {
+                    hb_last = Some(sensors_f.imu1.t_us);
+                }
+                flight.set_last_radio_heartbeat_us(hb_last);
+            }
+            let mut cmd_now: Option<&'static str> = None;
+            if let Some(c) = scenario.commands.get(cmd_next).filter(|c| truth.t_us >= c.0) {
+                use fw_flight::hands_off::{Command, Link as CLink, StationCommand};
+                cmd_next += 1;
+                let (name, command) = match c.1.as_str() {
+                    "start" => ("start", Command::Start),
+                    "pause" => ("pause", Command::Pause),
+                    "abort" => ("abort", Command::Abort),
+                    "land" => ("land", Command::Land),
+                    _ => ("return", Command::Return),
+                };
+                flight.set_command(StationCommand { command, link: if c.2 { CLink::Radio } else { CLink::Usb } });
+                cmd_now = Some(name);
+            }
             let out_f = flight.step(&FlightInputs { sensors: sensors_f, rc: pending.take(), erpm: erpm_lines(world.plant.rotor_speeds(), sensors_f.imu1.t_us) });
+            armed_prev = out_f.armed;
+            if let Some(name) = cmd_now {
+                use fw_flight::hands_off::CommandResult;
+                let r = match flight.take_command_result() {
+                    Some(CommandResult::Accepted) => "accepted".to_string(),
+                    Some(CommandResult::Denied(why)) => format!("denied:{}:{:?}", why.code(), why),
+                    None => "no-answer".to_string(),
+                };
+                MSN.with(|m| m.borrow_mut().cmds.push((truth.t_us, name, r)));
+            }
             let anchor = flight.sim_anchor();
             if flag(&X_INF) {
                 flight.sim_clear_track_error();
@@ -1514,7 +1559,8 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
                 x_m: fw_flight::hands_off::track_fault_m(flight.speed_xy_in_force()), vne: out_f.nav.valid.velocity_ne,
                 pne: out_f.nav.valid.position_ne, nav_v: [out_f.nav.velocity_ms[0], out_f.nav.velocity_ms[1]],
                 gated: GATED_STEP.swap(0, std::sync::atomic::Ordering::Relaxed),
-                coll_n: out_f.demand.map_or(f32::NAN, |d| d.thrust_n), hover: flight.sim_hover(), m_bit: flight.radio_status_seen() });
+                coll_n: out_f.demand.map_or(f32::NAN, |d| d.thrust_n), hover: flight.sim_hover(), m_bit: flight.radio_status_seen(),
+                crash: flight.crash_would_fire(), td: flight.sim_td() });
             let mut out = out_f;
             out.t_us -= off;
             out.nav.t_us -= off;
@@ -1587,6 +1633,42 @@ struct HoStep {
     coll_n: f32,
     hover: (f32, f32, bool, Option<f32>),
     m_bit: bool,
+    /// N2: crash rule K would fire after the step (shadow); Flight::sim_td (TD's held time us, the time needed, the low mark).
+    crash: bool,
+    td: (u64, u64, bool),
+}
+
+/// N2 plumbing, per run (one run per thread): the upload (time, the service's last answer, items committed, plan id, the
+/// GDN_SRC 1 target count, their heights, the return height) and every command (time, name, result).
+#[derive(Default)]
+struct MsnRec {
+    upload: Option<(u64, String, u8, u32, u8, Vec<f32>, f32)>,
+    cmds: Vec<(u64, &'static str, String)>,
+}
+
+thread_local! {
+    static MSN: RefCell<MsnRec> = RefCell::new(MsnRec::default());
+    /// `MARV_HO_DUMP2`: the per-step text of the latest ho_line (written by run_one).
+    static DUMP2: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// N2 plumbing: the list uploaded to fw_core's mission service on the radio link as the station does (MISSION_COUNT, then
+/// every MISSION_ITEM_INT in order: the waypoints, command 16, frame 3, at their geodetic points from the sim origin; the
+/// return item, command 20, at the origin), then the board's `push_gdn` choice with GDN_SRC 1 (`select_targets`).
+fn upload(svc: &mut fw_core::mission::MissionService, m: &marv_sim::scenario::Mission, now_us: u64, armed: bool, origin: &Origin)
+    -> (String, fw_core::mission::GdnTargets) {
+    use fw_core::mission::{Frame, Link as MLink, Rx, RxItem, select_targets};
+    let frame = |msg| Frame { link: MLink::Radio, src_system: 255, src_component: 190, target_system: 1, target_component: 1, msg };
+    let n = m.waypoints.len() + 1;
+    let mut last = svc.handle(now_us, armed, &frame(Rx::Count { count: n as u16, mission_type: 0 }));
+    for seq in 0..n {
+        let (w, command) = if seq + 1 < n { (m.waypoints[seq], 16) } else { ([0.0, 0.0, m.return_h], 20) };
+        let (x, y, _) = geo_from_ned(origin, [w[0], w[1], 0.0]);
+        let item = RxItem { seq: seq as u16, frame: 3, command, x, y, z_bits: (w[2] as f32).to_bits(), mission_type: 0 };
+        last = svc.handle(now_us, armed, &frame(Rx::ItemInt(item)));
+    }
+    let g = select_targets(1, 0, m.radius_m as f32, &[], svc.items(), svc.plan_id());
+    (format!("{:?}", last.map(|t| t.msg)).replace(' ', ""), g)
 }
 
 /// The `hands_off` verdict line (hands-off campaign). Times are scenario seconds. The hold point is the Position target at the
@@ -1800,7 +1882,7 @@ fn ho_line(scenario: &Scenario, trace: &Trace, ho: &[HoStep]) -> String {
     let mstop = trace.esc.iter().find(|e| e.0 >= t_from && e.1 == [0; 4]).map(|e| e.0);
     let mstop_after_contact = td.and_then(|t| trace.esc.iter().find(|e| e.0 >= t.t_us && e.1 == [0; 4]).map(|e| e.0 - t.t_us));
     let m_seen = (0..n).any(|k| ho[k].m_bit);
-    format!(
+    let base = format!(
         "hands_off hb {} xinf {} lost_s {} hold_s {} hp_off_m {} t_ref_s {} states {} tf_s {} land_s {} land_by {} blind_s {} td_s {} stop_s {} disarm_s {} \
 dt_tf_s {} dt_land_s {} d_tf_m {} d_land_m {} d_td_m {} d_stop_m {} d_max_m {} d_max_s {} d_hold_max_m {} trk_max_m {} hdg_drop_s {} ne_drop_s {} \
 e_land_deg {} h_land_m {} h_stop_m {} vz_stop_ms {} td_vz_ms {} td_vh_ms {} td_tilt_deg {} n_td {} liftoff_after_td {} mot_off {} armed_end {} d_end_m {} h_end_m {} e_hold_deg {} e_max_hold_deg {} hop_after_td_m {} r_walk_max_m {} r_moving_s {:.1} nav_gap_max_m {} \
@@ -1830,7 +1912,113 @@ dh5_m {} dh5_max_m {} dh5_min_m {} coll_min_1s_mg {} mstop_s {} h_mstop_m {} con
         num(dh5, 2), num(dh5_max, 2), num(dh5_min, 2), num(c1s_min, 3), opt(mstop), num(mstop.map(|t| h_at(k_of(t))), 2),
         num(mstop_after_contact.map(secs), 2), num(k_disarm.map(h_at), 2), m_seen,
         num(lost.map(|t| h_at(k_of(t))), 2), num(lost.map(|t| st[k_of(t)].truth_vel[2]), 2), num(k_land.map(|k| st[k].truth_vel[2]), 2)
-    )
+    );
+    format!("{base} {}", ho_extra(scenario, trace, ho, n, td.map(|t| t.t_us), k_stop, lost.or(k_land.map(|k| st[k].t_us))))
+}
+
+/// N2's fields after the `hands_off` line's: crash rule K (shadow) would-fire steps, in the air (true height > 0.3 m, not on
+/// the ground) and the first of each; after first ground contact (to STOP or the end): TD restarts (its held time back to 0
+/// while armed), drops of the idle-floor flag, the first floor step; TD's longest held time in the air; then the mission
+/// plumbing's fields when the scenario has a mission or commands. Fills DUMP2 (one row per step from 2 s before `t_dump`
+/// to 40 s after).
+fn ho_extra(scenario: &Scenario, trace: &Trace, ho: &[HoStep], n: usize, t_contact: Option<u64>, k_stop: Option<usize>, t_dump: Option<u64>) -> String {
+    let st = &trace.steps;
+    let secs = |t: u64| t as f64 * 1e-6;
+    let h = |k: usize| -st[k].truth_pos[2];
+    let at = |k: usize| format!("{:.3}@{:.2}m", secs(st[k].t_us), h(k));
+    let fire: Vec<usize> = (0..n).filter(|&k| ho[k].crash).collect();
+    let air: Vec<usize> = fire.iter().copied().filter(|&k| h(k) > 0.3 && !st[k].on_ground).collect();
+    let floor = |k: usize| st[k].flags.is_some_and(|f| f & 8 != 0);
+    let kc = t_contact.map(|t| st[..n].partition_point(|p| p.t_us < t).min(n - 1));
+    let (mut restarts, mut drops) = (0usize, 0usize);
+    let mut floor_first = None;
+    if let Some(kc) = kc {
+        let end = k_stop.filter(|&s| s > kc).unwrap_or(n);
+        for k in kc + 1..end {
+            restarts += usize::from(ho[k - 1].td.0 > 0 && ho[k].td.0 == 0 && st[k].armed);
+            drops += usize::from(floor(k - 1) && !floor(k));
+        }
+        floor_first = (kc..end).find(|&k| floor(k)).map(|k| secs(st[k].t_us) - secs(st[kc].t_us));
+    }
+    let td_air = (0..n).filter(|&k| h(k) > 0.3 && !st[k].on_ground && st[k].armed).map(|k| ho[k].td.0).max();
+    let mut out = format!(
+        "crash_fire_steps {} crash_fire_air {} crash_fire_first {} crash_fire_air_first {} td_restarts_after_contact {} floor_drops_after_contact {} \
+floor_first_after_contact_s {} td_max_air_ms {}",
+        fire.len(), air.len(), fire.first().map_or("none".to_string(), |&k| at(k)), air.first().map_or("none".to_string(), |&k| at(k)),
+        kc.map_or("none".to_string(), |_| restarts.to_string()), kc.map_or("none".to_string(), |_| drops.to_string()),
+        floor_first.map_or("none".to_string(), |v| format!("{v:.3}")), td_air.map_or("none".to_string(), |v| format!("{:.0}", v as f64 * 1e-3)));
+    if std::env::var("MARV_HO_DUMP2").is_ok() {
+        let mut text = String::from("t_s,state,mode,true_h,true_vz,on_ground,nav_h,target_h,pos_d_valid,vel_d_valid,coll_mg,floor,td_ms,lifted,crash_fire\n");
+        if let Some(t0) = t_dump {
+            for k in (0..n).filter(|&k| st[k].t_us + 2_000_000 >= t0 && st[k].t_us <= t0 + 40_000_000) {
+                text.push_str(&format!("{:.3},{},{},{:.3},{:.3},{},{:.3},{:.3},{},{},{:.3},{},{:.0},{},{}\n", secs(st[k].t_us), ho[k].state, st[k].mode,
+                    h(k), st[k].truth_vel[2], u8::from(st[k].on_ground), -st[k].nav_d, -st[k].target_d, u8::from(st[k].pos_d_valid),
+                    u8::from(st[k].vel_d_valid), f64::from(ho[k].coll_n / ho[k].hover.0), u8::from(floor(k)), ho[k].td.0 as f64 * 1e-3,
+                    u8::from(ho[k].td.2), u8::from(ho[k].crash)));
+            }
+        }
+        DUMP2.with(|d| *d.borrow_mut() = text);
+    }
+    if scenario.mission.is_none() && scenario.commands.is_empty() {
+        return out;
+    }
+    MSN.with(|m| {
+        let m = m.borrow();
+        let up = m.upload.as_ref().map_or("none".to_string(), |(t, ack, items, plan, gc, alts, ret)| {
+            let a: Vec<String> = alts.iter().map(|v| format!("{v:.1}")).collect();
+            format!("{:.3} msn_ack {ack} msn_items {items} msn_plan {plan:08x} msn_gdn_count {gc} msn_gdn_alts_m {} msn_return_m {ret:.1}", secs(*t), a.join(","))
+        });
+        let cmds: Vec<String> = m.cmds.iter().map(|(t, c, r)| format!("{c}@{:.3}:{r}", secs(*t))).collect();
+        out.push_str(&format!(" msn_upload_s {up} msn_cmds {}", if cmds.is_empty() { "none".to_string() } else { cmds.join(",") }));
+        // Legs from the first accepted Start (else the upload): a waypoint is reached at the first step within the radius
+        // (true horizontal distance), then the next is current; per leg the largest true cross-track distance from the segment
+        // (the previous waypoint, or the position at the go time, to this one); true height error at arrival.
+        let t_go = m.cmds.iter().find(|c| c.1 == "start" && c.2 == "accepted").map(|c| c.0).or(m.upload.as_ref().map(|u| u.0));
+        let wps = scenario.mission.as_ref().map_or(Vec::new(), |m| m.waypoints.clone());
+        let radius = scenario.mission.as_ref().map_or(0.0, |m| m.radius_m);
+        let (mut arr_t, mut arr_d, mut herr, mut xt, mut dmin) = (vec![None; wps.len()], vec![None; wps.len()], vec![None; wps.len()], vec![0.0f64; wps.len()], vec![f64::INFINITY; wps.len()]);
+        if let Some(tg) = t_go.filter(|_| !wps.is_empty()) {
+            let k0 = st[..n].partition_point(|p| p.t_us < tg).min(n - 1);
+            let mut prev = [st[k0].truth_pos[0], st[k0].truth_pos[1]];
+            let mut cur = 0;
+            for k in k0..n {
+                let p = [st[k].truth_pos[0], st[k].truth_pos[1]];
+                let w = wps[cur];
+                let d = (p[0] - w[0]).hypot(p[1] - w[1]);
+                let (sx, sy) = (w[0] - prev[0], w[1] - prev[1]);
+                let l2 = sx * sx + sy * sy;
+                let u = if l2 > 0.0 { (((p[0] - prev[0]) * sx + (p[1] - prev[1]) * sy) / l2).clamp(0.0, 1.0) } else { 0.0 };
+                xt[cur] = xt[cur].max((p[0] - prev[0] - u * sx).hypot(p[1] - prev[1] - u * sy));
+                dmin[cur] = dmin[cur].min(d);
+                if d < radius {
+                    (arr_t[cur], arr_d[cur], herr[cur]) = (Some(secs(st[k].t_us)), Some(d), Some(h(k) - w[2]));
+                    prev = [w[0], w[1]];
+                    cur += 1;
+                    if cur == wps.len() {
+                        break;
+                    }
+                }
+            }
+        }
+        let list = |v: Vec<String>| if v.is_empty() { "none".to_string() } else { v.join(",") };
+        let o = |x: &Option<f64>, p: usize| x.map_or("none".to_string(), |v| format!("{v:.p$}"));
+        let mut modes: Vec<String> = Vec::new();
+        let mut codes: Vec<String> = Vec::new();
+        for k in 0..n {
+            if k == 0 || (st[k].selected, st[k].mode) != (st[k - 1].selected, st[k - 1].mode) {
+                modes.push(format!("{}/{}@{:.3}", st[k].selected, st[k].mode, secs(st[k].t_us)));
+            }
+            if k == 0 || ho[k].state != ho[k - 1].state {
+                codes.push(format!("{}@{:.3}", ho[k].state, secs(st[k].t_us)));
+            }
+        }
+        out.push_str(&format!(
+            " msn_go_s {} msn_wp_t_s {} msn_wp_d_arr_m {} msn_wp_d_min_m {} msn_wp_herr_m {} msn_leg_xt_max_m {} msn_carrot_max_m none(not-exposed) msn_modes {} msn_state_codes {}",
+            t_go.map_or("none".to_string(), |t| format!("{:.3}", secs(t))), list(arr_t.iter().map(|x| o(x, 3)).collect()),
+            list(arr_d.iter().map(|x| o(x, 2)).collect()), list(dmin.iter().map(|x| if x.is_finite() { format!("{x:.2}") } else { "none".to_string() }).collect()),
+            list(herr.iter().map(|x| o(x, 2)).collect()), list(xt.iter().map(|x| format!("{x:.2}")).collect()), list(modes), list(codes)));
+    });
+    out
 }
 
 fn firmware_text() -> String {
@@ -1927,7 +2115,7 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
         None => env.wind_mean_ned.v.ok_or("wind.mean_ned is \"ask\"")?,
     };
 
-    if !GDN_TARGETS.lock().unwrap().is_empty() {
+    if !GDN_TARGETS.lock().unwrap().is_empty() || scenario.mission.is_some() {
         let _ = GDN_SIM_ORIGIN.set(Origin::from_env(env)?);
     }
     let mut log = Log::with_header();
@@ -2114,6 +2302,10 @@ vh_ms {:.4} vz_ms {:.4}",
         }
     }
     let hands_off = (flag(&FS_HOLD) || flag(&HO_LINE)).then(|| ho_line(scenario, &trace, &ho));
+    if let (Ok(dir), Some(_)) = (std::env::var("MARV_HO_DUMP2"), &hands_off) {
+        let name = cell.map_or(format!("{}-seed{seed}", scenario.name), |r| r.cell.name.clone());
+        DUMP2.with(|d| std::fs::write(Path::new(&dir).join(format!("{}-{name}.csv", scenario.name)), d.borrow().as_bytes())).map_err(|e| format!("MARV_HO_DUMP2: {e}"))?;
+    }
     // `MARV_HO_DUMP=<dir>`: one CSV per run of every flight step from 2 s before the stick loss to 25 s after it.
     if let (Ok(dir), Some(&(lost, _))) = (std::env::var("MARV_HO_DUMP"), scenario.rc_lost.first()) {
         let name = cell.map_or(format!("{}-seed{seed}", scenario.name), |r| r.cell.name.clone());
