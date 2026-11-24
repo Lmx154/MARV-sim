@@ -765,6 +765,9 @@ impl Estimator for Steering {
     fn set_armed(&mut self, armed: bool) {
         self.eskf.set_armed(armed);
     }
+    fn set_airborne(&mut self, airborne: bool) {
+        self.eskf.set_airborne(airborne);
+    }
 }
 
 /// What the eskf3 run reads of the composite after each step (the `Flight` owns it): the core's counters, the output's
@@ -844,6 +847,9 @@ impl Estimator for Mix3 {
     }
     fn set_armed(&mut self, armed: bool) {
         self.mix.set_armed(armed);
+    }
+    fn set_airborne(&mut self, airborne: bool) {
+        self.mix.set_airborne(airborne);
     }
 }
 
