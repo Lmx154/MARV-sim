@@ -29,6 +29,8 @@ pub struct Plant {
     /// +1 for a CCW rotor, -1 for a CW rotor, seen from above.
     spin_sign: [f64; 4],
     rotor_speed: [f64; 4],
+    /// Thrust scale by DShot line (1.0 = the card; hands-off campaign `motor_thrust`).
+    thrust_scale: [f64; 4],
 }
 
 /// The value of a record, or an error naming the key when the card says "ask".
@@ -76,6 +78,7 @@ impl Plant {
             rotor_position,
             spin_sign,
             rotor_speed: [0.0; 4],
+            thrust_scale: [1.0; 4],
         })
     }
 
@@ -93,7 +96,7 @@ impl Plant {
         let mut force = [0.0, 0.0, 0.0];
         let mut torque = [0.0, 0.0, 0.0];
         for i in 0..4 {
-            let thrust = self.thrust_coefficient * self.rotor_speed[i] * self.rotor_speed[i];
+            let thrust = self.thrust_scale[i] * self.thrust_coefficient * self.rotor_speed[i] * self.rotor_speed[i];
             let push = [0.0, 0.0, -thrust];
             // Thrust torque from the arm, plus the reaction torque of the spinning rotor about z.
             let arm = cross(self.rotor_position[i], push);
@@ -123,6 +126,11 @@ impl Plant {
             force[k] -= self.drag_rotor_linear * air[k];
         }
         Wrench { force_n: force, torque_nm: torque }
+    }
+
+    /// Scales the thrust (and the reaction torque) of the rotor on DShot line `line` (hands-off campaign `motor_thrust`).
+    pub fn set_thrust_scale(&mut self, line: usize, scale: f64) {
+        self.thrust_scale[line] = scale;
     }
 
     pub fn rotor_speeds(&self) -> [f64; 4] {

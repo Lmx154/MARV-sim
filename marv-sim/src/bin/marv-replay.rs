@@ -1,11 +1,10 @@
 //! `marv-replay`: replays a flown flight log (`.BIN`) through the flight code's own estimators and checks them against
 //! what the board logged. See `--help` and the README.
 
-use fw_flight::eskf::{Aiding, Eskf, EskfStats, Nki, code};
+use fw_flight::eskf::{Aiding, Eskf, EskfStats, Nki};
 use fw_flight::eskf_out::EskfSteer;
 use fw_flight::gnc::{Controller, Estimator, NavState, Saturation, Setpoint, Valid};
-use fw_flight::heading_mon::{HeadingMon, SIG_CONF_RAD};
-use fw_flight::mahony::{DT_MAX_US, Mahony};
+use fw_flight::mahony::Mahony;
 use fw_flight::mahony_baro::MahonyBaro;
 use fw_flight::pid::CascadedPid;
 use fw_flight::tuning::{GAIN_NAMES, Gains, Tuning};
@@ -16,7 +15,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 const HELP: &str = "\
-marv-replay <log.BIN> <outdir> [--every N] [--imu-period-us US] [--mag-expected UT,INC_DEG,STR_PCT,TOL_DEG] [--noaid-sigma M] [--no-baro-from-armed N] [--gps-delay-ms MS] [--gps-min-rate-hz HZ] [--no-mag] [--nki] [--steering mahony-baro|eskf2|eskf3] [--veld] [--holdout-vd-odd] [--vd-sigma M_S] [--notch] [--notch-harmonics 1|3] [--notch-fs HZ] [--heading-mon] [--yaw-inject DEG@T]
+marv-replay <log.BIN> <outdir> [--every N] [--imu-period-us US] [--mag-expected UT,INC_DEG,STR_PCT,TOL_DEG] [--noaid-sigma M] [--no-baro-from-armed N] [--gps-delay-ms MS] [--gps-min-rate-hz HZ] [--no-mag] [--nki] [--steering mahony-baro|eskf2|eskf3] [--veld] [--holdout-vd-odd] [--vd-sigma M_S] [--notch] [--notch-harmonics 1|3] [--notch-fs HZ]
 
 Replays a flight log through the flight code's estimators (the real Rust code, Tuning::DEFAULT) and prints a
 validation table against the log's own NAV and NKF1 records. One CSV per estimator goes into <outdir>
@@ -38,16 +37,6 @@ and once on with every eRPM withheld (negative control: its rates must equal the
 above 50 Hz (Welch, Hann, 2048 samples, 50 % overlap, mean removed, 803.86 Hz) on X and Y. --notch-harmonics 1|3 sets
 Tuning::notch_harmonics (default 3, as built). --notch-fs HZ is the sample rate the controller is built for
 (default 800.0 = 1e6 / 1250 us, the board's configured IMU1 period); the metric always uses the measured 803.86 Hz.
-
---heading-mon: the eskf3 row's heading monitor (NKI Src 13) is told the airborne state: Flight's airborne latch (step.rs)
-rebuilt from the log, MOT.Arm and each step's DMD (Ok, Thr against Tuning::ground_thrust_g x weight, Sat bit 3 thrust_low,
-land_detect_us), the value after the previous step, as Flight::step passes it. Prints per armed session the evaluated,
-R2-screened and R5-refused (NE flag false) pairs, informed % (sig <= 15 deg), max |d_hat| over informed epochs, the time from take-off
-to confirmed, any fault, the blind time; writes <outdir>/eskf3_headmon.csv (every Src 13 record).
-
---yaw-inject DEG@T (HM0r): the eskf3 row's nominal yaw is turned by DEG degrees once, before the first step whose IMU time
-is >= T seconds of board time (the firmware's sim-fault hook EskfN::sim_rotate_yaw; P, the monitor and the events are not
-touched). Open loop: the recorded vehicle does not react. No other row sees it.
 ";
 
 /// When the estimator is told the armed state: the steering estimator gets the gate's state after the previous step
@@ -75,12 +64,6 @@ trait Replayed: Estimator {
     fn extras(&self) -> Option<[f32; 9]> {
         None
     }
-    /// The heading monitor's output and its Src 13 slot drops (`--heading-mon`, eskf3).
-    fn heading_mon(&self) -> Option<(HeadingMon, u32)> {
-        None
-    }
-    /// `--yaw-inject`: the nominal yaw + `dpsi` rad (eskf3 only).
-    fn sim_rotate_yaw(&mut self, _dpsi: f32) {}
 }
 impl Replayed for Mahony {}
 impl Replayed for MahonyBaro {}
@@ -107,12 +90,6 @@ impl Replayed for Eskf {
     }
     fn nki(&self) -> Vec<Nki> {
         self.events().copied().collect()
-    }
-    fn heading_mon(&self) -> Option<(HeadingMon, u32)> {
-        Some((Eskf::heading_mon(self), self.heading_mon_dropped()))
-    }
-    fn sim_rotate_yaw(&mut self, dpsi: f32) {
-        Eskf::sim_rotate_yaw(self, dpsi);
     }
 }
 
@@ -185,17 +162,9 @@ struct Args {
     notch_harmonics: usize,
     /// `--notch-fs HZ`: the `fs_hz` of `CascadedPid::new` for `--notch` (default 800.0, the board's).
     notch_fs: f32,
-    /// `--heading-mon`: the eskf3 row's heading monitor gets the rebuilt airborne latch; per-session report and CSV.
-    heading_mon: bool,
-    /// `--yaw-inject DEG@T`: the eskf3 row's yaw turned by DEG degrees at board time T (us).
-    yaw_inject: Option<(f32, u64)>,
 }
 
 fn parse_args() -> Result<Args, String> {
-    parse_args_from(std::env::args().skip(1))
-}
-
-fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut pos = Vec::new();
     let mut every = 8usize;
     let mut noaid = None;
@@ -207,8 +176,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut vd_sigma = None;
     let (mut notch, mut notch_harmonics, mut notch_fs) = (false, 3usize, 800.0f32);
     let mut opts = StreamOpts { imu_period_us: None, expected_cli: None };
-    let mut heading_mon = false;
-    let mut yaw_inject = None;
+    let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "-h" | "--help" => {
@@ -233,14 +201,6 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             "--holdout-vd-odd" => holdout_vd_odd = true,
             "--vd-sigma" => vd_sigma = Some(it.next().and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite() && *v > 0.0).ok_or("--vd-sigma M_S")?),
             "--notch" => notch = true,
-            "--heading-mon" => heading_mon = true,
-            "--yaw-inject" => {
-                let v = it.next().unwrap_or_default();
-                let (d, t) = v.split_once('@').ok_or("--yaw-inject DEG@T")?;
-                let d = d.parse::<f32>().ok().filter(|d| d.is_finite() && d.abs() <= 360.0).ok_or("--yaw-inject: DEG is not a number in [-360, 360]")?;
-                let t = t.parse::<f64>().ok().filter(|t| t.is_finite() && *t >= 0.0).ok_or("--yaw-inject: T is not seconds >= 0")?;
-                yaw_inject = Some((d, (t * 1e6).round() as u64));
-            }
             "--notch-harmonics" => notch_harmonics = it.next().and_then(|v| v.parse::<usize>().ok()).filter(|v| [1, 3].contains(v)).ok_or("--notch-harmonics 1|3")?,
             "--notch-fs" => notch_fs = it.next().and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite() && *v > 0.0).ok_or("--notch-fs HZ")?,
             "--steering" => match it.next().as_deref() {
@@ -267,7 +227,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         }
     }
     let [log, out]: [String; 2] = pos.try_into().map_err(|_| "usage: marv-replay <log.BIN> <outdir> [options]; --help")?;
-    Ok(Args { log: log.into(), out: out.into(), every, opts, noaid, no_baro_from_armed, gps_delay_ms, gps_min_rate_hz, no_mag, nki, steering, steer_eskf3, veld, holdout_vd_odd, vd_sigma, notch, notch_harmonics, notch_fs, heading_mon, yaw_inject })
+    Ok(Args { log: log.into(), out: out.into(), every, opts, noaid, no_baro_from_armed, gps_delay_ms, gps_min_rate_hz, no_mag, nki, steering, steer_eskf3, veld, holdout_vd_odd, vd_sigma, notch, notch_harmonics, notch_fs })
 }
 
 fn bits(v: &Valid) -> [u8; 7] {
@@ -365,173 +325,6 @@ fn intervals(stream: &Stream) -> Vec<(u64, u64)> {
         prev = s.armed;
     }
     v
-}
-
-/// `--heading-mon`: Flight's airborne latch (step.rs, after the gate), rebuilt from what the log says of each step.
-#[derive(Default)]
-struct Latch {
-    airborne: bool,
-    low_us: u64,
-    last_us: Option<u64>,
-}
-
-impl Latch {
-    /// One step at `t_us`: `armed` = MOT.Arm after the step, `dmd` = its DMD (Ok, Thr N, Sat bits) or None if the log has
-    /// none for the step (the latch then holds). Returns the latch after the step.
-    fn step(&mut self, t_us: u64, armed: bool, dmd: Option<(bool, f32, u8)>, ground_n: f32, land_us: u64) -> bool {
-        let dt_us = self.last_us.map_or(0, |prev| t_us.saturating_sub(prev).min(DT_MAX_US));
-        self.last_us = Some(t_us);
-        if !armed {
-            self.airborne = false;
-            self.low_us = 0;
-            return false;
-        }
-        let Some((ok, thrust_n, sat)) = dmd else {
-            return self.airborne;
-        };
-        // No allocation without a demand (DMD Sat 0), so a refused demand is low, as in Flight.
-        let (thrust_ok, low) = (ok && thrust_n >= ground_n, !ok || sat & 8 != 0);
-        if !low {
-            if thrust_ok {
-                self.airborne = true;
-            }
-            self.low_us = 0;
-        } else {
-            self.low_us += dt_us;
-            if self.low_us >= land_us {
-                self.airborne = false;
-            }
-        }
-        self.airborne
-    }
-}
-
-/// The rebuilt latch after each step of `stream` (DMD matched by TimeUS = the step's IMU1 time).
-fn airborne_latch(log: &Log, stream: &Stream, tuning: &Tuning) -> Result<Vec<bool>, String> {
-    let t = log.table("DMD")?;
-    let (co, ct, cs) = (t.col("Ok")?, t.col("Thr")?, t.col("Sat")?);
-    let dmd: HashMap<u64, (bool, f32, u8)> = (0..t.rows()).map(|k| (t.time(k), (t.u8(k, co) != 0, t.f32(k, ct), t.u8(k, cs)))).collect();
-    let ground_n = tuning.ground_thrust_g * marv_card::MASS * fw_core::calib::GRAVITY_MSS;
-    let mut latch = Latch::default();
-    let mut missing = 0usize;
-    let air = stream
-        .steps
-        .iter()
-        .map(|s| {
-            let d = dmd.get(&s.sensors.imu1.t_us).copied();
-            missing += usize::from(s.armed && d.is_none());
-            latch.step(s.sensors.imu1.t_us, s.armed, d, ground_n, tuning.land_detect_us)
-        })
-        .collect();
-    println!(
-        "heading-mon airborne: Flight's latch rebuilt from MOT.Arm and DMD (ground thrust {ground_n:.3} N, land detect {} us); armed steps without a DMD record (latch held): {missing}",
-        tuning.land_detect_us
-    );
-    Ok(air)
-}
-
-/// One armed session of the `--heading-mon` report. Times are board us.
-#[derive(Default)]
-struct HmSession {
-    arm_us: u64,
-    end_us: u64,
-    takeoff_us: Option<u64>,
-    air_us: u64,
-    evaluated: u32,
-    screened: u32,
-    informed: u32,
-    max_d_rad: f32,
-    confirmed_us: Option<u64>,
-    fault_us: Option<u64>,
-    blind_us: u64,
-    /// The monitor's output after the session's last step.
-    out: Option<HeadingMon>,
-    slot0: u32,
-    slot_drops: u32,
-}
-
-/// `--heading-mon`: the eskf3 monitor's Src 13 records and per-session figures, fed after every step.
-#[derive(Default)]
-struct HmReport {
-    sessions: Vec<HmSession>,
-    prev_armed: bool,
-    last_us: Option<u64>,
-    /// (step time, session index, the record).
-    rows: Vec<(u64, usize, Nki)>,
-}
-
-impl HmReport {
-    fn step(&mut self, t_us: u64, armed: bool, air: bool, o: &HeadingMon, slot_dropped: u32, events: &[Nki]) {
-        let dt_us = self.last_us.map_or(0, |prev| t_us.saturating_sub(prev));
-        self.last_us = Some(t_us);
-        if armed && !self.prev_armed {
-            self.sessions.push(HmSession { arm_us: t_us, slot0: slot_dropped, ..HmSession::default() });
-        }
-        self.prev_armed = armed;
-        let Some(n) = self.sessions.len().checked_sub(1).filter(|_| armed) else {
-            return;
-        };
-        let s = &mut self.sessions[n];
-        s.end_us = t_us;
-        if air {
-            s.takeoff_us.get_or_insert(t_us);
-            s.air_us += dt_us;
-        }
-        if o.blind {
-            s.blind_us += dt_us;
-        }
-        if o.confirmed {
-            s.confirmed_us.get_or_insert(t_us);
-        }
-        if o.fault {
-            s.fault_us.get_or_insert(t_us);
-        }
-        s.out = Some(*o);
-        s.slot_drops = slot_dropped - s.slot0;
-        for e in events.iter().filter(|e| e.src == code::HEADING_MON) {
-            if e.ok & code::HM_SCREENED != 0 {
-                s.screened += 1;
-            } else {
-                s.evaluated += 1;
-                if e.var.sqrt() <= SIG_CONF_RAD {
-                    s.informed += 1;
-                    s.max_d_rad = s.max_d_rad.max(e.inn.abs());
-                }
-            }
-            self.rows.push((t_us, n, *e));
-        }
-    }
-
-    fn text(&self) -> String {
-        let mut o = String::from("\nheading monitor (eskf3, NKI Src 13), per armed session; times in s of board time\n");
-        let sec = |us: u64| us as f64 * 1e-6;
-        for (k, s) in self.sessions.iter().enumerate() {
-            let _ = write!(o, "  session {k}: armed {:.3}..{:.3}", sec(s.arm_us), sec(s.end_us));
-            let Some(t0) = s.takeoff_us else {
-                let _ = writeln!(o, ", never airborne; Src 13 records {}", s.evaluated + s.screened);
-                continue;
-            };
-            let after = |t: Option<u64>| t.map_or("none".to_string(), |t| format!("at {:.3} ({:.3} after take-off)", sec(t), sec(t) - sec(t0)));
-            let Some(m) = s.out else { continue };
-            let _ = writeln!(
-                o,
-                ", take-off {:.3}, airborne {:.1}; evaluated {} screened(R2) {} ne-invalid(R5) {} non-finite {} out-of-interval {} slot drops {}; informed {:.1} %; max |d_hat| informed {:.2} deg; confirmed {}; fault {}; blind {:.2}; last d_hat {:.2} deg sig {:.2} deg",
-                sec(t0), sec(s.air_us), s.evaluated, s.screened, m.ne_invalid, m.non_finite, m.out_of_interval, s.slot_drops,
-                100.0 * f64::from(s.informed) / f64::from(s.evaluated.max(1)), s.max_d_rad.to_degrees(), after(s.confirmed_us),
-                after(s.fault_us), sec(s.blind_us), m.delta_rad.to_degrees(), m.sigma_rad.to_degrees()
-            );
-        }
-        o
-    }
-
-    fn write_csv(&self, path: &std::path::Path) -> std::io::Result<()> {
-        let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
-        writeln!(w, "step_t_us,t_us,sess,d_hat_rad,var_rad2,ok")?;
-        for (t, n, e) in &self.rows {
-            writeln!(w, "{t},{},{n},{},{},{}", e.t_us, e.inn, e.var, e.ok)?;
-        }
-        w.flush()
-    }
 }
 
 /// What the handed GNSS epochs look like to the Eskf's acceptance (5c), in the order of `Eskf::gnss_arrival`'s checks:
@@ -966,24 +759,10 @@ fn run() -> Result<(), String> {
     for r in &mut rows {
         r.nav.reserve(stream.steps.len());
     }
-    let air = if args.heading_mon { airborne_latch(&log, &stream, &tuning)? } else { Vec::new() };
-    let mut hm = args.heading_mon.then(HmReport::default);
     let mut prev_armed = false;
-    let mut inject = args.yaw_inject;
-    for (k, s) in stream.steps.iter().enumerate() {
-        let inject_now = inject.filter(|i| s.sensors.imu1.t_us >= i.1);
-        if let Some((d, _)) = inject_now {
-            println!("yaw inject: eskf3 yaw + {d} deg before the step at {:.6} s (armed {})", s.sensors.imu1.t_us as f64 * 1e-6, s.armed);
-            inject = None;
-        }
+    for s in &stream.steps {
         for r in &mut rows {
-            if let (Some((d, _)), "eskf3") = (inject_now, r.name) {
-                r.est.sim_rotate_yaw(d.to_radians());
-            }
             r.est.set_armed(if r.armed_at == ArmedAt::Before { prev_armed } else { s.armed });
-            if args.heading_mon && r.name == "eskf3" {
-                r.est.set_airborne(k > 0 && air[k - 1]);
-            }
             let mut held = None;
             if args.holdout_vd_odd && r.name == "eskf2vd" && s.sensors.gnss.is_some_and(|g| g.seq % 2 == 1) {
                 let mut h = s.sensors.clone();
@@ -996,9 +775,6 @@ fn run() -> Result<(), String> {
             }
             if args.nki && r.name == "eskf3" {
                 r.nki.extend(r.est.nki());
-            }
-            if let (Some(h), Some((o, dropped)), true) = (hm.as_mut(), r.est.heading_mon(), r.name == "eskf3") {
-                h.step(s.sensors.imu1.t_us, s.armed, air[k], &o, dropped, &r.est.nki());
             }
             if let Some((g, a)) = r.est.biases() {
                 r.bias.push([g[0], g[1], g[2], a[0], a[1], a[2]]);
@@ -1055,12 +831,6 @@ fn run() -> Result<(), String> {
             w.flush().map_err(|e| e.to_string())?;
             println!("wrote {}", path.display());
         }
-    }
-    if let Some(h) = &hm {
-        let path = args.out.join("eskf3_headmon.csv");
-        h.write_csv(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        print!("{}", h.text());
-        println!("wrote {}", path.display());
     }
     for r in &rows {
         if let Some(s) = r.est.eskf_stats() {
@@ -1358,100 +1128,4 @@ fn log_figures(log: &Log, iv: &[(u64, u64)]) -> Result<(), String> {
     }
     println!("  Barometer over the whole log: lowest {:.1} Pa at {:.1} s, highest {:.1} Pa at {:.1} s (ISA height difference {:.2} m).", pmin.0, pmin.1 as f64 * 1e-6, pmax.0, pmax.1 as f64 * 1e-6, h(pmin.0, pmax.0));
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn args(v: &[&str]) -> Result<Args, String> {
-        parse_args_from(v.iter().map(|s| s.to_string()))
-    }
-
-    #[test]
-    fn heading_mon_option_parses() {
-        assert!(!args(&["a.BIN", "out"]).unwrap().heading_mon);
-        let a = args(&["a.BIN", "out", "--heading-mon", "--nki"]).unwrap();
-        assert!(a.heading_mon && a.nki);
-        assert!(args(&["--heading-mon", "a.BIN", "out"]).unwrap().heading_mon);
-        assert!(args(&["a.BIN", "--heading-mon"]).is_err(), "the out dir is still required");
-        assert!(args(&["a.BIN", "out", "--heading-monitor"]).is_err());
-    }
-
-    #[test]
-    fn yaw_inject_option_parses() {
-        assert_eq!(args(&["a.BIN", "out"]).unwrap().yaw_inject, None);
-        assert_eq!(args(&["a.BIN", "out", "--yaw-inject", "45@123.5"]).unwrap().yaw_inject, Some((45.0, 123_500_000)));
-        assert_eq!(args(&["a.BIN", "out", "--yaw-inject", "-90@0"]).unwrap().yaw_inject, Some((-90.0, 0)));
-        for bad in ["45", "45@", "@10", "x@10", "45@-1", "400@10"] {
-            assert!(args(&["a.BIN", "out", "--yaw-inject", bad]).is_err(), "{bad}");
-        }
-    }
-
-    /// The rebuilt latch on a synthetic DMD stream: rises only armed with a demand at or above the ground thrust and not
-    /// low; holds over a missing record; falls after `land_detect_us` low (refused demand or Sat bit 3), dt capped at
-    /// DT_MAX_US; a disarmed step clears it at once.
-    #[test]
-    fn airborne_latch_follows_flights_rule() {
-        let (g, land, p) = (5.0f32, 1_000_000u64, 1_250u64);
-        let mut l = Latch::default();
-        let t = std::cell::Cell::new(0u64);
-        let run = |l: &mut Latch, n: usize, armed: bool, dmd: Option<(bool, f32, u8)>| {
-            let mut a = false;
-            for _ in 0..n {
-                t.set(t.get() + p);
-                a = l.step(t.get(), armed, dmd, g, land);
-            }
-            a
-        };
-        assert!(!run(&mut l, 10, false, Some((true, 9.0, 0))), "disarmed");
-        assert!(!run(&mut l, 10, true, Some((true, 4.9, 0))), "below the ground thrust");
-        assert!(!run(&mut l, 10, true, Some((true, 6.0, 8))), "thrust_low");
-        assert!(!run(&mut l, 10, true, Some((false, 6.0, 0))), "refused demand");
-        assert!(run(&mut l, 1, true, Some((true, 5.0, 0))), "at the ground thrust, not low");
-        assert!(run(&mut l, 10, true, None), "no DMD: held");
-        assert!(run(&mut l, 10, true, Some((true, 3.0, 0))), "below the ground thrust but not low: stays");
-        assert!(run(&mut l, 799, true, Some((true, 3.0, 8))), "low 0.99875 s");
-        assert!(!run(&mut l, 1, true, Some((true, 3.0, 8))), "low 1.0 s");
-        assert!(run(&mut l, 1, true, Some((true, 6.0, 0))));
-        assert!(run(&mut l, 1, true, Some((false, 0.0, 0))), "refused: low from here");
-        t.set(t.get() + 2_000_000);
-        assert!(l.step(t.get(), true, Some((false, 0.0, 0)), g, land), "a 2 s gap adds only DT_MAX_US");
-        assert!(run(&mut l, 790, true, Some((false, 0.0, 0))));
-        assert!(!run(&mut l, 9, true, Some((false, 0.0, 0))));
-        assert!(run(&mut l, 1, true, Some((true, 6.0, 0))));
-        assert!(!run(&mut l, 1, false, Some((true, 6.0, 0))), "disarm clears at once");
-    }
-
-    fn mon(confirmed: bool, fault: bool, blind: bool) -> HeadingMon {
-        HeadingMon { ok: confirmed && !fault && !blind, confirmed, fault, delta_rad: 0.0, sigma_rad: f32::INFINITY, info: 0.0,
-            screened_r2: 0, ne_invalid: 0, non_finite: 0, out_of_interval: 0, blind }
-    }
-
-    /// The session figures from synthetic steps: screened records are not evaluated, only informed ones (sig <= 15 deg)
-    /// enter max |d_hat|, times count from the first airborne step, disarmed steps belong to no session.
-    #[test]
-    fn heading_mon_report_counts_a_synthetic_session() {
-        let rec = |inn: f32, sig_deg: f32, ok: u8| Nki { t_us: 0, src: code::HEADING_MON, inn, var: sig_deg.to_radians().powi(2), ok };
-        let other = Nki { t_us: 0, src: code::HEADING_MON - 1, inn: 9.0, var: 0.0, ok: 0 };
-        let mut h = HmReport::default();
-        h.step(1_000_000, false, false, &mon(false, false, false), 0, &[rec(0.1, 1.0, 0)]);
-        h.step(2_000_000, true, false, &mon(false, false, false), 0, &[]);
-        h.step(3_000_000, true, true, &mon(false, false, false), 0, &[rec(0.3, 20.0, 0), other]);
-        h.step(4_000_000, true, true, &mon(false, false, true), 0, &[rec(0.2, 10.0, 0)]);
-        h.step(5_000_000, true, true, &mon(true, false, false), 1, &[rec(0.5, 10.0, code::HM_SCREENED | code::HM_CONFIRMED)]);
-        h.step(6_000_000, true, true, &mon(true, true, false), 1, &[rec(-0.25, 14.9, code::HM_CONFIRMED | code::HM_FAULT)]);
-        h.step(7_000_000, false, false, &mon(true, true, false), 1, &[rec(0.9, 1.0, 0)]);
-        h.step(8_000_000, true, false, &mon(false, false, false), 1, &[]);
-        assert_eq!(h.sessions.len(), 2);
-        let s = &h.sessions[0];
-        assert_eq!((s.arm_us, s.end_us, s.takeoff_us, s.air_us), (2_000_000, 6_000_000, Some(3_000_000), 4_000_000));
-        assert_eq!((s.evaluated, s.screened, s.informed), (3, 1, 2));
-        assert!((s.max_d_rad - 0.25).abs() < 1e-6, "{}", s.max_d_rad);
-        assert_eq!((s.confirmed_us, s.fault_us, s.blind_us, s.slot_drops), (Some(5_000_000), Some(6_000_000), 1_000_000, 1));
-        assert_eq!(h.rows.len(), 4);
-        assert!(h.sessions[1].takeoff_us.is_none() && h.sessions[1].slot_drops == 0);
-        let text = h.text();
-        assert!(text.contains("confirmed at 5.000 (2.000 after take-off)") && text.contains("never airborne"), "{text}");
-    }
 }

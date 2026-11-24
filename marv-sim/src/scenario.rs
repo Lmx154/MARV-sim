@@ -63,6 +63,16 @@ pub struct Scenario {
     /// `[scenario] yaw_inject = { at_s, deg }` (HM3b, decision-heading-monitor H5 (ii)): at scenario time `at_s` (>= 0)
     /// the filter's yaw is turned by `deg` (yaw + deg) through the firmware's `sim-fault` hook; eskf3 runs only.
     pub yaw_inject: Option<YawInject>,
+    /// `[scenario] yaw_hold = { at_s, deg }` (hands-off campaign, decision-heading-monitor H12 I-H5): from scenario time `at_s`
+    /// on, before every flight step the filter's yaw is set to the truth yaw + `deg` through the firmware's `sim-fault` hook,
+    /// so the error cannot heal; eskf3 runs only.
+    pub yaw_hold: Option<YawInject>,
+    /// `[scenario] gnss_jump = { at_s, north_m, east_m }` (hands-off campaign): from scenario time `at_s` on, every GNSS
+    /// position the flight code gets is moved by this many metres (a persistent jump of the reported position).
+    pub gnss_jump: Option<(u64, [f64; 2])>,
+    /// `[scenario] motor_thrust = { at_s, line, scale }` (hands-off campaign): from scenario time `at_s` on, the thrust (and
+    /// the reaction torque) of the rotor on DShot line `line` is scaled by `scale` in the plant.
+    pub motor_thrust: Option<(u64, usize, f64)>,
     /// `[scenario] gnss_latency_s` (G4): replaces the model's latency (the card's); `None` leaves it.
     pub gnss_latency_s: Option<f64>,
     /// `[scenario] wind_steps = [[t_s, d_north, d_east, d_down], ...]` (Amendment P, P6 and P7): from scenario time `t_s`
@@ -760,20 +770,23 @@ impl Scenario {
                 return Err(format!("{key}: unknown table"));
             }
         }
-        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz", "mag_expected", "gnss_velocity", "baro_motion", "baro_lost", "gnss_lost", "gnss_hold", "mag_fault", "gnss_latency_s", "wind_steps", "yaw_inject"])?;
+        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz", "mag_expected", "gnss_velocity", "baro_motion", "baro_lost", "gnss_lost", "gnss_hold", "mag_fault", "gnss_latency_s", "wind_steps", "yaw_inject", "yaw_hold", "gnss_jump", "motor_thrust"])?;
         let ground = match root.get("initial").and_then(Value::as_table).and_then(|i| i.get("contact")) {
             None => false,
             Some(Value::String(c)) if c == "air" => false,
             Some(Value::String(c)) if c == "ground" => true,
-            Some(_) => return Err("initial.contact: must be \"air\" or \"ground\"".to_string()),
+            Some(Value::String(c)) if c == "air_over_ground" => false,
+            Some(_) => return Err("initial.contact: must be \"air\", \"air_over_ground\" or \"ground\"".to_string()),
         };
+        // Hands-off campaign: an air start with the ground plane at down = 0 under it (`Start::AirOverGround`).
+        let over = root.get("initial").and_then(Value::as_table).and_then(|i| i.get("contact")).and_then(Value::as_str) == Some("air_over_ground");
         let i = if ground {
             table(&root, "initial", &["contact", "ground_roll_pitch_deg", "yaw_deg", "rotors", "settle_s"])?
         } else {
             table(
                 &root,
                 "initial",
-                &["contact", "position_ned_m", "velocity_ned_ms", "roll_pitch_yaw_deg", "rates_rads", "rotors"],
+                &["contact", "position_ned_m", "velocity_ned_ms", "roll_pitch_yaw_deg", "rates_rads", "rotors", "settle_s"][..if over { 7 } else { 6 }],
             )?
         };
 
@@ -905,13 +918,53 @@ impl Scenario {
             }
             Some(_) => return Err("scenario.yaw_inject: must be an inline table".to_string()),
         };
+        let yaw_hold = match s.get("yaw_hold") {
+            None => None,
+            Some(Value::Table(t)) => {
+                known_keys(t, "scenario.yaw_hold", &["at_s", "deg"])?;
+                let at_s = scalar(t, "scenario.yaw_hold", "at_s")?;
+                let deg = scalar(t, "scenario.yaw_hold", "deg")?;
+                if !(at_s.is_finite() && at_s >= 0.0 && deg.is_finite()) {
+                    return Err("scenario.yaw_hold: at_s must be >= 0 and deg finite".to_string());
+                }
+                Some(YawInject { at_us: (at_s * 1e6).round() as u64, rad: deg.to_radians() })
+            }
+            Some(_) => return Err("scenario.yaw_hold: must be an inline table".to_string()),
+        };
+        let gnss_jump = match s.get("gnss_jump") {
+            None => None,
+            Some(Value::Table(t)) => {
+                known_keys(t, "scenario.gnss_jump", &["at_s", "north_m", "east_m"])?;
+                let at_s = scalar(t, "scenario.gnss_jump", "at_s")?;
+                let (n, e) = (scalar(t, "scenario.gnss_jump", "north_m")?, scalar(t, "scenario.gnss_jump", "east_m")?);
+                if !(at_s.is_finite() && at_s >= 0.0 && n.is_finite() && e.is_finite()) {
+                    return Err("scenario.gnss_jump: at_s must be >= 0 and the metres finite".to_string());
+                }
+                Some(((at_s * 1e6).round() as u64, [n, e]))
+            }
+            Some(_) => return Err("scenario.gnss_jump: must be an inline table".to_string()),
+        };
+        let motor_thrust = match s.get("motor_thrust") {
+            None => None,
+            Some(Value::Table(t)) => {
+                known_keys(t, "scenario.motor_thrust", &["at_s", "line", "scale"])?;
+                let at_s = scalar(t, "scenario.motor_thrust", "at_s")?;
+                let line = scalar(t, "scenario.motor_thrust", "line")?;
+                let scale = scalar(t, "scenario.motor_thrust", "scale")?;
+                if !(at_s.is_finite() && at_s >= 0.0 && [0.0, 1.0, 2.0, 3.0].contains(&line) && (0.0..=1.0).contains(&scale)) {
+                    return Err("scenario.motor_thrust: at_s >= 0, line 0 to 3, scale 0 to 1".to_string());
+                }
+                Some(((at_s * 1e6).round() as u64, line as usize, scale))
+            }
+            Some(_) => return Err("scenario.motor_thrust: must be an inline table".to_string()),
+        };
         let mut disturbances = Vec::new();
         for (i, row) in rows(&root, "", "disturbance", &["from_s", "to_s", "torque_nm"])?.into_iter().enumerate() {
             let name = format!("disturbance[{i}]");
             let to_us = if row.contains_key("to_s") { micros(row, &name, "to_s")? } else { u64::MAX };
             disturbances.push(Disturbance { from_us: micros(row, &name, "from_s")?, to_us, torque_nm: vec3(row, &name, "torque_nm")? });
         }
-        let settle_s = if ground {
+        let settle_s = if ground || over {
             let x = scalar(i, "initial", "settle_s")?;
             if x < 0.0 {
                 return Err("initial.settle_s: must be >= 0".to_string());
@@ -934,7 +987,7 @@ impl Scenario {
                 vec3(i, "initial", "velocity_ned_ms")?,
                 quat_from_euler_deg(vec3(i, "initial", "roll_pitch_yaw_deg")?),
                 vec3(i, "initial", "rates_rads")?,
-                Start::Air,
+                if over { Start::AirOverGround } else { Start::Air },
             )
         };
         Ok(Scenario {
@@ -960,6 +1013,9 @@ impl Scenario {
             gnss_hold,
             mag_fault,
             yaw_inject,
+            yaw_hold,
+            gnss_jump,
+            motor_thrust,
             gnss_latency_s,
             wind_steps,
             disturbances,

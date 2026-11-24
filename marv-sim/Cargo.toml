@@ -10,6 +10,6 @@ license = "MIT"
 marv-card = { path = "../marv-card", features = ["std"] }
 # The firmware by path: an edit to the flight code runs in the sim at once (build.rs records which commit).
 # `sim-fault`: the firmware's simulator test hooks (HM3b: yaw_inject); never in the flight image.
-fw-flight = { path = "../../MARV-V2-firmware/crates/fw-flight", features = ["sim-fault"] }
+fw-flight = { path = "../../MARV-V2-firmware/crates/fw-flight", features = ["sim-fault", "sim"] }
 fw-core = { path = "../../MARV-V2-firmware/crates/fw-core" }
 toml = "0.9"
