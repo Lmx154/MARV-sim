@@ -220,6 +220,8 @@ pub enum Throttle {
     Height(f64),
     /// Descend at this speed, m/s.
     Descend(f64),
+    /// `throttle = <0..1>` (N19 smoke): the stick moves to this value at the rate limit and stays (0.5: the centre).
+    Fixed(f64),
 }
 
 /// One row of `[rc] phase`. Roll, pitch and yaw are scripted sticks; `arm = None` keeps the previous phase's switch.
@@ -579,7 +581,10 @@ fn rc_phases(rc: &Table) -> Result<Vec<Phase>, String> {
             (true, false, false) => match get(row, &at, "throttle")?.as_str() {
                 Some("zero") => Throttle::Zero,
                 Some("ramp") => Throttle::Ramp,
-                _ => return Err(format!("{at}.throttle: must be \"zero\" or \"ramp\"")),
+                _ => match get(row, &at, "throttle")?.as_float() {
+                    Some(u) if (0.0..=1.0).contains(&u) => Throttle::Fixed(u),
+                    _ => return Err(format!("{at}.throttle: must be \"zero\", \"ramp\" or a number in [0, 1]")),
+                },
             },
             (false, true, false) => Throttle::Height(scalar(row, &at, "height_m")?),
             (false, false, true) => Throttle::Descend(scalar(row, &at, "descend_ms")?),

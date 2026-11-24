@@ -191,7 +191,7 @@ impl Pilot {
         match throttle {
             Throttle::Height(h) => (self.p.k_h * (h - v.height_m)).clamp(-self.p.v_dn_ms, self.p.v_up_ms),
             Throttle::Descend(s) => -s,
-            Throttle::Zero | Throttle::Ramp => 0.0,
+            Throttle::Zero | Throttle::Ramp | Throttle::Fixed(_) => 0.0,
         }
     }
 
@@ -269,6 +269,7 @@ impl Pilot {
         let elapsed_s = (now_us - self.start_us) as f64 * 1e-6;
         let (mode, reference, target) = match ph.throttle {
             Throttle::Zero => (0, 0.0, 0.0),
+            Throttle::Fixed(u) => (0, 0.0, u),
             Throttle::Ramp => (1, 0.0, self.p.ramp_stick_per_s * elapsed_s),
             Throttle::Height(_) | Throttle::Descend(_) => {
                 let v_ref = self.v_ref(ph.throttle, &v);
