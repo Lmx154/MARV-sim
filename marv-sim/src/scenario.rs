@@ -108,7 +108,7 @@ pub struct Scenario {
     pub commands: Vec<(u64, String, bool, bool)>,
     /// `[scenario] resume = { after_done_s }` or `{ after_start_s }` (campaign mission): the pilot's current lost phase ends
     /// (stick reports resume with the next phase) that long after AUTO's last waypoint (AUTO -> HOLD at the last index) or
-    /// after the first accepted Start. (0 done, 1 start; us.)
+    /// after the first accepted Start, or (`after_return_s`) after the first RETURN step. (0 done, 1 start, 2 return; us.)
     pub resume: Option<(u8, u64)>,
     /// `[scenario] station_hb = { from_s, to_s }` (N2 plumbing): the station HEARTBEAT time fed every flight step from `from_s`
     /// while before `to_s` (Flight::set_last_radio_heartbeat_us); after `to_s` the last time stays (the heartbeat stops).
@@ -1124,8 +1124,10 @@ impl Scenario {
         let resume = match s.get("resume") {
             None => None,
             Some(Value::Table(t)) => {
-                known_keys(t, "scenario.resume", &["after_done_s", "after_start_s"])?;
-                if t.contains_key("after_done_s") {
+                known_keys(t, "scenario.resume", &["after_done_s", "after_start_s", "after_return_s"])?;
+                if t.contains_key("after_return_s") {
+                    Some((2, secs(scalar(t, "scenario.resume", "after_return_s")?)))
+                } else if t.contains_key("after_done_s") {
                     Some((0, secs(scalar(t, "scenario.resume", "after_done_s")?)))
                 } else {
                     Some((1, secs(scalar(t, "scenario.resume", "after_start_s")?)))

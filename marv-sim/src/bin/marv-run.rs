@@ -1340,7 +1340,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
     let mut gdn_in: Option<fw_core::mission::GdnTargets> = None;
     // Campaign mission: the first HOLD step, the first accepted Start, AUTO's end at the last waypoint (for `resume` and
     // `after_hold_s`), the previous step's state and leg.
-    let (mut t_hold1, mut t_start1, mut t_done) = (None::<u64>, None::<u64>, None::<u64>);
+    let (mut t_hold1, mut t_start1, mut t_done, mut t_ret1) = (None::<u64>, None::<u64>, None::<u64>, None::<u64>);
     let (mut st_prev, mut leg_prev) = (0u8, None::<u8>);
     if !scenario.mission.is_empty() || !scenario.commands.is_empty() {
         // The board gives false until the battery monitor is merged; mission cells set it true (stated in the report).
@@ -1417,6 +1417,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
                 Some(p) => {
                     let due = match scenario.resume {
                         Some((0, d)) => t_done.is_some_and(|t| now >= t + d),
+                        Some((2, d)) => t_ret1.is_some_and(|t| now >= t + d),
                         Some((_, d)) => t_start1.is_some_and(|t| now >= t + d),
                         None => false,
                     };
@@ -1583,6 +1584,9 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
                 let (code, leg) = (flight.hands_off_state().code(), flight.leg_active());
                 if code == 3 {
                     t_hold1.get_or_insert(truth.t_us);
+                }
+                if code == 5 {
+                    t_ret1.get_or_insert(truth.t_us);
                 }
                 let last = gdn_in.map(|g| g.count.saturating_sub(1));
                 if st_prev == 4 && code == 3 && leg_prev.is_some() && leg_prev == last {
@@ -2002,6 +2006,39 @@ floor_first_after_contact_s {} td_max_air_ms {}",
             }
         }
         DUMP2.with(|d| *d.borrow_mut() = text);
+    }
+    // RETURN (campaign part 2): entry, the climb (until the setpoint NE first moves 0.5 m from its value at entry), the leg home,
+    // LAND; home = the TRUE take-off point (0, 0). Heights and distances TRUE.
+    if let Some(kr) = (0..n).find(|&k| ho[k].state == 5) {
+        let hd = |k: usize| st[k].truth_pos[0].hypot(st[k].truth_pos[1]);
+        let p0 = [st[kr].truth_pos[0], st[kr].truth_pos[1]];
+        let c0 = st[kr].pos_target_ne;
+        let kre = (kr..n).find(|&k| ho[k].state != 5).unwrap_or(n);
+        let kc = (kr..kre).find(|&k| { let c = st[k].pos_target_ne; c.iter().all(|v| v.is_finite()) && (c[0] - c0[0]).hypot(c[1] - c0[1]) > 0.5 }).unwrap_or(kre);
+        let drift = (kr..kc).map(|k| (st[k].truth_pos[0] - p0[0]).hypot(st[k].truth_pos[1] - p0[1])).fold(0.0f64, f64::max);
+        let ktop = (kr..kre.max(kr + 1).min(n)).max_by(|&a, &b| h(a).total_cmp(&h(b))).unwrap_or(kr);
+        let car = (kr..kre).filter_map(|k| { let c = st[k].pos_target_ne; c.iter().all(|v| v.is_finite()).then(|| (st[k].nav_ne[0] - c[0]).hypot(st[k].nav_ne[1] - c[1])) }).fold(0.0f64, f64::max);
+        let tr = st[kr].t_us;
+        let tdn = trace.touchdowns.iter().find(|t| t.t_us >= tr);
+        let ktd = tdn.map(|t| st[..n].partition_point(|p| p.t_us < t.t_us).min(n - 1));
+        let mstop = trace.esc.iter().find(|e| e.0 >= tr && e.1 == [0; 4]).map(|e| e.0);
+        let vmean = |lo: f64, hi: f64| {
+            let v: Vec<f64> = (kre..ktd.unwrap_or(n)).filter(|&k| h(k) > lo && h(k) < hi && ho[k].state == 6).map(|k| st[k].truth_vel[2]).collect();
+            (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
+        };
+        let o = |v: Option<f64>, p: usize| v.map_or("none".to_string(), |v| format!("{v:.p$}"));
+        let after = if kre < n { ho[kre].state } else { 0 };
+        out.push_str(&format!(
+            " ret_s {:.3} ret_h_entry_m {:.2} ret_d_home_entry_m {:.2} ret_climb_s {:.2} ret_h_climb_end_m {:.2} ret_climb_drift_m {:.2} ret_h_max_m {:.2} \
+ret_top_est_err_m {:.2} ret_leg_s {} ret_exit_state {} ret_exit_s {} ret_d_home_exit_m {} ret_carrot_max_m {:.2} ret_land_vz_hi_ms {} ret_land_vz_lo_ms {} \
+ret_td_s {} ret_td_d_home_m {} ret_td_vz_ms {} ret_mstop_s {} ret_to_stop_s {} ret_contact_to_stop_s {}",
+            secs(tr), h(kr), hd(kr), secs(st[kc.min(n - 1)].t_us) - secs(tr), h(kc.min(n - 1)), drift, h(ktop), (-st[ktop].nav_d) - h(ktop),
+            o((kre > kc).then(|| secs(st[kre.min(n - 1)].t_us) - secs(st[kc.min(n - 1)].t_us)), 2), after,
+            if kre < n { format!("{:.3}", secs(st[kre].t_us)) } else { "none".to_string() }, o((kre < n).then(|| hd(kre)), 2), car,
+            o(vmean(10.5, 1e9), 2), o(vmean(0.5, 9.5), 2), o(tdn.map(|t| secs(t.t_us)), 3), o(ktd.map(hd), 2), o(tdn.map(|t| t.velocity_ms[2]), 2),
+            o(mstop.map(secs), 3), o(mstop.map(|m| secs(m) - secs(tr)), 2), o(mstop.zip(tdn).map(|(m, t)| secs(m) - secs(t.t_us)), 2)));
+    } else {
+        out.push_str(" ret_s none");
     }
     if scenario.mission.is_empty() && scenario.commands.is_empty() {
         return out;
