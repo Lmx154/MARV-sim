@@ -1,0 +1,37 @@
+# H13 P2: as ho-h13-speed5-hold60, the filter yaw HELD at truth + 60 deg from 29.7 s (0.3 s before the stick loss).
+# Hands-off campaign G0 (no fault): air start 5 m over the ground plane, Position from 0.04 s with centred sticks, the stick
+# reports stop at 20 s (the "model switch": RC loss while armed and airborne), HOLD from 21 s, held to 141 s.
+# Run: marv-run --estimator eskf3 --preroll 60 --fs-hold, in a handsoff/*.toml spread (5 points x 3 air x 3 seeds).
+[scenario]
+name = "ho-h13-speed5-hold60-t03"
+duration_s = 100.0
+yaw_hold = { at_s = 29.7, deg = 60.0 }
+
+[initial]
+contact = "air_over_ground"
+position_ned_m = [0.0, 0.0, -5.0]
+velocity_ned_ms = [0.0, 0.0, 0.0]
+roll_pitch_yaw_deg = [0.0, 0.0, 0.0]
+rates_rads = [0.0, 0.0, 0.0]
+rotors = "hover"
+settle_s = 0.08
+
+[rc]
+script = [
+  { t_s = 0.0   , roll = 0, pitch = 0, yaw = 0, throttle = 0.0, arm = false },   # preamble, switch low, throttle 0
+  { t_s = 0.02  , roll = 0, pitch = 0, yaw = 0, throttle = 0.0, arm = true },   # arm
+  { t_s = 0.04  , roll = 0, pitch = 0, yaw = 0, throttle = 0.5, arm = true, mode = "high" },   # throttle 0.5, Position from here on
+  { t_s = 20.0  , roll = 0, pitch = 1.00, yaw = 0, throttle = 0.5, arm = true, mode = "high" },   # straight north at about 5 m/s (5 m/s x stick through the dead zone); held until the reports stop at 30 s
+]
+lost = [ { from_s = 30.0, to_s = 100000.0 } ]   # the stick reports stop at 30 s and never return
+
+[verdict]
+check = "pos_hold"                # judged only to keep the file loadable; the campaign reads the hands_off line
+windows = [[10.0, 20.0]]
+max_arm_to_position_s = 1.0
+max_hold_error_m = 1.5
+max_nav_gap_m = 1.0
+max_height_error_m = 0.5
+releases_s = []
+modes = [1, 2, 3]
+selected = [1, 3]

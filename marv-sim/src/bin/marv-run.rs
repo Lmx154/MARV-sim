@@ -52,6 +52,8 @@ static X_INF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new
 /// The truth yaw (rad, f64 bits) of the plant at the flight step about to run, for the `yaw_hold` hook in `Mix3`.
 /// `--pilot-speed <m/s>`: PILOT_SPEED_XY through Flight::set_pilot_speed_xy before arming (hands-off campaign H13 item 5).
 static PILOT_SPEED: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+/// The GNSS scalars the core gated in the latest update (bit = event source: 0 N, 1 E, 2 VN, 3 VE, 12 VD), for the dump.
+static GATED_STEP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static TRUTH_YAW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn flag(f: &std::sync::atomic::AtomicBool) -> bool {
     f.load(std::sync::atomic::Ordering::Relaxed)
@@ -872,6 +874,8 @@ impl Estimator for Mix3 {
         if i.latch_t_us.is_none() && core.events().any(|e| e.src == code::YAW_RESET && e.ok == code::GATED) {
             i.latch_t_us = Some(t);
         }
+        let gated = core.events().filter(|e| e.ok == code::GATED && matches!(e.src, 0..=3 | 12)).fold(0u32, |m, e| m | 1 << e.src);
+        GATED_STEP.store(gated, std::sync::atomic::Ordering::Relaxed);
         if i.align_t_us.is_none() && i.stats.yaw_aligns > 0 {
             i.align_t_us = Some(t);
         }
@@ -1480,7 +1484,9 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
                 flight.sim_clear_track_error();
             }
             ho.push(HoStep { state: flight.hands_off_state().code(), tf: flight.sim_track_fault(), hdg: out_f.nav.valid.heading, anchor,
-                x_m: fw_flight::hands_off::track_fault_m(flight.speed_xy_in_force()) });
+                x_m: fw_flight::hands_off::track_fault_m(flight.speed_xy_in_force()), vne: out_f.nav.valid.velocity_ne,
+                pne: out_f.nav.valid.position_ne, nav_v: [out_f.nav.velocity_ms[0], out_f.nav.velocity_ms[1]],
+                gated: GATED_STEP.swap(0, std::sync::atomic::Ordering::Relaxed) });
             let mut out = out_f;
             out.t_us -= off;
             out.nav.t_us -= off;
@@ -1543,6 +1549,11 @@ struct HoStep {
     /// X in force.
     anchor: Option<([f32; 2], f32)>,
     x_m: f32,
+    /// For the `MARV_HO_DUMP` per-step file: Valid.velocity_ne, Valid.position_ne, the nav NE velocity, the gated GNSS scalars.
+    vne: bool,
+    pne: bool,
+    nav_v: [f32; 2],
+    gated: u32,
 }
 
 /// The `hands_off` verdict line (hands-off campaign). Times are scenario seconds. The hold point is the Position target at the
@@ -1985,6 +1996,21 @@ vh_ms {:.4} vz_ms {:.4}",
         }
     }
     let hands_off = flag(&FS_HOLD).then(|| ho_line(scenario, &trace, &ho));
+    // `MARV_HO_DUMP=<dir>`: one CSV per run of every flight step from 2 s before the stick loss to 25 s after it.
+    if let (Ok(dir), Some(&(lost, _))) = (std::env::var("MARV_HO_DUMP"), scenario.rc_lost.first()) {
+        let name = cell.map_or(format!("{}-seed{seed}", scenario.name), |r| r.cell.name.clone());
+        let mut text = String::from("t_s,state,tf,vel_ne,pos_ne,heading,pos_covered,pos_d,vel_d,nav_vn,nav_ve,true_vn,true_ve,true_n,true_e,true_h,gated,anchor\n");
+        for (p, h) in trace.steps.iter().zip(&ho) {
+            if p.t_us + 2_000_000 < lost || p.t_us > lost + 25_000_000 {
+                continue;
+            }
+            text.push_str(&format!("{:.5},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{}\n", p.t_us as f64 * 1e-6, h.state,
+                u8::from(h.tf), u8::from(h.vne), u8::from(h.pne), u8::from(h.hdg), u8::from(p.position_covered), u8::from(p.pos_d_valid),
+                u8::from(p.vel_d_valid), h.nav_v[0], h.nav_v[1], p.truth_vel[0], p.truth_vel[1], p.truth_pos[0], p.truth_pos[1],
+                -p.truth_pos[2], h.gated, u8::from(h.anchor.is_some())));
+        }
+        std::fs::write(Path::new(&dir).join(format!("{name}.csv")), text).map_err(|e| format!("MARV_HO_DUMP: {e}"))?;
+    }
     let steer = steer_cfg.zip(steer).map(|(cfg, st)| {
         let info = match cfg.est {
             EstKind::Mahony => None,
