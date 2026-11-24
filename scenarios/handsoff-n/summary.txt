@@ -1,0 +1,159 @@
+# Campaign N: descend on stick loss (FS_HOLD_EN 0 unless stated). Firmware MARV-ho/MARV-V2-firmware hands-off-sim-3ea (3ea990c + hooks), simulator MARV-ho/MARV-sim hands-off-sim-3ea.
+# Rows: median[min,max] over 15 cells (5 plant points x calm/5 m/s N/5 m/s E, seed 1). Heights and vz TRUE (vz down +). Collectives x card m g.
+
+## A (sim 6757eab, firmware 735961f, 2026-11-24T01:20:28-06:00)
+a-h2-t3-g088 | PASS | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 3.16[2.24,4.50] s (>5 or none: 0) | LAND->TD 0.22[0.19,0.23] m (>2: 0) | TD vz 0.54[0.47,0.60] | h_gain 0.00[0.00,0.00] | vz mean 0.46[0.42,0.48] max 0.66[0.52,0.91] | H 1.050[0.880,1.120]
+a-h2-t3-g100 | PASS | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 2.74[1.62,3.90] s (>5 or none: 0) | LAND->TD 0.22[0.20,0.23] m (>2: 0) | TD vz 0.54[0.47,0.59] | h_gain 0.00[0.00,0.00] | vz mean 0.47[0.42,0.48] max 0.68[0.55,0.94] | H 1.001[0.880,1.120]
+a-h2-t3-g112 | FAIL | cells 15 | air stops 6 | states S>P>L>S:15 | contact->stop 2.35[0.00,3.55] s (>5 or none: 0) | LAND->TD 0.20[0.06,0.22] m (>2: 0) | TD vz 0.58[0.47,5.90] | h_gain 0.00[0.00,0.00] | vz mean 0.47[0.43,3.07] max 0.87[0.57,5.89] | H 0.993[0.897,1.120]
+a-h2-t2-g088 | PASS | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 3.23[2.43,4.45] s (>5 or none: 0) | LAND->TD 7.76[0.41,8.61] m (>2: 10, not judged) | TD vz 0.51[0.49,0.53] | h_gain 0.01[0.00,0.03] | vz mean 0.44[0.40,0.45] max 0.58[0.55,0.62] | H 1.064[0.880,1.120]
+a-h2-t2-g100 | PASS | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 2.87[1.87,3.90] s (>5 or none: 0) | LAND->TD 8.14[0.62,8.97] m (>2: 10, not judged) | TD vz 0.51[0.50,0.53] | h_gain 0.01[0.00,0.02] | vz mean 0.44[0.41,0.45] max 0.58[0.56,0.62] | H 1.001[0.880,1.120]
+a-h2-t2-g112 | FAIL | cells 15 | air stops 6 | states S>P>L>S:15 | contact->stop 2.52[0.00,3.59] s (>5 or none: 0) | LAND->TD 1.45[0.13,8.58] m (>2: 6, not judged) | TD vz 0.52[0.50,5.72] | h_gain 0.00[0.00,0.02] | vz mean 0.45[0.41,2.77] max 0.60[0.57,5.72] | H 0.993[0.897,1.120]
+a-h2-t1-g088 | FAIL | cells 15 | air stops 0 | states S>P>B>S:15 | contact->stop 1.99[1.80,17.52] s (>5 or none: 11) | LAND->TD 17.97[0.22,26.00] m (>2: 13, not judged) | TD vz 0.93[0.54,1.10] | h_gain 0.00[0.00,0.82] | vz mean 0.00[0.00,0.88] max 0.00[0.00,1.10] | H 1.054[0.880,1.120]
+a-h2-t1-g100 | FAIL | cells 15 | air stops 0 | states S>P>B>S:9 S>P>B:6 | contact->stop - s (>5 or none: 15) | LAND->TD - m (>2: 15, not judged) | TD vz - | h_gain 0.00[0.00,506.62] | vz mean 0.00[-19.67,0.00] max 0.00[-0.43,0.00] | H 1.002[0.880,1.120]
+a-h2-t1-g112 | FAIL | cells 15 | air stops 0 | states S>P>B>S:9 S>P>B:6 | contact->stop 2.35[2.16,2.75] s (>5 or none: 12) | LAND->TD 3.19[0.16,6.59] m (>2: 14, not judged) | TD vz 0.60[0.27,1.14] | h_gain 0.00[0.00,984.94] | vz mean 0.00[-38.14,1.02] max 0.00[-1.39,1.14] | H 0.993[0.897,1.120]
+a-h10-t3-g088 | PASS | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 2.60[1.75,4.27] s (>5 or none: 0) | LAND->TD 0.73[0.69,0.75] m (>2: 0) | TD vz 0.32[0.26,0.45] | h_gain 0.00[0.00,0.00] | vz mean 0.50[0.50,0.50] max 0.93[0.61,1.09] | H 1.045[0.880,1.120]
+a-h10-t3-g100 | PASS | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 2.20[1.19,3.77] s (>5 or none: 0) | LAND->TD 0.73[0.70,0.75] m (>2: 0) | TD vz 0.33[0.27,0.46] | h_gain 0.00[0.00,0.00] | vz mean 0.50[0.50,0.50] max 0.93[0.61,1.08] | H 0.999[0.880,1.120]
+a-h10-t3-g112 | FAIL | cells 15 | air stops 6 | states S>P>L>S:15 | contact->stop 1.83[0.00,3.43] s (>5 or none: 0) | LAND->TD 0.73[0.25,1.28] m (>2: 0) | TD vz 0.45[0.27,14.42] | h_gain 0.00[0.00,0.00] | vz mean 0.50[0.50,7.36] max 1.05[0.61,14.41] | H 0.993[0.898,1.120]
+a-h10-t2-g088 | PASS | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 2.78[2.00,4.25] s (>5 or none: 0) | LAND->TD 98.83[4.57,104.01] m (>2: 15, not judged) | TD vz 0.47[0.44,0.50] | h_gain 0.00[0.00,0.00] | vz mean 0.50[0.49,0.51] max 0.71[0.58,0.74] | H 1.055[0.880,1.120]
+a-h10-t2-g100 | PASS | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 2.43[1.52,3.72] s (>5 or none: 0) | LAND->TD 98.38[4.90,103.53] m (>2: 15, not judged) | TD vz 0.46[0.44,0.47] | h_gain 0.00[0.00,0.00] | vz mean 0.50[0.49,0.51] max 0.72[0.56,0.74] | H 0.999[0.880,1.120]
+a-h10-t2-g112 | FAIL | cells 15 | air stops 6 | states S>P>L>S:15 | contact->stop 2.11[0.00,3.40] s (>5 or none: 0) | LAND->TD 5.16[0.10,103.06] m (>2: 13, not judged) | TD vz 0.47[0.44,13.76] | h_gain 0.00[0.00,0.00] | vz mean 0.51[0.49,7.01] max 0.73[0.59,13.75] | H 0.993[0.897,1.120]
+a-h10-t1-g088 | FAIL | cells 15 | air stops 0 | states S>P>B>S:15 | contact->stop 3.19[1.30,11.81] s (>5 or none: 3) | LAND->TD 0.70[0.05,19.85] m (>2: 4, not judged) | TD vz 6.08[1.82,9.34] | h_gain 0.00[0.00,0.00] | vz mean 5.36[1.18,8.41] max 6.08[1.85,9.34] | H 1.052[0.880,1.120]
+a-h10-t1-g100 | FAIL | cells 15 | air stops 0 | states S>P>B>S:9 S>P>B:6 | contact->stop 3.14[2.73,3.19] s (>5 or none: 6) | LAND->TD 0.90[0.07,3.61] m (>2: 8, not judged) | TD vz 8.04[4.04,8.52] | h_gain 0.00[0.00,1260.47] | vz mean 3.63[-30.18,7.54] max 4.07[0.34,8.52] | H 1.001[0.880,1.120]
+a-h10-t1-g112 | FAIL | cells 15 | air stops 0 | states S>P>B>S:9 S>P>B:6 | contact->stop 3.06[1.54,3.15] s (>5 or none: 6) | LAND->TD 1.21[0.10,11.60] m (>2: 8, not judged) | TD vz 6.86[2.41,7.58] | h_gain 0.00[0.00,2484.78] | vz mean 1.77[-59.38,6.65] max 2.50[-0.55,7.58] | H 0.993[0.898,1.120]
+a-h30-t3-g088 | PASS | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 3.37[2.35,4.83] s (>5 or none: 0) | LAND->TD 0.10[0.05,0.12] m (>2: 0) | TD vz 0.79[0.54,0.86] | h_gain 0.07[0.00,0.11] | vz mean 0.90[0.89,0.90] max 1.65[1.59,1.68] | H 1.043[0.882,1.120]
+a-h30-t3-g100 | PASS | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 2.98[1.80,4.17] s (>5 or none: 0) | LAND->TD 0.09[0.04,0.13] m (>2: 0) | TD vz 0.78[0.54,0.84] | h_gain 0.07[0.00,0.12] | vz mean 0.90[0.88,0.90] max 1.65[1.58,1.67] | H 0.998[0.880,1.120]
+a-h30-t3-g112 | FAIL | cells 15 | air stops 6 | states S>P>L>S:15 | contact->stop 2.58[0.00,3.78] s (>5 or none: 0) | LAND->TD 0.14[0.05,3.30] m (>2: 4) | TD vz 0.82[0.54,25.16] | h_gain 0.07[0.00,0.11] | vz mean 0.90[0.89,12.67] max 1.65[1.60,25.15] | H 0.993[0.899,1.120]
+a-h30-t2-g088 | PASS | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 3.24[2.29,4.40] s (>5 or none: 0) | LAND->TD 192.44[10.11,200.02] m (>2: 15, not judged) | TD vz 0.46[0.44,0.50] | h_gain 0.00[0.00,0.00] | vz mean 0.89[0.88,0.89] max 1.65[1.60,1.69] | H 1.054[0.880,1.120]
+a-h30-t2-g100 | PASS | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 2.86[1.76,3.87] s (>5 or none: 0) | LAND->TD 192.61[9.77,199.62] m (>2: 15, not judged) | TD vz 0.46[0.43,0.50] | h_gain 0.00[0.00,0.00] | vz mean 0.89[0.88,0.89] max 1.63[1.58,1.68] | H 0.999[0.880,1.120]
+a-h30-t2-g112 | FAIL | cells 15 | air stops 6 | states S>P>L>S:15 | contact->stop 2.56[0.00,3.58] s (>5 or none: 0) | LAND->TD 10.05[0.17,200.19] m (>2: 13, not judged) | TD vz 0.49[0.44,24.35] | h_gain 0.00[0.00,0.00] | vz mean 0.89[0.88,12.33] max 1.67[1.60,24.34] | H 0.993[0.896,1.120]
+a-h30-t1-g088 | FAIL | cells 15 | air stops 0 | states S>P>B>S:14 S>P>B:1 | contact->stop 3.18[1.57,10.80] s (>5 or none: 3) | LAND->TD 3.69[0.08,36.28] m (>2: 10, not judged) | TD vz 8.23[3.71,15.53] | h_gain 0.00[0.00,0.00] | vz mean 7.31[2.62,12.33] max 8.23[3.75,15.53] | H 1.043[0.880,1.120]
+a-h30-t1-g100 | FAIL | cells 15 | air stops 0 | states S>P>B>S:9 S>P>B:6 | contact->stop 3.12[1.65,3.13] s (>5 or none: 6) | LAND->TD 4.39[0.09,13.23] m (>2: 12, not judged) | TD vz 12.96[6.33,13.61] | h_gain 0.00[0.00,2121.49] | vz mean 5.44[-38.53,10.97] max 6.49[1.43,13.61] | H 0.998[0.880,1.120]
+a-h30-t1-g112 | FAIL | cells 15 | air stops 0 | states S>P>B>S:9 S>P>B:6 | contact->stop 3.03[2.45,3.04] s (>5 or none: 6) | LAND->TD 5.51[0.15,25.98] m (>2: 12, not judged) | TD vz 10.58[4.80,11.28] | h_gain 0.00[0.00,4228.87] | vz mean 3.49[-76.69,9.43] max 4.98[0.55,11.28] | H 0.993[0.897,1.120]
+    air stop: a-h2-t3-g112 p3-mapA-air1-gnd1-seed1 at 101.678@1.77m (S@0.001,P@60.002,L@101.676,S@101.677)
+    air stop: a-h2-t3-g112 p3-mapA-air2-gnd1-seed1 at 101.678@1.73m (S@0.001,P@60.002,L@101.676,S@101.677)
+    air stop: a-h2-t3-g112 p3-mapA-air3-gnd1-seed1 at 101.678@1.78m (S@0.001,P@60.002,L@101.676,S@101.677)
+    air stop: a-h2-t3-g112 p4-mapA-air1-gnd1-seed1 at 101.658@1.77m (S@0.001,P@60.002,L@101.656,S@101.657)
+    air stop: a-h2-t3-g112 p4-mapA-air2-gnd1-seed1 at 101.658@1.74m (S@0.001,P@60.002,L@101.656,S@101.657)
+    air stop: a-h2-t3-g112 p4-mapA-air3-gnd1-seed1 at 101.658@1.79m (S@0.001,P@60.002,L@101.656,S@101.657)
+    air stop: a-h2-t2-g112 p3-mapA-air1-gnd1-seed1 at 107.178@1.68m (S@0.001,P@60.002,L@107.176,S@107.177)
+    air stop: a-h2-t2-g112 p3-mapA-air2-gnd1-seed1 at 107.360@1.61m (S@0.001,P@60.002,L@107.176,S@107.360)
+    air stop: a-h2-t2-g112 p3-mapA-air3-gnd1-seed1 at 107.469@1.62m (S@0.001,P@60.002,L@107.176,S@107.469)
+    air stop: a-h2-t2-g112 p4-mapA-air1-gnd1-seed1 at 107.158@1.67m (S@0.001,P@60.002,L@107.156,S@107.157)
+    air stop: a-h2-t2-g112 p4-mapA-air2-gnd1-seed1 at 107.385@1.61m (S@0.001,P@60.002,L@107.156,S@107.385)
+    air stop: a-h2-t2-g112 p4-mapA-air3-gnd1-seed1 at 107.504@1.61m (S@0.001,P@60.002,L@107.156,S@107.504)
+    air stop: a-h10-t3-g112 p3-mapA-air1-gnd1-seed1 at 105.678@10.52m (S@0.001,P@60.002,L@105.676,S@105.677)
+    air stop: a-h10-t3-g112 p3-mapA-air2-gnd1-seed1 at 105.678@10.69m (S@0.001,P@60.002,L@105.676,S@105.677)
+    air stop: a-h10-t3-g112 p3-mapA-air3-gnd1-seed1 at 105.678@10.66m (S@0.001,P@60.002,L@105.676,S@105.677)
+    air stop: a-h10-t3-g112 p4-mapA-air1-gnd1-seed1 at 105.658@10.53m (S@0.001,P@60.002,L@105.656,S@105.657)
+    air stop: a-h10-t3-g112 p4-mapA-air2-gnd1-seed1 at 105.658@10.70m (S@0.001,P@60.002,L@105.656,S@105.657)
+    air stop: a-h10-t3-g112 p4-mapA-air3-gnd1-seed1 at 105.658@10.67m (S@0.001,P@60.002,L@105.656,S@105.657)
+    air stop: a-h10-t2-g112 p3-mapA-air1-gnd1-seed1 at 111.178@9.57m (S@0.001,P@60.002,L@111.176,S@111.177)
+    air stop: a-h10-t2-g112 p3-mapA-air2-gnd1-seed1 at 111.178@9.65m (S@0.001,P@60.002,L@111.176,S@111.177)
+    air stop: a-h10-t2-g112 p3-mapA-air3-gnd1-seed1 at 111.178@9.64m (S@0.001,P@60.002,L@111.176,S@111.177)
+    air stop: a-h10-t2-g112 p4-mapA-air1-gnd1-seed1 at 111.158@9.58m (S@0.001,P@60.002,L@111.156,S@111.157)
+    air stop: a-h10-t2-g112 p4-mapA-air2-gnd1-seed1 at 111.158@9.66m (S@0.001,P@60.002,L@111.156,S@111.157)
+    air stop: a-h10-t2-g112 p4-mapA-air3-gnd1-seed1 at 111.158@9.65m (S@0.001,P@60.002,L@111.156,S@111.157)
+    air stop: a-h30-t3-g112 p3-mapA-air1-gnd1-seed1 at 115.678@32.50m (S@0.001,P@60.002,L@115.676,S@115.677)
+    air stop: a-h30-t3-g112 p3-mapA-air2-gnd1-seed1 at 118.233@30.03m (S@0.001,P@60.002,L@115.676,S@118.233)
+    air stop: a-h30-t3-g112 p3-mapA-air3-gnd1-seed1 at 118.223@30.09m (S@0.001,P@60.002,L@115.676,S@118.222)
+    air stop: a-h30-t3-g112 p4-mapA-air1-gnd1-seed1 at 115.658@32.51m (S@0.001,P@60.002,L@115.656,S@115.657)
+    air stop: a-h30-t3-g112 p4-mapA-air2-gnd1-seed1 at 118.198@30.05m (S@0.001,P@60.002,L@115.656,S@118.197)
+    air stop: a-h30-t3-g112 p4-mapA-air3-gnd1-seed1 at 118.195@30.11m (S@0.001,P@60.002,L@115.656,S@118.195)
+    air stop: a-h30-t2-g112 p3-mapA-air1-gnd1-seed1 at 121.178@30.16m (S@0.001,P@60.002,L@121.176,S@121.177)
+    air stop: a-h30-t2-g112 p3-mapA-air2-gnd1-seed1 at 121.178@30.21m (S@0.001,P@60.002,L@121.176,S@121.177)
+    air stop: a-h30-t2-g112 p3-mapA-air3-gnd1-seed1 at 121.178@30.24m (S@0.001,P@60.002,L@121.176,S@121.177)
+    air stop: a-h30-t2-g112 p4-mapA-air1-gnd1-seed1 at 121.158@30.16m (S@0.001,P@60.002,L@121.156,S@121.157)
+    air stop: a-h30-t2-g112 p4-mapA-air2-gnd1-seed1 at 121.158@30.21m (S@0.001,P@60.002,L@121.156,S@121.157)
+    air stop: a-h30-t2-g112 p4-mapA-air3-gnd1-seed1 at 121.158@30.25m (S@0.001,P@60.002,L@121.156,S@121.157)
+
+## B (sim 6757eab, firmware 735961f, 2026-11-24T01:20:41-06:00)
+a-h30-t1-g088 | FAIL | cells 15 | air stops 0 | states S>P>B>S:14 S>P>B:1 | BLIND 15 | above entry+1 m 0 (gain 0.00[0.00,0.00]) | TD STOP 14 | H 1.043[0.880,1.120] valid 5 | c0 0.969[0.850,1.089] c1 1.095[0.880,1.120] | a0 1.532[-0.990,4.045] a1 0.443[0.079,3.099] | vz mean 7.31[2.62,12.33] max 8.23[3.75,15.53] | TD vz 8.23[3.71,15.53] | contact->stop 3.18[1.57,10.80]
+a-h30-t1-g100 | FAIL | cells 15 | air stops 0 | states S>P>B>S:9 S>P>B:6 | BLIND 15 | above entry+1 m 6 (gain 0.00[0.00,2121.49]) | TD STOP 9 | H 0.998[0.880,1.120] valid 5 | c0 0.969[0.849,1.089] c1 0.980[0.880,1.120] | a0 0.408[-2.457,3.257] a1 0.373[-1.436,2.169] | vz mean 5.44[-38.53,10.97] max 6.49[1.43,13.61] | TD vz 12.96[6.33,13.61] | contact->stop 3.12[1.65,3.13]
+a-h30-t1-g112 | FAIL | cells 15 | air stops 0 | states S>P>B>S:9 S>P>B:6 | BLIND 15 | above entry+1 m 6 (gain 0.00[0.00,4228.87]) | TD STOP 9 | H 0.993[0.897,1.120] valid 3 | c0 0.969[0.866,1.089] c1 0.880[0.880,1.120] | a0 -0.721[-3.906,2.472] a1 0.251[-2.784,1.238] | vz mean 3.49[-76.69,9.43] max 4.98[0.55,11.28] | TD vz 10.58[4.80,11.28] | contact->stop 3.03[2.45,3.04]
+b-sag | FAIL | cells 15 | air stops 0 | states S>P>B>S:9 S>P>B:6 | BLIND 15 | above entry+1 m 7 (gain 0.00[0.00,2536.87]) | TD STOP 9 | H 1.002[0.880,1.120] valid 5 | c0 0.969[0.849,1.089] c1 0.988[0.880,1.120] | a0 0.475[-2.302,3.257] a1 0.442[-1.213,2.301] | vz mean 2.88[-41.08,8.36] max 5.49[-4.12,12.29] | TD vz 11.62[5.35,12.29] | contact->stop 3.13[1.79,3.13]
+b-early | FAIL | cells 15 | air stops 0 | states S>P>B>S:9 S>P>B:6 | BLIND 15 | above entry+1 m 9 (gain 25.53[0.00,4635.06]) | TD STOP 9 | H 1.004[0.993,1.046] valid 0 | c0 0.969[0.969,0.969] c1 0.950[0.880,1.120] | a0 0.106[-2.819,3.093] a1 0.570[-1.439,2.218] | vz mean 0.48[-63.70,3.27] max 5.35[-10.99,6.61] | TD vz 5.35[5.35,6.61] | contact->stop 3.12[1.62,3.13]
+
+## D (sim 6757eab, firmware 735961f, 2026-11-24T01:20:48-06:00)
+d1 | PASS | cells 15 | air stops 0 | states S>P>L>T>P:15 | want: TAKEOVER then PILOT, no motor stop | motor stop - s at h - m | M seen 0
+d2 | PASS | cells 15 | air stops 15 | states S>P>L>S:15 | want: motors stop within 0.05 s of the arm-OFF report at 23 s | motor stop 23.002[23.002,23.002] s at h 28.64[28.58,28.81] m | M seen 0
+d3 | PASS | cells 15 | air stops 0 | states S>P>L>T>P:15 | want: TAKEOVER then PILOT, no motor stop | motor stop - s at h - m | M seen 15
+d4 | PASS | cells 15 | air stops 15 | states S>P>L>T>S:15 | want: motors stop within 0.05 s of the arm-OFF report at 50 s | motor stop 50.002[50.002,50.002] s at h 18.25[18.13,18.29] m | M seen 15
+    air stop: d2 p0-mapA-air1-gnd1-seed1 at 23.002@28.81m (S@0.001,P@0.022,L@20.996,S@23.001)
+    air stop: d2 p0-mapA-air2-gnd1-seed1 at 23.002@28.64m (S@0.001,P@0.022,L@20.996,S@23.001)
+    air stop: d2 p0-mapA-air3-gnd1-seed1 at 23.002@28.58m (S@0.001,P@0.022,L@20.996,S@23.001)
+    air stop: d2 p1-mapA-air1-gnd1-seed1 at 23.002@28.80m (S@0.001,P@0.022,L@20.996,S@23.001)
+    air stop: d2 p1-mapA-air2-gnd1-seed1 at 23.002@28.64m (S@0.001,P@0.022,L@20.996,S@23.001)
+    air stop: d2 p1-mapA-air3-gnd1-seed1 at 23.002@28.58m (S@0.001,P@0.022,L@20.996,S@23.001)
+    air stop: d2 p2-mapA-air1-gnd1-seed1 at 23.002@28.80m (S@0.001,P@0.022,L@20.996,S@23.001)
+    air stop: d2 p2-mapA-air2-gnd1-seed1 at 23.002@28.64m (S@0.001,P@0.022,L@20.996,S@23.001)
+    air stop: d2 p2-mapA-air3-gnd1-seed1 at 23.002@28.59m (S@0.001,P@0.022,L@20.996,S@23.001)
+    air stop: d2 p3-mapA-air1-gnd1-seed1 at 23.002@28.81m (S@0.001,P@0.022,L@20.996,S@23.001)
+    air stop: d2 p3-mapA-air2-gnd1-seed1 at 23.002@28.64m (S@0.001,P@0.022,L@20.996,S@23.001)
+    air stop: d2 p3-mapA-air3-gnd1-seed1 at 23.002@28.58m (S@0.001,P@0.022,L@20.996,S@23.001)
+    air stop: d2 p4-mapA-air1-gnd1-seed1 at 23.002@28.81m (S@0.001,P@0.022,L@20.996,S@23.001)
+    air stop: d2 p4-mapA-air2-gnd1-seed1 at 23.002@28.65m (S@0.001,P@0.022,L@20.996,S@23.001)
+    air stop: d2 p4-mapA-air3-gnd1-seed1 at 23.002@28.59m (S@0.001,P@0.022,L@20.996,S@23.001)
+    air stop: d4 p0-mapA-air1-gnd1-seed1 at 50.002@18.14m (S@0.001,P@0.022,L@20.996,T@45.001,S@50.001)
+    air stop: d4 p0-mapA-air2-gnd1-seed1 at 50.002@18.27m (S@0.001,P@0.022,L@20.996,T@45.001,S@50.001)
+    air stop: d4 p0-mapA-air3-gnd1-seed1 at 50.002@18.28m (S@0.001,P@0.022,L@20.996,T@45.001,S@50.001)
+    air stop: d4 p1-mapA-air1-gnd1-seed1 at 50.002@18.13m (S@0.001,P@0.022,L@20.996,T@45.001,S@50.001)
+    air stop: d4 p1-mapA-air2-gnd1-seed1 at 50.002@18.23m (S@0.001,P@0.022,L@20.996,T@45.001,S@50.001)
+    air stop: d4 p1-mapA-air3-gnd1-seed1 at 50.002@18.25m (S@0.001,P@0.022,L@20.996,T@45.001,S@50.001)
+    air stop: d4 p2-mapA-air1-gnd1-seed1 at 50.002@18.13m (S@0.001,P@0.022,L@20.996,T@45.001,S@50.001)
+    air stop: d4 p2-mapA-air2-gnd1-seed1 at 50.002@18.23m (S@0.001,P@0.022,L@20.996,T@45.001,S@50.001)
+    air stop: d4 p2-mapA-air3-gnd1-seed1 at 50.002@18.25m (S@0.001,P@0.022,L@20.996,T@45.001,S@50.001)
+    air stop: d4 p3-mapA-air1-gnd1-seed1 at 50.002@18.14m (S@0.001,P@0.022,L@20.996,T@45.001,S@50.001)
+    air stop: d4 p3-mapA-air2-gnd1-seed1 at 50.002@18.27m (S@0.001,P@0.022,L@20.996,T@45.001,S@50.001)
+    air stop: d4 p3-mapA-air3-gnd1-seed1 at 50.002@18.29m (S@0.001,P@0.022,L@20.996,T@45.001,S@50.001)
+    air stop: d4 p4-mapA-air1-gnd1-seed1 at 50.002@18.14m (S@0.001,P@0.022,L@20.996,T@45.001,S@50.001)
+    air stop: d4 p4-mapA-air2-gnd1-seed1 at 50.002@18.27m (S@0.001,P@0.022,L@20.996,T@45.001,S@50.001)
+    air stop: d4 p4-mapA-air3-gnd1-seed1 at 50.002@18.29m (S@0.001,P@0.022,L@20.996,T@45.001,S@50.001)
+
+## C (sim 6757eab, firmware 735961f, 2026-11-24T01:21:42-06:00)
+c-pos3 | PASS | cells 15 | air stops 0 | states S>P>L>S:15 | vz at loss 0.28[-0.07,0.36] | lowest coll 1st s 0.876[0.635,1.378] m g | dh 5 s -2.73[-2.98,-2.31] (max 0.00[0.00,0.07], min -2.73[-2.98,-2.31]) m | h_gain 0.00[0.00,0.07] | TD vz 0.38[0.29,0.46] | contact->stop 2.77[1.72,4.27]
+c-pos5 | PASS | cells 15 | air stops 0 | states S>P>L>S:15 | vz at loss 0.28[-0.23,0.32] | lowest coll 1st s 0.938[0.691,1.380] m g | dh 5 s -2.84[-3.25,-2.31] (max 0.00[0.00,0.12], min -2.84[-3.25,-2.31]) m | h_gain 0.00[0.00,0.12] | TD vz 0.43[0.28,0.63] | contact->stop 3.69[1.72,4.19]
+c-climb | FAIL | cells 15 | air stops 2 | states S>P>L>S:14 S>P>L:1 | vz at loss -4.17[-4.42,-3.59] | lowest coll 1st s 0.573[0.427,0.637] m g | dh 5 s 0.08[-15.03,3.07] (max 4.50[1.27,4.71], min -0.00[-15.03,-0.00]) m | h_gain 4.50[1.27,4.71] | TD vz 0.75[0.28,25.42] | contact->stop 3.73[0.00,7.19]
+c-chop30 | PASS | cells 15 | air stops 0 | states S>P>L:9 S>P>L>S:6 | vz at loss 11.75[0.00,13.23] | lowest coll 1st s 2.000[2.000,2.000] m g | dh 5 s 44.56[19.95,69.77] (max 44.56[19.96,69.77], min -5.93[-9.79,-0.00]) m | h_gain 71.90[19.96,215.54] | TD vz 15.17[0.52,18.70] | contact->stop 53.49[3.82,55.13]
+c-chop60 | FAIL | cells 15 | air stops 1 | states S>P>L>S:9 S>P>L:6 | vz at loss 13.55[12.59,14.38] | lowest coll 1st s 2.000[2.000,2.000] m g | dh 5 s -5.41[-18.23,24.80] (max 0.00[0.00,24.80], min -16.90[-26.10,-13.32]) m | h_gain 0.00[0.00,283.91] | TD vz 0.63[0.13,28.00] | contact->stop 1.73[0.00,2.61]
+    air stop: c-climb p3-mapA-air1-gnd1-seed1 at 107.733@33.02m (S@0.001,P@60.002,L@104.761,S@107.733)
+    air stop: c-climb p4-mapA-air1-gnd1-seed1 at 107.765@32.84m (S@0.001,P@60.002,L@104.741,S@107.765)
+    air stop: c-chop60 p4-mapA-air2-gnd1-seed1 at 134.852@40.47m (S@0.001,P@60.002,L@127.241,S@134.851)
+
+## E (sim 6757eab, firmware 735961f, 2026-11-24T01:21:57-06:00)
+e-hold35-h20 | PASS | cells 15 | air stops 0 | states S>P>H>L>S:15 | LAND->TD 4.54[3.12,11.63] m (>10: 3) | LAND->TD time 30.0[28.8,30.2] s | h at LAND 23.30[22.68,23.65] | TD vz 0.55[0.29,0.90] | contact->stop 3.20[1.33,4.55]
+e-hold40-h20 | PASS | cells 15 | air stops 0 | states S>P>H>L>S:13 S>P>H>L:2 | LAND->TD 2.95[1.81,7.74] m (>10: 0) | LAND->TD time 29.8[29.5,30.6] s | h at LAND 23.34[22.50,24.04] | TD vz 0.58[0.44,0.86] | contact->stop 3.49[1.08,4.66]
+e-hold45-h20 | PASS | cells 15 | air stops 0 | states S>P>H>L>S:15 | LAND->TD 11.84[2.99,39.00] m (>10: 9) | LAND->TD time 29.9[28.0,30.2] s | h at LAND 23.09[22.68,23.77] | TD vz 0.53[0.42,0.95] | contact->stop 3.71[2.46,4.50]
+e-hold35-h50 | PASS | cells 15 | air stops 0 | states S>P>H>L>S:15 | LAND->TD 5.41[1.85,31.96] m (>10: 2) | LAND->TD time 50.4[48.6,50.8] s | h at LAND 54.86[54.73,55.00] | TD vz 0.46[0.18,0.54] | contact->stop 2.70[1.22,3.95]
+e-hold40-h50 | PASS | cells 15 | air stops 0 | states S>P>H>L>S:15 | LAND->TD 7.19[2.75,12.79] m (>10: 5) | LAND->TD time 50.4[49.8,51.0] s | h at LAND 54.49[54.27,55.30] | TD vz 0.50[0.23,0.81] | contact->stop 2.65[1.40,4.87]
+e-hold45-h50 | PASS | cells 15 | air stops 0 | states S>P>H>L>S:15 | LAND->TD 13.86[2.72,64.92] m (>10: 10) | LAND->TD time 50.3[49.1,51.3] s | h at LAND 54.64[54.21,55.24] | TD vz 0.57[0.30,0.84] | contact->stop 3.34[1.71,5.18]
+
+## F (sim 6757eab, firmware 735961f, 2026-11-24T01:22:10-06:00)
+f-hover-fs0 | FAIL | cells 15 | air stops 0 | states S>P:10 S>P>S:5 | cells leaving PILOT or tripping 0 | contact->motor stop 5.20[5.20,5.20] s (<5 s, i.e. before the disarm: 10) | TD vz 0.60[0.16,0.76]
+f-hover-fs1 | FAIL | cells 15 | air stops 0 | states S>P:10 S>P>S:5 | cells leaving PILOT or tripping 0 | contact->motor stop 5.20[5.20,5.20] s (<5 s, i.e. before the disarm: 10) | TD vz 0.60[0.16,0.76]
+
+## P0 (nominal card, kf 1.0) cells only, B and A-T1 (h_lost vz_lost H c0 c1 a0 a1 vz_max td_vz h_gain contact->stop)
+a-h10-t1-g088 air1 9.28 4.40 1.120 1.089 1.112 0.522 0.237 4.99 4.995 0.00 1.96
+a-h10-t1-g088 air2 9.23 4.55 1.043 0.969 1.093 1.511 0.721 6.16 6.161 0.00 3.03
+a-h10-t1-g088 air3 9.25 4.46 1.052 0.969 1.092 1.507 0.671 6.08 6.080 0.00 3.02
+a-h10-t1-g100 air1 9.37 3.15 1.001 0.970 0.977 0.370 0.537 4.07 4.067 0.00 2.73
+a-h10-t1-g100 air2 9.32 3.34 0.996 0.969 0.978 0.383 0.472 4.15 4.148 0.00 2.93
+a-h10-t1-g100 air3 9.33 3.24 1.003 0.969 0.977 0.377 0.443 4.04 4.040 0.00 2.75
+a-h10-t1-g112 air1 9.46 1.89 0.898 0.867 0.880 0.320 0.394 3.10 3.097 0.00 1.54
+a-h10-t1-g112 air2 9.42 2.11 0.964 0.969 0.880 -0.744 0.248 2.50 2.498 0.00 2.91
+a-h10-t1-g112 air3 9.42 2.00 0.964 0.969 0.880 -0.751 0.245 2.41 2.410 0.00 2.65
+a-h30-t1-g088 air1 29.95 5.79 1.120 1.089 1.115 0.554 0.407 7.51 7.506 0.00 2.45
+a-h30-t1-g088 air2 29.83 5.57 1.041 0.969 1.095 1.532 0.443 8.23 8.229 0.00 2.07
+a-h30-t1-g088 air3 29.92 5.70 1.043 0.969 1.095 1.539 0.449 8.36 8.357 0.00 2.13
+a-h30-t1-g100 air1 30.05 4.66 0.998 0.968 0.981 0.424 0.415 6.58 6.577 0.00 1.65
+a-h30-t1-g100 air2 29.89 4.31 0.988 0.969 0.980 0.401 0.367 6.32 6.325 0.00 2.82
+a-h30-t1-g100 air3 29.98 4.47 1.002 0.969 0.980 0.408 0.373 6.49 6.489 0.00 2.95
+a-h30-t1-g112 air1 30.14 3.52 0.897 0.866 0.880 0.366 0.420 5.83 5.828 0.00 2.45
+a-h30-t1-g112 air2 29.95 3.07 0.949 0.969 0.880 -0.727 0.246 4.80 4.798 0.00 2.53
+a-h30-t1-g112 air3 30.04 3.26 0.971 0.969 0.880 -0.721 0.251 4.98 4.983 0.00 2.91
+b-sag air1 29.71 -0.94 1.019 0.989 0.984 0.254 0.518 5.65 5.653 1.20 1.79
+b-sag air2 30.42 0.41 0.991 0.969 0.988 0.475 0.435 5.49 5.491 0.00 2.86
+b-sag air3 30.47 0.57 1.002 0.969 0.988 0.488 0.442 5.35 5.353 0.00 1.80
+b-early air1 6.03 -5.03 1.003 0.969 0.950 0.109 0.620 6.52 6.524 24.33 1.62
+b-early air2 6.04 -5.04 1.004 0.969 0.950 0.106 0.570 6.61 6.609 25.53 2.39
+b-early air3 6.03 -5.04 1.004 0.969 0.950 0.103 0.570 6.61 6.608 25.67 2.32
+
