@@ -49,6 +49,8 @@ static NOTCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new
 static FS_HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static NO_HEARTBEAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static X_INF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// `--ho` (hands-off campaign N): the `hands_off` line without --fs-hold (FS_HOLD_EN stays 0, no HEARTBEAT fed).
+static HO_LINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// The truth yaw (rad, f64 bits) of the plant at the flight step about to run, for the `yaw_hold` hook in `Mix3`.
 /// `--pilot-speed <m/s>`: PILOT_SPEED_XY through Flight::set_pilot_speed_xy before arming (hands-off campaign H13 item 5).
 static PILOT_SPEED: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -95,7 +97,8 @@ every 8th step, and one `gdn` line. Without --gdn the guidance is not called and
 --fs-hold (hands-off campaign): FS_HOLD_EN 1 before arming, the radio HEARTBEAT time given fresh at every flight step (the
 step's own time) unless --no-heartbeat, heading_ok given after every step as the estimator's own heading flag (H12: the firmware
 adds NOT track_fault), and one `hands_off` line; --x-inf: the H12 control, the track distance forgotten after every step
-(Flight::sim_clear_track_error) so the 5 m rule cannot trip.";
+(Flight::sim_clear_track_error) so the 5 m rule cannot trip; --ho: the `hands_off` line without --fs-hold (FS_HOLD_EN 0, no
+HEARTBEAT). heading_ok is no longer fed (the firmware reads the estimator's flag itself).";
 
 /// `--noaid-sigma`: replaces `Tuning::nav_noaid_sigma_m` (the armed no-aid position hold's sigma) for every estimator.
 static NOAID_SIGMA: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -240,6 +243,7 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
             "--fs-hold" => Some(&FS_HOLD),
             "--no-heartbeat" => Some(&NO_HEARTBEAT),
             "--x-inf" => Some(&X_INF),
+            "--ho" => Some(&HO_LINE),
             _ => None,
         };
         if let Some(sw) = switch {
@@ -1334,6 +1338,8 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
     let mut ran = 0;
     // The scenario's GNSS hold and compass faults (G4): the last GNSS sample outside a hold, the stuck compass field.
     let mut faults = Faults::default();
+    // Campaign N: a phase with baro_lost / gnss_lost has started (latched to the end of the run).
+    let (mut phase_baro_lost, mut phase_gnss_lost) = (false, false);
     // Contact at any tick since the last stick report: what the pilot's eye catches between reports (Amendment B1).
     let mut touched = false;
     // Contact at any tick since the last flight step, for the shadow's airborne time.
@@ -1373,9 +1379,6 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
                 }
                 TRUTH_YAW.store(yaw_of(pinned.attitude).to_bits(), std::sync::atomic::Ordering::Relaxed);
                 let out = flight.step(&FlightInputs { sensors, rc: pending.take(), erpm: erpm_lines(world.plant.rotor_speeds(), pinned.t_us) });
-                if flag(&FS_HOLD) {
-                    flight.set_heading_ok(out.nav.valid.heading);
-                }
                 if flag(&X_INF) {
                     flight.sim_clear_track_error();
                 }
@@ -1395,6 +1398,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
         }
         if k.is_multiple_of(RC_TICKS) {
             // The script row in force, or the pilot's report from what it sees (it flies on through a lost link).
+            let mut phase_lost = false;
             let row = match pilot.as_deref_mut() {
                 None => row_at(&scenario.rc_script, now),
                 Some(p) => {
@@ -1403,11 +1407,14 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
                     let Some(report) = p.report(now, view) else { break };
                     log.pilot(&report);
                     trace.pilot.push(report);
+                    phase_lost = scenario.phases.get(report.phase).is_some_and(|p| p.lost);
+                    phase_baro_lost |= scenario.phases.get(report.phase).is_some_and(|p| p.baro_lost);
+                    phase_gnss_lost |= scenario.phases.get(report.phase).is_some_and(|p| p.gnss_lost);
                     report.row
                 }
             };
             // Only the newest report reaches the next flight step, once.
-            let lost = scenario.rc_lost.iter().any(|&(from, to)| now >= from && now < to);
+            let lost = phase_lost || scenario.rc_lost.iter().any(|&(from, to)| now >= from && now < to);
             if !lost {
                 let given = row;
                 let sticks = Sticks { roll: given.roll, pitch: given.pitch, throttle: given.throttle, yaw: given.yaw };
@@ -1423,9 +1430,15 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
                 wind[k] += delta[k];
             }
         }
+        let gain = scenario.thrust_gain.map_or(1.0, |(a, b, g0, g1)| g0 + (g1 - g0) * ((now.clamp(a, b) - a) as f64 / (b - a) as f64));
+        if scenario.thrust_gain.is_some() {
+            for line in 0..4 {
+                world.plant.set_thrust_scale(line, gain);
+            }
+        }
         if let Some((at, line, scale)) = scenario.motor_thrust.filter(|m| now >= m.0) {
             let _ = at;
-            world.plant.set_thrust_scale(line, scale);
+            world.plant.set_thrust_scale(line, scale * gain);
         }
         let mut wrench = world.plant.step(levels, world.backend.truth(), wind, TICK_US);
         if let Some((_, _, [fn_, fe])) = scenario.push.filter(|p| now >= p.0 && now < p.1) {
@@ -1466,6 +1479,12 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
                 sensors_f.baro = None;
             }
             faults.apply(scenario, truth.t_us as i64, -truth.position_m[2], &mut sensors_f);
+            if phase_baro_lost {
+                sensors_f.baro = None;
+            }
+            if phase_gnss_lost {
+                sensors_f.gnss = None;
+            }
             if sensors_f.baro.is_some() && drift0.is_none() {
                 drift0 = Some(world.slow.baro.drift_m());
             }
@@ -1481,11 +1500,12 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             if flag(&FS_HOLD) {
                 flight.set_last_radio_heartbeat_us((!flag(&NO_HEARTBEAT)).then_some(sensors_f.imu1.t_us));
             }
+            if let Some((a, b, p)) = scenario.radio_status.filter(|r| truth.t_us >= r.0) {
+                let newest = a + ((truth.t_us.min(b - 1) - a) / p) * p;
+                flight.set_last_radio_status_us(Some(newest + off));
+            }
             TRUTH_YAW.store(yaw_of(truth.attitude).to_bits(), std::sync::atomic::Ordering::Relaxed);
             let out_f = flight.step(&FlightInputs { sensors: sensors_f, rc: pending.take(), erpm: erpm_lines(world.plant.rotor_speeds(), sensors_f.imu1.t_us) });
-            if flag(&FS_HOLD) {
-                flight.set_heading_ok(out_f.nav.valid.heading);
-            }
             let anchor = flight.sim_anchor();
             if flag(&X_INF) {
                 flight.sim_clear_track_error();
@@ -1493,7 +1513,8 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             ho.push(HoStep { state: flight.hands_off_state().code(), tf: flight.sim_track_fault(), hdg: out_f.nav.valid.heading, anchor,
                 x_m: fw_flight::hands_off::track_fault_m(flight.speed_xy_in_force()), vne: out_f.nav.valid.velocity_ne,
                 pne: out_f.nav.valid.position_ne, nav_v: [out_f.nav.velocity_ms[0], out_f.nav.velocity_ms[1]],
-                gated: GATED_STEP.swap(0, std::sync::atomic::Ordering::Relaxed) });
+                gated: GATED_STEP.swap(0, std::sync::atomic::Ordering::Relaxed),
+                coll_n: out_f.demand.map_or(f32::NAN, |d| d.thrust_n), hover: flight.sim_hover(), m_bit: flight.radio_status_seen() });
             let mut out = out_f;
             out.t_us -= off;
             out.nav.t_us -= off;
@@ -1561,6 +1582,11 @@ struct HoStep {
     pne: bool,
     nav_v: [f32; 2],
     gated: u32,
+    /// N: the demand's collective (N; NaN without a demand), Flight::sim_hover (m g, H, H in use, BLIND's corrected
+    /// collective), N12's M after the step.
+    coll_n: f32,
+    hover: (f32, f32, bool, Option<f32>),
+    m_bit: bool,
 }
 
 /// The `hands_off` verdict line (hands-off campaign). Times are scenario seconds. The hold point is the Position target at the
@@ -1655,7 +1681,11 @@ fn ho_line(scenario: &Scenario, trace: &Trace, ho: &[HoStep]) -> String {
     let lift_after = td.map_or(0, |t| trace.liftoffs.iter().filter(|&&l| l > t.t_us).count());
     let mot_off = trace.esc.last().is_some_and(|e| e.1 == [0; 4]);
     let hp_off = k_hold.zip(hp).map(|(k, h)| (st[k].truth_pos[0] - h[0]).hypot(st[k].truth_pos[1] - h[1]));
-    let lost = scenario.rc_lost.first().map(|w| w.0);
+    // The stick loss: the first scripted window, else (a phase with lost = true) the first gap in the reports given.
+    let per = RC_TICKS * TICK_US;
+    let rc_gap = trace.rc_us.windows(2).find(|w| w[1] - w[0] > 3 * per).map(|w| w[0] + per)
+        .or(trace.rc_us.last().filter(|&&l| l + 1_000_000 < st[n - 1].t_us).map(|l| l + per));
+    let lost = scenario.rc_lost.first().map(|w| w.0).or(rc_gap);
     let e_max = (k0..k_land.unwrap_or(n)).map(|k| e_deg(k).abs()).fold(None, |a: Option<f64>, b| Some(a.map_or(b, |a| a.max(b))));
     let k_end = k_stop.unwrap_or(n);
     // The Position target's walk in HOLD (nav frame) from the first HOLD step's target, and the time the target moved between
@@ -1735,13 +1765,50 @@ fn ho_line(scenario: &Scenario, trace: &Trace, ho: &[HoStep]) -> String {
         }
     }
     let hop = k_td.map(|kt| (kt..k_end).map(|k| -st[k].truth_pos[2]).fold(0.0, f64::max));
+    // N (FS_HOLD_EN 0 campaign): heights and vertical speeds are TRUE (vz down positive); collectives x the card's m g.
+    let mg = f64::from(ho[n - 1].hover.0);
+    let coll = |k: usize| f64::from(ho[k].coll_n) / mg;
+    let h_at = |k: usize| -st[k].truth_pos[2];
+    let k_of = |t: u64| st[..n].partition_point(|p| p.t_us < t).min(n - 1);
+    let h_entry = k_land.map(h_at);
+    let h_entry_mg = k_land.map(|k| f64::from(ho[k].hover.1) / mg);
+    let h_valid_entry = k_land.map(|k| ho[k].hover.2);
+    let kb_end = k_blind.map(|kb| (kb..n).find(|&k| ho[k].state != 8).unwrap_or(n));
+    let k_trim = k_blind.zip(kb_end).and_then(|(kb, ke)| (kb..ke).find(|&k| ho[k].hover.3.is_some()));
+    let mean = |a: usize, b: usize, f: &dyn Fn(usize) -> f64| {
+        let v: Vec<f64> = (a..b).map(f).filter(|x| x.is_finite()).collect();
+        (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
+    };
+    let blind_c0 = k_blind.and_then(|kb| mean(kb, k_trim.or(kb_end).unwrap_or(n), &coll));
+    let blind_c1 = k_trim.and_then(|k| ho[k].hover.3).map(|c| f64::from(c) / mg);
+    // True net vertical acceleration (down positive) over BLIND's first second, and from the correction for up to 3 s
+    // (or to first ground contact).
+    let acc = |a: usize, b: usize| (b > a + 1).then(|| (st[b - 1].truth_vel[2] - st[a].truth_vel[2]) / (secs(st[b - 1].t_us) - secs(st[a].t_us)));
+    let k_contact = td.map(|t| k_of(t.t_us));
+    let a0 = k_blind.and_then(|kb| acc(kb, k_trim.unwrap_or(k_of(st[kb].t_us + 1_000_000))));
+    let a1 = k_trim.and_then(|kt| acc(kt, k_of(st[kt].t_us + 3_000_000).min(k_contact.unwrap_or(n)).min(kb_end.unwrap_or(n))));
+    let desc_end = k_contact.unwrap_or(n);
+    let vz_mean = k_land.filter(|&kl| desc_end > kl + 1).map(|kl| (h_at(kl) - h_at(desc_end - 1)) / (secs(st[desc_end - 1].t_us) - secs(st[kl].t_us)));
+    let vz_max = k_land.and_then(|kl| fold_max(kl, desc_end, &|k| Some(st[k].truth_vel[2])));
+    let h_gain = k_land.zip(h_entry).and_then(|(kl, he)| fold_max(kl, n, &|k| Some(h_at(k) - he)));
+    let k5 = k_land.map(|kl| k_of(st[kl].t_us + 5_000_000));
+    let dh5 = k_land.zip(k5).map(|(kl, k)| h_at(k) - h_at(kl));
+    let dh5_max = k_land.zip(k5).and_then(|(kl, k)| fold_max(kl, k + 1, &|j| Some(h_at(j) - h_at(kl))));
+    let dh5_min = k_land.zip(k5).and_then(|(kl, k)| fold_max(kl, k + 1, &|j| Some(h_at(kl) - h_at(j)))).map(|v| -v);
+    let c1s_min = k_land.and_then(|kl| fold_max(kl, k_of(st[kl].t_us + 1_000_000), &|k| Some(-coll(k)).filter(|v| v.is_finite()))).map(|v| -v);
+    let t_from = lost.or(trace.liftoffs.first().copied()).unwrap_or(0);
+    let mstop = trace.esc.iter().find(|e| e.0 >= t_from && e.1 == [0; 4]).map(|e| e.0);
+    let mstop_after_contact = td.and_then(|t| trace.esc.iter().find(|e| e.0 >= t.t_us && e.1 == [0; 4]).map(|e| e.0 - t.t_us));
+    let m_seen = (0..n).any(|k| ho[k].m_bit);
     format!(
         "hands_off hb {} xinf {} lost_s {} hold_s {} hp_off_m {} t_ref_s {} states {} tf_s {} land_s {} land_by {} blind_s {} td_s {} stop_s {} disarm_s {} \
 dt_tf_s {} dt_land_s {} d_tf_m {} d_land_m {} d_td_m {} d_stop_m {} d_max_m {} d_max_s {} d_hold_max_m {} trk_max_m {} hdg_drop_s {} ne_drop_s {} \
 e_land_deg {} h_land_m {} h_stop_m {} vz_stop_ms {} td_vz_ms {} td_vh_ms {} td_tilt_deg {} n_td {} liftoff_after_td {} mot_off {} armed_end {} d_end_m {} h_end_m {} e_hold_deg {} e_max_hold_deg {} hop_after_td_m {} r_walk_max_m {} r_moving_s {:.1} nav_gap_max_m {} \
 anchor_s {} b_m {} x_m {:.2} v_entry_ms {} trip_by {} dA_tf_m {} dAn_tf_m {} dA_land_m {} dAn_land_m {} dA_max_pre_land_m {} dAn_max_pre_land_m {} dA_max_m {} \
 dA_td_m {} stop_dist_m {} stopped_s {} ne_short_drops {} \
-law_brake_s {:.2} law_hold_s {:.2} law_level_s {:.2} law_td {} brake_vmax_ms {:.2} brake_tilt_deg {:.1} land_to_td_m {} air_stops {} air_stop_first {}",
+law_brake_s {:.2} law_hold_s {:.2} law_level_s {:.2} law_td {} brake_vmax_ms {:.2} brake_tilt_deg {:.1} land_to_td_m {} air_stops {} air_stop_first {} \
+fs {} h_entry_m {} H_entry_mg {} H_valid {} blind_c0_mg {} blind_c1_mg {} a_net0_mss {} a_net1_mss {} vz_mean_ms {} vz_max_ms {} h_gain_max_m {} \
+dh5_m {} dh5_max_m {} dh5_min_m {} coll_min_1s_mg {} mstop_s {} h_mstop_m {} contact_to_mstop_s {} h_disarm_m {} m_seen {} h_lost_m {} vz_lost_ms {} vz_entry_ms {}",
         if flag(&NO_HEARTBEAT) { "absent" } else { "fed" }, u8::from(flag(&X_INF)), opt(lost), opt(k_hold.map(|k| st[k].t_us)), num(hp_off, 3),
         opt(t_ref), hist.join(","), opt(k_tf.map(|k| st[k].t_us)), opt(k_land.map(|k| st[k].t_us)), land_by.unwrap_or("none".to_string()),
         opt(k_blind.map(|k| st[k].t_us)), opt(td.map(|t| t.t_us)), opt(k_stop.map(|k| st[k].t_us)), opt(k_disarm.map(|k| st[k].t_us)),
@@ -1757,7 +1824,12 @@ law_brake_s {:.2} law_hold_s {:.2} law_level_s {:.2} law_td {} brake_vmax_ms {:.
         num(da_max_pre, 2), num(dan_max_pre, 2), num(da_max, 2), num(k_td.and_then(da_t), 2), num(k_stopped.and_then(da_t), 2),
         opt(k_stopped.map(|k| st[k].t_us)), short_drops,
         law_s[0], law_s[1], law_s[2], law_name(law_td), brake_vmax, brake_tilt, num(land_to_td, 2), air_stops,
-        air_stop_first.map_or("none".to_string(), |(t, h)| format!("{:.3}@{:.2}m", secs(t), h))
+        air_stop_first.map_or("none".to_string(), |(t, h)| format!("{:.3}@{:.2}m", secs(t), h)),
+        u8::from(flag(&FS_HOLD)), num(h_entry, 2), num(h_entry_mg, 3), h_valid_entry.map_or("none", |v| if v { "yes" } else { "no" }),
+        num(blind_c0, 3), num(blind_c1, 3), num(a0, 3), num(a1, 3), num(vz_mean, 2), num(vz_max, 2), num(h_gain, 2),
+        num(dh5, 2), num(dh5_max, 2), num(dh5_min, 2), num(c1s_min, 3), opt(mstop), num(mstop.map(|t| h_at(k_of(t))), 2),
+        num(mstop_after_contact.map(secs), 2), num(k_disarm.map(h_at), 2), m_seen,
+        num(lost.map(|t| h_at(k_of(t))), 2), num(lost.map(|t| st[k_of(t)].truth_vel[2]), 2), num(k_land.map(|k| st[k].truth_vel[2]), 2)
     )
 }
 
@@ -2041,7 +2113,7 @@ vh_ms {:.4} vz_ms {:.4}",
             summary.push(format!("PHASE {i:>2} {:<8} start {:>7.3} s  {how}", ph.name, ph.start_us as f64 * 1e-6));
         }
     }
-    let hands_off = flag(&FS_HOLD).then(|| ho_line(scenario, &trace, &ho));
+    let hands_off = (flag(&FS_HOLD) || flag(&HO_LINE)).then(|| ho_line(scenario, &trace, &ho));
     // `MARV_HO_DUMP=<dir>`: one CSV per run of every flight step from 2 s before the stick loss to 25 s after it.
     if let (Ok(dir), Some(&(lost, _))) = (std::env::var("MARV_HO_DUMP"), scenario.rc_lost.first()) {
         let name = cell.map_or(format!("{}-seed{seed}", scenario.name), |r| r.cell.name.clone());

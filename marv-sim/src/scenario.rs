@@ -76,6 +76,12 @@ pub struct Scenario {
     /// `[scenario] push = { from_s, to_s, north_n, east_n }` (hands-off campaign H14): a horizontal world-frame force (N) on the
     /// vehicle from `from_s` to `to_s`, added to the plant's wrench.
     pub push: Option<(u64, u64, [f64; 2])>,
+    /// `[scenario] thrust_gain = { from_s, to_s, from, to }` (hands-off campaign N): a scale on all four rotors' thrust (and
+    /// reaction torque), `from` until `from_s`, linear to `to` at `to_s`, `to` after (a constant gain: from = to).
+    pub thrust_gain: Option<(u64, u64, f64, f64)>,
+    /// `[scenario] radio_status = { from_s, to_s, period_s }` (hands-off campaign N, N12): RADIO_STATUS arrivals every
+    /// `period_s` from `from_s` while before `to_s`; the newest arrival time goes to Flight::set_last_radio_status_us.
+    pub radio_status: Option<(u64, u64, u64)>,
     /// `[scenario] gnss_latency_s` (G4): replaces the model's latency (the card's); `None` leaves it.
     pub gnss_latency_s: Option<f64>,
     /// `[scenario] wind_steps = [[t_s, d_north, d_east, d_down], ...]` (Amendment P, P6 and P7): from scenario time `t_s`
@@ -190,6 +196,13 @@ pub struct Phase {
     pub xy_hold: bool,
     /// The channel-6 switch from this phase on; `None` keeps the previous phase's (Low at the start).
     pub mode: Option<Switch3>,
+    /// `lost = true` (hands-off campaign N): no stick report reaches the flight code while this phase runs (the pilot flies
+    /// on); the reports resume with the next phase's sticks, arm and switch.
+    pub lost: bool,
+    /// `baro_lost = true` / `gnss_lost = true` (hands-off campaign N): from this phase's start to the end of the run no
+    /// barometer / GNSS sample reaches the flight code.
+    pub baro_lost: bool,
+    pub gnss_lost: bool,
 }
 
 /// A body torque added to the plant's wrench over `[from_us, to_us)`.
@@ -477,9 +490,16 @@ fn pilot(p: &Table) -> Result<PilotParams, String> {
 const PILOT_KEYS: [&str; 14] = ["delay_s", "stick_rate_per_s", "ramp_stick_per_s", "airborne_m", "k_h", "k_v", "k_i",
     "accel_max_g", "v_up_ms", "v_dn_ms", "xy_k", "xy_stick_max", "xy_ki", "stick_thrust_max_g"];
 
+fn flag_of(row: &Table, at: &str, k: &str) -> Result<bool, String> {
+    match row.get(k) {
+        None => Ok(false),
+        Some(v) => v.as_bool().ok_or(format!("{at}.{k}: must be true or false")),
+    }
+}
+
 fn rc_phases(rc: &Table) -> Result<Vec<Phase>, String> {
     let keys = ["name", "after_s", "event", "below_m", "timeout_s", "arm", "throttle", "height_m", "descend_ms", "xy",
-        "roll", "pitch", "yaw", "mode"];
+        "roll", "pitch", "yaw", "mode", "lost", "baro_lost", "gnss_lost"];
     let mut phases: Vec<Phase> = Vec::new();
     for (i, row) in rows(rc, "rc", "phase", &keys)?.into_iter().enumerate() {
         let at = format!("rc.phase[{i}]");
@@ -543,7 +563,8 @@ fn rc_phases(rc: &Table) -> Result<Vec<Phase>, String> {
             Some(_) => return Err(format!("{at}.mode: must be \"low\", \"middle\" or \"high\"")),
         };
         phases.push(Phase { name, end, arm, throttle, roll: stick("roll")?, pitch: stick("pitch")?, yaw: stick("yaw")?,
-            xy_hold, mode });
+            xy_hold, mode, lost: flag_of(row, &at, "lost")?, baro_lost: flag_of(row, &at, "baro_lost")?,
+            gnss_lost: flag_of(row, &at, "gnss_lost")? });
     }
     if phases.is_empty() {
         return Err("rc.phase: empty".to_string());
@@ -773,7 +794,7 @@ impl Scenario {
                 return Err(format!("{key}: unknown table"));
             }
         }
-        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz", "mag_expected", "gnss_velocity", "baro_motion", "baro_lost", "gnss_lost", "gnss_hold", "mag_fault", "gnss_latency_s", "wind_steps", "yaw_inject", "yaw_hold", "gnss_jump", "motor_thrust", "push"])?;
+        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz", "mag_expected", "gnss_velocity", "baro_motion", "baro_lost", "gnss_lost", "gnss_hold", "mag_fault", "gnss_latency_s", "wind_steps", "yaw_inject", "yaw_hold", "gnss_jump", "motor_thrust", "push", "thrust_gain", "radio_status"])?;
         let ground = match root.get("initial").and_then(Value::as_table).and_then(|i| i.get("contact")) {
             None => false,
             Some(Value::String(c)) if c == "air" => false,
@@ -974,6 +995,32 @@ impl Scenario {
             }
             Some(_) => return Err("scenario.push: must be an inline table".to_string()),
         };
+        let thrust_gain = match s.get("thrust_gain") {
+            None => None,
+            Some(Value::Table(t)) => {
+                known_keys(t, "scenario.thrust_gain", &["from_s", "to_s", "from", "to"])?;
+                let (a, b) = (scalar(t, "scenario.thrust_gain", "from_s")?, scalar(t, "scenario.thrust_gain", "to_s")?);
+                let (g0, g1) = (scalar(t, "scenario.thrust_gain", "from")?, scalar(t, "scenario.thrust_gain", "to")?);
+                if !(a.is_finite() && b.is_finite() && a >= 0.0 && b > a && g0 > 0.0 && g0 <= 2.0 && g1 > 0.0 && g1 <= 2.0) {
+                    return Err("scenario.thrust_gain: 0 <= from_s < to_s, gains in (0, 2]".to_string());
+                }
+                Some(((a * 1e6).round() as u64, (b * 1e6).round() as u64, g0, g1))
+            }
+            Some(_) => return Err("scenario.thrust_gain: must be an inline table".to_string()),
+        };
+        let radio_status = match s.get("radio_status") {
+            None => None,
+            Some(Value::Table(t)) => {
+                known_keys(t, "scenario.radio_status", &["from_s", "to_s", "period_s"])?;
+                let (a, b) = (scalar(t, "scenario.radio_status", "from_s")?, scalar(t, "scenario.radio_status", "to_s")?);
+                let p = scalar(t, "scenario.radio_status", "period_s")?;
+                if !(a.is_finite() && b.is_finite() && a >= 0.0 && b > a && p >= 0.001 && p.is_finite()) {
+                    return Err("scenario.radio_status: 0 <= from_s < to_s, period_s >= 0.001".to_string());
+                }
+                Some(((a * 1e6).round() as u64, (b * 1e6).round() as u64, (p * 1e6).round() as u64))
+            }
+            Some(_) => return Err("scenario.radio_status: must be an inline table".to_string()),
+        };
         let mut disturbances = Vec::new();
         for (i, row) in rows(&root, "", "disturbance", &["from_s", "to_s", "torque_nm"])?.into_iter().enumerate() {
             let name = format!("disturbance[{i}]");
@@ -1033,6 +1080,8 @@ impl Scenario {
             gnss_jump,
             motor_thrust,
             push,
+            thrust_gain,
+            radio_status,
             gnss_latency_s,
             wind_steps,
             disturbances,

@@ -1,0 +1,35 @@
+# Campaign N D(i) (30 m air start): reports stop at 20 s, back at 23 s with arm ON in Position (TAKEOVER); out of Position at 28 s (PILOT).
+[scenario]
+name = "ho-n-d1"
+duration_s = 45.0
+
+
+[initial]
+contact = "air_over_ground"
+position_ned_m = [0.0, 0.0, -30.0]
+velocity_ned_ms = [0.0, 0.0, 0.0]
+roll_pitch_yaw_deg = [0.0, 0.0, 0.0]
+rates_rads = [0.0, 0.0, 0.0]
+rotors = "hover"
+settle_s = 0.08
+
+[rc]
+script = [
+  { t_s = 0.0, roll = 0, pitch = 0, yaw = 0, throttle = 0.0, arm = false },
+  { t_s = 0.02, roll = 0, pitch = 0, yaw = 0, throttle = 0.0, arm = true },
+  { t_s = 0.04, roll = 0, pitch = 0, yaw = 0, throttle = 0.5, arm = true, mode = "high" },
+  { t_s = 23.00, roll = 0, pitch = 0, yaw = 0, throttle = 0.50, arm = true, mode = "high" },
+  { t_s = 28.00, roll = 0, pitch = 0, yaw = 0, throttle = 0.50, arm = true, mode = "middle" },
+]
+lost = [ { from_s = 20.0, to_s = 23.0 } ]
+
+[verdict]
+check = "pos_hold"                # judged only to keep the file loadable; the campaign reads the hands_off line
+windows = [[10.0, 20.0]]
+max_arm_to_position_s = 1.0
+max_hold_error_m = 1.5
+max_nav_gap_m = 1.0
+max_height_error_m = 0.5
+releases_s = []
+modes = [1, 2, 3]
+selected = [1, 3]
