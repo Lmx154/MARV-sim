@@ -1555,6 +1555,23 @@ fn hm_line(scenario: &Scenario, trace: &Trace, x: &Ext) -> String {
     let hdg_drop = drop(&|k| x.rows[k].2.is_some());
     let ne_drop = drop(&|k| x.rows[k].3.is_some());
     let pos_exit = drop(&|k| st[k].mode == 3);
+    // HM3c: the first time after the reference that the NE flags have been down for 1.0 s without a break (B5's debounce).
+    let ne_lost1 = {
+        let (mut seen, mut from, mut hit) = (false, None, None);
+        for k in k_ref..n {
+            if x.rows[k].3.is_some() {
+                seen = true;
+                from = None;
+            } else if seen {
+                let f = *from.get_or_insert(st[k].t_us);
+                if st[k].t_us >= f + 1_000_000 {
+                    hit = Some(st[k].t_us);
+                    break;
+                }
+            }
+        }
+        hit
+    };
     let g6b = i.latch_t_us.filter(|&t| t >= t_ref);
     let blind = i.hm_blind.iter().map(|b| b.0).find(|&t| t >= t_ref);
     let fault = i.hm_fault_t_us;
@@ -1591,18 +1608,18 @@ fn hm_line(scenario: &Scenario, trace: &Trace, x: &Ext) -> String {
     let blind_total: f64 = i.hm_blind.iter().map(|b| secs(b.1.unwrap_or(st[n - 1].t_us).saturating_sub(b.0))).sum::<f64>() + 0.0;
     let blinds: Vec<String> = i.hm_blind.iter().take(6).map(|b| format!("{:.1}-{}", secs(b.0), b.1.map_or("end".to_string(), |t| format!("{:.1}", secs(t))))).collect();
     format!(
-        "heading_mon t_air_s {} t_ref_s {:.3} inject_s {} confirmed_s {} to_confirmed_s {} fault_s {} blind_s {} blind_total_s {:.1} hdg_drop_s {} ne_drop_s {} \
+        "heading_mon t_air_s {} t_ref_s {:.3} inject_s {} confirmed_s {} to_confirmed_s {} fault_s {} blind_s {} blind_total_s {:.1} hdg_drop_s {} ne_drop_s {} ne_lost1_s {} \
 pos_exit_s {} g6b_s {} prot_s {} prot_by {} dhat_max_inf_deg {} n_eval {} n_screened {} n_ne_invalid {} e_ref_deg {:.2} e_hist_deg {} \
 e_peak_deg {:.2} e_peak_s {:.2} e_end_deg {:.2} e_fault_deg {} e_min_1s_before_fault_deg {} dhat_fault_deg {} sig_fault_deg {} \
-exc_fault_m {} exc_fault1_m {} exc_prot1_m {} exc_ne1_m {} exc_max_m {} exc_max_s {} exc_unprot_max_m {} exc_end_m {} exc_max_pre_lost_m {} \
+exc_fault_m {} exc_fault1_m {} exc_prot1_m {} exc_ne1_m {} exc_ne_lost1_m {} exc_max_m {} exc_max_s {} exc_unprot_max_m {} exc_end_m {} exc_max_pre_lost_m {} \
 tilt_err_fault_deg {} tilt_err_max_deg {:.2}",
         opt(i.hm_air_t_us), secs(t_ref), opt(i.hm_inject_t_us), opt(i.hm_confirmed_t_us),
         num(i.hm_confirmed_t_us.zip(i.hm_air_t_us).map(|(c, a)| secs(c) - secs(a)), 3),
-        opt(fault), if blinds.is_empty() { "none".to_string() } else { blinds.join(",") }, blind_total, opt(hdg_drop), opt(ne_drop),
+        opt(fault), if blinds.is_empty() { "none".to_string() } else { blinds.join(",") }, blind_total, opt(hdg_drop), opt(ne_drop), opt(ne_lost1),
         opt(pos_exit), opt(g6b), opt(prot.map(|p| p.0)), prot.map_or("none", |p| p.1),
         num(dhat_max, 2), eval.len(), last.map_or(0, |o| o.screened_r2), last.map_or(0, |o| o.ne_invalid),
         e[k_ref], hist.join("/"), peak, secs(st[peak_k].t_us), e[n - 1], num(e_fault, 2), num(e_min_before, 2), num(dhat_fault, 2), num(sig_fault, 2),
-        num(exc_at(fault), 3), num(exc_at(fault.map(|t| t + 1_000_000)), 3), num(exc_at(prot.map(|p| p.0 + 1_000_000)), 3), num(exc_at(ne_drop.map(|t| t + 1_000_000)), 3),
+        num(exc_at(fault), 3), num(exc_at(fault.map(|t| t + 1_000_000)), 3), num(exc_at(prot.map(|p| p.0 + 1_000_000)), 3), num(exc_at(ne_drop.map(|t| t + 1_000_000)), 3), num(exc_at(ne_lost1), 3),
         num(all.map(|a| a.0), 3), opt(all.map(|a| a.1)), num(unprot.map(|a| a.0), 3), num(exc[n - 1], 3),
         num(pre_lost.map(|a| a.0), 3), num(tilt_fault, 2), d(tilt_max)
     )
