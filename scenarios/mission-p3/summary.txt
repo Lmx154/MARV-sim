@@ -1,0 +1,202 @@
+# Mission campaign part 3. Firmware MARV-ho/MARV-V2-firmware hands-off-sim-a32 8425f59 = hands-off a3217e5 (battery monitor merged,
+# FX-1/FX-2/FX-3, N18) + 4 sim hook commits; simulator MARV-ho/MARV-sim hands-off-sim-a32. Battery: the simulator now runs the board's
+# path (fw_core::battery::Monitor at 10 Hz, its cell byte | CELL_KNOWN_OK given to Flight::set_battery_cell every step, as
+# src/batt_fs.rs + src/flight.rs) from a scenario pack-voltage profile (default a steady 16.0 V 4S pack, BATT_* defaults: 4 cells,
+# LOW 3.6, CRITICAL 3.5 V/cell, 10 s, act 0); set_battery_ok is no longer called. The station heartbeat is fed directly with
+# Flight::set_last_radio_heartbeat_us, so the board glue's sender filter (255, 190) does not apply in the simulator.
+
+## PC (sim d573883, firmware 8425f59, 2026-11-24T04:01:12-06:00)
+p2-chop60-1s | cells 15 | states S>P>L>S:15 | stops in air 0 | K-fire cells 0 | h at loss 56.66[37.89,65.76] | fall stopped at - m | rise after - m | hover after - s | contact->stop 4.95[3.87,54.53] | ever stopped 15
+    p0-mapA-air1 h_lost 56.61 fall_stop none@none rise none hover none contact 159.950 td_vz 0.489 stop 4.29 S@0.001,P@60.002,L@126.965,S@164.240
+    p0-mapA-air2 h_lost 56.67 fall_stop none@none rise none hover none contact 156.715 td_vz 0.596 stop 5.73 S@0.001,P@60.002,L@126.965,S@162.440
+    p0-mapA-air3 h_lost 56.66 fall_stop none@none rise none hover none contact 156.549 td_vz 0.585 stop 4.66 S@0.001,P@60.002,L@126.965,S@161.210
+    p1-mapA-air1 h_lost 37.89 fall_stop none@none rise none hover none contact 128.729 td_vz 14.055 stop 54.53 S@0.001,P@60.002,L@127.305,S@183.257
+    p1-mapA-air2 h_lost 38.26 fall_stop none@none rise none hover none contact 128.737 td_vz 14.109 stop 45.83 S@0.001,P@60.002,L@127.305,S@174.564
+    p1-mapA-air3 h_lost 38.08 fall_stop none@none rise none hover none contact 128.719 td_vz 14.269 stop 45.21 S@0.001,P@60.002,L@127.309,S@173.925
+    p2-mapA-air1 h_lost 38.03 fall_stop none@none rise none hover none contact 128.734 td_vz 13.611 stop 53.56 S@0.001,P@60.002,L@127.281,S@182.291
+    p2-mapA-air2 h_lost 38.40 fall_stop none@none rise none hover none contact 128.740 td_vz 13.694 stop 44.29 S@0.001,P@60.002,L@127.281,S@173.031
+    p2-mapA-air3 h_lost 38.23 fall_stop none@none rise none hover none contact 128.718 td_vz 13.841 stop 44.22 S@0.001,P@60.002,L@127.281,S@172.935
+    p3-mapA-air1 h_lost 65.43 fall_stop none@none rise none hover none contact 166.426 td_vz 0.509 stop 3.87 S@0.001,P@60.002,L@126.761,S@170.300
+    p3-mapA-air2 h_lost 65.76 fall_stop none@none rise none hover none contact 164.947 td_vz 0.744 stop 4.95 S@0.001,P@60.002,L@126.761,S@169.897
+    p3-mapA-air3 h_lost 65.66 fall_stop none@none rise none hover none contact 164.956 td_vz 0.738 stop 4.85 S@0.001,P@60.002,L@126.761,S@169.805
+    p4-mapA-air1 h_lost 65.19 fall_stop none@none rise none hover none contact 166.676 td_vz 0.506 stop 3.87 S@0.001,P@60.002,L@126.741,S@170.546
+    p4-mapA-air2 h_lost 65.53 fall_stop none@none rise none hover none contact 165.200 td_vz 0.652 stop 4.60 S@0.001,P@60.002,L@126.741,S@169.802
+    p4-mapA-air3 h_lost 65.44 fall_stop none@none rise none hover none contact 165.199 td_vz 0.662 stop 4.62 S@0.001,P@60.002,L@126.741,S@169.820
+p2-chop60-2s | cells 15 | states S>P>L>S:9 S>P>L:6 | stops in air 0 | K-fire cells 0 | h at loss 43.86[23.80,52.38] | fall stopped at 6.88[4.88,8.15] m | rise after 0.01[0.01,0.03] m | hover after 0.5[0.5,0.5] s | contact->stop 4.00[3.58,128.10] | ever stopped 9
+    p0-mapA-air1 h_lost 44.03 fall_stop none@none rise none hover none contact 129.002 td_vz 16.827 stop 128.10 S@0.001,P@60.002,L@127.965,S@257.100
+    p0-mapA-air2 h_lost 43.86 fall_stop none@none rise none hover none contact 129.045 td_vz 15.931 stop 44.47 S@0.001,P@60.002,L@127.965,S@173.517
+    p0-mapA-air3 h_lost 43.85 fall_stop none@none rise none hover none contact 129.055 td_vz 15.740 stop 44.27 S@0.001,P@60.002,L@127.965,S@173.319
+    p1-mapA-air1 h_lost 23.84 fall_stop none@none rise none hover none contact 128.331 td_vz 27.965 stop none S@0.001,P@60.002,L@128.305
+    p1-mapA-air2 h_lost 24.12 fall_stop none@none rise none hover none contact 128.338 td_vz 28.125 stop none S@0.001,P@60.002,L@128.305
+    p1-mapA-air3 h_lost 23.89 fall_stop none@none rise none hover none contact 128.331 td_vz 28.080 stop none S@0.001,P@60.002,L@128.309
+    p2-mapA-air1 h_lost 23.80 fall_stop none@none rise none hover none contact 128.300 td_vz 28.075 stop none S@0.001,P@60.002,L@128.281
+    p2-mapA-air2 h_lost 24.08 fall_stop none@none rise none hover none contact 128.306 td_vz 28.173 stop none S@0.001,P@60.002,L@128.281
+    p2-mapA-air3 h_lost 23.86 fall_stop none@none rise none hover none contact 128.297 td_vz 28.120 stop none S@0.001,P@60.002,L@128.281
+    p3-mapA-air1 h_lost 52.08 fall_stop 4.88@129.787 rise 0.03 hover 0.5 contact 139.920 td_vz 0.479 stop 3.70 S@0.001,P@60.002,L@127.761,S@143.625
+    p3-mapA-air2 h_lost 52.38 fall_stop none@none rise none hover none contact 144.144 td_vz 0.667 stop 4.00 S@0.001,P@60.002,L@127.761,S@148.141
+    p3-mapA-air3 h_lost 52.30 fall_stop none@none rise none hover none contact 144.224 td_vz 0.690 stop 4.04 S@0.001,P@60.002,L@127.761,S@148.260
+    p4-mapA-air1 h_lost 51.70 fall_stop 5.65@129.831 rise 0.01 hover 0.5 contact 141.424 td_vz 0.548 stop 4.00 S@0.001,P@60.002,L@127.741,S@145.420
+    p4-mapA-air2 h_lost 52.00 fall_stop 8.15@129.894 rise 0.01 hover 0.5 contact 143.649 td_vz 0.492 stop 3.58 S@0.001,P@60.002,L@127.741,S@147.227
+    p4-mapA-air3 h_lost 51.92 fall_stop 8.12@129.877 rise 0.01 hover 0.5 contact 143.730 td_vz 0.520 stop 3.59 S@0.001,P@60.002,L@127.741,S@147.320
+p2-chop60-3s | cells 15 | states S>P>L:15 | stops in air 0 | K-fire cells 0 | h at loss 22.62[0.33,31.49] | fall stopped at -0.00[-0.00,-0.00] m | rise after 510.84[447.77,1005.67] m | hover after 0.0[0.0,0.0] s | contact->stop - | ever stopped 0
+    p0-mapA-air1 h_lost 22.55 fall_stop -0.00@128.965 rise 875.05 hover 0.0 contact none td_vz none stop none S@0.001,P@60.002,L@128.965
+    p0-mapA-air2 h_lost 22.62 fall_stop -0.00@128.965 rise 510.84 hover 0.0 contact none td_vz none stop none S@0.001,P@60.002,L@128.965
+    p0-mapA-air3 h_lost 22.66 fall_stop -0.00@128.965 rise 508.52 hover 0.0 contact none td_vz none stop none S@0.001,P@60.002,L@128.965
+    p1-mapA-air1 h_lost 0.62 fall_stop -0.00@129.305 rise 536.67 hover 0.0 contact none td_vz none stop none S@0.001,P@60.002,L@129.305
+    p1-mapA-air2 h_lost 0.79 fall_stop -0.00@129.305 rise 458.39 hover 0.0 contact none td_vz none stop none S@0.001,P@60.002,L@129.305
+    p1-mapA-air3 h_lost 0.51 fall_stop -0.00@129.309 rise 450.79 hover 0.0 contact none td_vz none stop none S@0.001,P@60.002,L@129.309
+    p2-mapA-air1 h_lost 0.41 fall_stop -0.00@129.281 rise 548.77 hover 0.0 contact none td_vz none stop none S@0.001,P@60.002,L@129.281
+    p2-mapA-air2 h_lost 0.57 fall_stop -0.00@129.281 rise 455.64 hover 0.0 contact none td_vz none stop none S@0.001,P@60.002,L@129.281
+    p2-mapA-air3 h_lost 0.33 fall_stop -0.00@129.281 rise 447.77 hover 0.0 contact none td_vz none stop none S@0.001,P@60.002,L@129.281
+    p3-mapA-air1 h_lost 30.10 fall_stop -0.00@128.761 rise 1005.67 hover 0.0 contact none td_vz none stop none S@0.001,P@60.002,L@128.761
+    p3-mapA-air2 h_lost 31.49 fall_stop none@none rise none hover none contact 128.950 td_vz 28.949 stop none S@0.001,P@60.002,L@128.761
+    p3-mapA-air3 h_lost 31.42 fall_stop none@none rise none hover none contact 128.947 td_vz 28.945 stop none S@0.001,P@60.002,L@128.761
+    p4-mapA-air1 h_lost 29.59 fall_stop -0.00@128.741 rise 1002.95 hover 0.0 contact none td_vz none stop none S@0.001,P@60.002,L@128.741
+    p4-mapA-air2 h_lost 30.77 fall_stop none@none rise none hover none contact 128.881 td_vz 28.745 stop none S@0.001,P@60.002,L@128.741
+    p4-mapA-air3 h_lost 30.70 fall_stop none@none rise none hover none contact 128.879 td_vz 28.766 stop none S@0.001,P@60.002,L@128.741
+p2-chop60-4s | cells 15 | states S>P>L:9 S>P>S:6 | stops in air 0 | K-fire cells 0 | h at loss -0.00[-0.00,5.29] | fall stopped at -0.00[-0.00,-0.00] m | rise after 514.14[483.48,971.99] m | hover after 0.0[0.0,0.1] s | contact->stop 1.98[1.97,1.99] | ever stopped 6
+    p0-mapA-air1 h_lost -0.00 fall_stop -0.00@129.965 rise 843.38 hover 0.0 contact none td_vz none stop none S@0.001,P@60.002,L@129.965
+    p0-mapA-air2 h_lost -0.00 fall_stop -0.00@129.965 rise 488.21 hover 0.0 contact none td_vz none stop none S@0.001,P@60.002,L@129.965
+    p0-mapA-air3 h_lost -0.00 fall_stop -0.00@129.965 rise 483.48 hover 0.0 contact none td_vz none stop none S@0.001,P@60.002,L@129.965
+    p1-mapA-air1 h_lost -0.00 fall_stop None@None rise None hover None contact None td_vz 27.998 stop 1.97 S@0.001,P@60.002,S@130.305
+    p1-mapA-air2 h_lost -0.00 fall_stop None@None rise None hover None contact None td_vz 28.175 stop 1.97 S@0.001,P@60.002,S@130.305
+    p1-mapA-air3 h_lost -0.00 fall_stop None@None rise None hover None contact None td_vz 28.102 stop 1.98 S@0.001,P@60.002,S@130.309
+    p2-mapA-air1 h_lost -0.00 fall_stop None@None rise None hover None contact None td_vz 28.107 stop 1.98 S@0.001,P@60.002,S@130.281
+    p2-mapA-air2 h_lost -0.00 fall_stop None@None rise None hover None contact None td_vz 28.229 stop 1.98 S@0.001,P@60.002,S@130.281
+    p2-mapA-air3 h_lost -0.00 fall_stop None@None rise None hover None contact None td_vz 28.140 stop 1.99 S@0.001,P@60.002,S@130.281
+    p3-mapA-air1 h_lost -0.00 fall_stop -0.00@129.761 rise 971.99 hover 0.0 contact none td_vz none stop none S@0.001,P@60.002,L@129.761
+    p3-mapA-air2 h_lost 5.29 fall_stop -0.00@129.761 rise 512.03 hover 0.1 contact none td_vz none stop none S@0.001,P@60.002,L@129.761
+    p3-mapA-air3 h_lost 5.20 fall_stop -0.00@129.761 rise 514.14 hover 0.1 contact none td_vz none stop none S@0.001,P@60.002,L@129.761
+    p4-mapA-air1 h_lost -0.00 fall_stop -0.00@129.741 rise 969.33 hover 0.0 contact none td_vz none stop none S@0.001,P@60.002,L@129.741
+    p4-mapA-air2 h_lost 3.93 fall_stop -0.00@129.741 rise 512.17 hover 0.1 contact none td_vz none stop none S@0.001,P@60.002,L@129.741
+    p4-mapA-air3 h_lost 3.85 fall_stop -0.00@129.741 rise 519.44 hover 0.1 contact none td_vz none stop none S@0.001,P@60.002,L@129.741
+
+## P4 (sim d573883, firmware 8425f59, 2026-11-24T04:01:29-06:00)
+p4-alt | cells 15 | states S>P>H>A>H>T>P>S:15 | stops in air 0 | K-fire cells 0 | PILOT from TAKEOVER in mode (sel/eff) ['2/2']: drift 30 s 121.10[2.24,126.77] (max 121.10[2.24,126.77]) m | after the switch to Position ['-']: drift 30 s - (max -) m
+    p0-mapA-air1 pilot 164.512 drift 3.09 max 3.09 | pos none drift None max None
+    p0-mapA-air2 pilot 164.776 drift 121.10 max 121.10 | pos none drift None max None
+    p0-mapA-air3 pilot 164.621 drift 124.63 max 124.63 | pos none drift None max None
+    p1-mapA-air1 pilot 164.636 drift 2.63 max 2.63 | pos none drift None max None
+    p1-mapA-air2 pilot 164.909 drift 122.70 max 122.70 | pos none drift None max None
+    p1-mapA-air3 pilot 164.769 drift 126.77 max 126.77 | pos none drift None max None
+    p2-mapA-air1 pilot 164.641 drift 2.24 max 2.24 | pos none drift None max None
+    p2-mapA-air2 pilot 164.889 drift 122.75 max 122.75 | pos none drift None max None
+    p2-mapA-air3 pilot 164.765 drift 126.55 max 126.55 | pos none drift None max None
+    p3-mapA-air1 pilot 164.341 drift 5.40 max 5.40 | pos none drift None max None
+    p3-mapA-air2 pilot 164.585 drift 119.13 max 119.13 | pos none drift None max None
+    p3-mapA-air3 pilot 164.429 drift 124.04 max 124.04 | pos none drift None max None
+    p4-mapA-air1 pilot 164.332 drift 5.39 max 5.39 | pos none drift None max None
+    p4-mapA-air2 pilot 164.556 drift 119.00 max 119.00 | pos none drift None max None
+    p4-mapA-air3 pilot 164.409 drift 124.07 max 124.07 | pos none drift None max None
+p4-pos | cells 15 | states S>P>H>A>H>T>P>S:15 | stops in air 0 | K-fire cells 0 | PILOT from TAKEOVER in mode (sel/eff) ['2/2']: drift 30 s 4.51[0.01,4.86] (max 4.94[0.32,5.08]) m | after the switch to Position ['3/3']: drift 30 s 1.18[0.17,1.47] (max 1.57[0.28,1.71]) m
+    p0-mapA-air1 pilot 164.512 drift 0.24 max 0.47 | pos 167.512 drift 0.19 max 0.30
+    p0-mapA-air2 pilot 164.776 drift 4.71 max 4.95 | pos 167.776 drift 1.18 max 1.69
+    p0-mapA-air3 pilot 164.621 drift 4.64 max 4.98 | pos 167.621 drift 1.42 max 1.57
+    p1-mapA-air1 pilot 164.636 drift 0.02 max 0.33 | pos 167.636 drift 0.19 max 0.31
+    p1-mapA-air2 pilot 164.909 drift 4.85 max 5.05 | pos 167.909 drift 1.19 max 1.68
+    p1-mapA-air3 pilot 164.769 drift 4.74 max 5.02 | pos 167.769 drift 1.45 max 1.58
+    p2-mapA-air1 pilot 164.641 drift 0.01 max 0.32 | pos 167.641 drift 0.18 max 0.31
+    p2-mapA-air2 pilot 164.889 drift 4.86 max 5.08 | pos 167.889 drift 1.20 max 1.71
+    p2-mapA-air3 pilot 164.765 drift 4.75 max 5.03 | pos 167.765 drift 1.47 max 1.59
+    p3-mapA-air1 pilot 164.341 drift 0.44 max 0.65 | pos 167.341 drift 0.17 max 0.28
+    p3-mapA-air2 pilot 164.585 drift 4.41 max 4.67 | pos 167.585 drift 1.12 max 1.62
+    p3-mapA-air3 pilot 164.429 drift 4.51 max 4.94 | pos 167.429 drift 1.35 max 1.55
+    p4-mapA-air1 pilot 164.332 drift 0.44 max 0.65 | pos 167.332 drift 0.17 max 0.28
+    p4-mapA-air2 pilot 164.556 drift 4.37 max 4.64 | pos 167.556 drift 1.12 max 1.61
+    p4-mapA-air3 pilot 164.409 drift 4.51 max 4.95 | pos 167.409 drift 1.36 max 1.55
+
+## P1 (sim d573883, firmware 8425f59, 2026-11-24T04:02:12-06:00)
+m1-square | PASS | cells 15 | states S>P>H>A>H>T>P>S:15 | trips 0 LAND/BLIND 0 stops-in-air 0 K-fire cells 0 | wp0 t_leg 11.6[11.5,11.8] d_arr 1.96[1.93,1.98] herr -0.10[-0.31,-0.05] xt 0.43[0.39,0.44]; wp1 t_leg 11.5[11.5,11.6] d_arr 1.92[1.91,1.92] herr 0.04[-0.02,0.12] xt 1.96[1.93,1.98]; wp2 t_leg 11.5[11.5,11.6] d_arr 2.01[1.99,2.03] herr 0.28[0.17,0.48] xt 1.92[1.91,1.92]; wp3 t_leg 11.5[11.4,11.5] d_arr 1.91[1.87,1.95] herr 0.38[0.17,0.53] xt 1.99[1.97,2.00]; carrot est 2.00[2.00,2.00] (true 2.42[2.38,2.44]) X 7.00[7.00,7.00] | sag 0.90[0.52,1.65] | hdg dev 4.2[3.8,4.8] deg | vh max 3.08[3.07,3.16] | Start ['accepted']
+m1-square-s23 | PASS | cells 6 | states S>P>H>A>H>T>P>S:6 | trips 0 LAND/BLIND 0 stops-in-air 0 K-fire cells 0 | wp0 t_leg 11.2[11.2,11.3] d_arr 2.15[1.91,2.38] herr 0.43[0.33,0.70] xt 0.57[0.32,0.81]; wp1 t_leg 11.7[11.6,11.8] d_arr 2.05[1.73,2.37] herr 0.42[0.21,0.85] xt 2.14[1.90,2.38]; wp2 t_leg 11.3[11.1,11.5] d_arr 2.01[1.91,2.13] herr 0.54[0.43,0.78] xt 2.04[1.73,2.35]; wp3 t_leg 11.3[11.2,11.4] d_arr 1.98[1.72,2.24] herr 0.45[0.24,0.54] xt 1.94[1.77,2.13]; carrot est 2.00[2.00,2.00] (true 2.17[2.10,2.25]) X 7.00[7.00,7.00] | sag 0.71[0.65,0.95] | hdg dev 2.9[1.6,3.9] deg | vh max 3.08[3.07,3.14] | Start ['accepted']
+m1-owner | PASS | cells 15 | states S>P>H>A>H>T>P>S:15 | trips 0 LAND/BLIND 0 stops-in-air 0 K-fire cells 0 | wp0 t_leg 9.9[9.8,10.0] d_arr 1.88[1.85,1.89] herr 0.00[-0.23,0.07] xt 0.43[0.41,0.45]; wp1 t_leg 13.2[13.2,13.3] d_arr 1.91[1.90,1.92] herr 0.04[-0.05,0.08] xt 1.88[1.85,1.89]; wp2 t_leg 13.3[13.3,13.4] d_arr 2.01[2.00,2.02] herr 0.57[0.31,0.77] xt 1.90[1.89,1.91]; wp3 t_leg 12.1[12.1,12.1] d_arr 1.86[1.86,1.89] herr 0.49[0.37,0.64] xt 1.90[1.90,1.91]; carrot est 2.00[2.00,2.00] (true 2.44[2.39,2.45]) X 7.00[7.00,7.00] | sag 0.78[0.62,1.24] | hdg dev 2.8[2.4,3.1] deg | vh max 3.06[3.05,3.06] | Start ['accepted']
+m1-owner-s23 | FAIL | cells 6 | states S>P>H>A>H>T>P>S:6 | trips 0 LAND/BLIND 0 stops-in-air 0 K-fire cells 0 | wp0 t_leg 9.2[9.0,9.3] d_arr 2.12[1.71,2.54] herr 0.30[0.14,0.38] xt 0.61[0.36,0.88]; wp1 t_leg 13.4[13.2,13.5] d_arr 2.05[1.73,2.37] herr 0.40[0.21,0.71] xt 2.10[1.67,2.54]; wp2 t_leg 13.3[13.3,13.4] d_arr 1.90[1.86,1.95] herr 0.44[0.32,0.50] xt 2.01[1.73,2.29]; wp3 t_leg 11.9[11.9,12.1] d_arr 2.02[1.69,2.36] herr 0.44[0.20,0.74] xt 1.79[1.65,1.95]; carrot est 2.00[2.00,2.00] (true 2.15[2.13,2.19]) X 7.00[7.00,7.00] | sag 0.61[0.40,0.65] | hdg dev 2.5[1.8,2.8] deg | vh max 3.08[3.06,3.13] | Start ['accepted']
+    FAIL m1-owner-s23 p0-mapA-air1-gnd1-seed2: wp 0 arrival 2.54 m > 2.5 | states S@0.001,P@60.002,H@98.373,A@103.373,H@151.093,T@161.096,P@166.096,S@176.292
+    FAIL m1-owner-s23 p0-mapA-air2-gnd1-seed2: wp 0 arrival 2.54 m > 2.5 | states S@0.001,P@60.002,H@98.373,A@103.373,H@151.176,T@161.181,P@166.181,S@176.433
+    FAIL m1-owner-s23 p0-mapA-air3-gnd1-seed2: wp 0 arrival 2.54 m > 2.5 | states S@0.001,P@60.002,H@98.373,A@103.373,H@151.142,T@161.145,P@166.145,S@176.445
+r1-square | PASS | cells 15 | states S>P>H>A>R>L>S:15 | cmds ['start:accepted,return:accepted'] | trips 0 (by ['none']) | K-fire cells 0 | RETURN at 111.5[111.2,111.8] s, h 10.06[9.78,10.29], from home 17.19[16.85,17.70] | climb 4.06[3.90,4.10] s to 20.11[19.52,20.56] (drift 1.12[0.99,1.25]) | h max 20.66[20.29,20.96] (est-true at top -0.33[-0.53,-0.11]) | leg 6.3[6.2,6.6] s | exit ['6'] at 1.42[1.40,1.43] m from home | carrot max 2.00[2.00,2.00] | LAND vz >10 m 1.33[1.31,1.38], <10 m 0.60[0.51,0.62] | touchdown 0.49[0.35,0.67] m from home at 0.52[0.47,0.53] m/s | Return->stop 40.2[38.5,42.8] s | contact->stop 4.23[3.53,5.86] s | vh max 2.99[2.96,3.02]
+r1-far | PASS | cells 15 | states S>P>H>A>R>L>S:15 | cmds ['start:accepted,return:accepted'] | trips 0 (by ['none']) | K-fire cells 0 | RETURN at 174.5[174.2,174.8] s, h 29.93[29.76,30.00], from home 141.49[141.34,141.75] | climb 3.96[3.94,4.05] s to 39.95[39.25,40.29] (drift 1.20[1.08,1.30]) | h max 40.75[40.34,40.86] (est-true at top -0.21[-0.29,-0.05]) | leg 50.2[50.0,50.5] s | exit ['6'] at 2.05[2.03,2.05] m from home | carrot max 2.00[2.00,2.00] | LAND vz >10 m 1.45[1.44,1.47], <10 m 0.56[0.52,0.57] | touchdown 1.09[1.02,1.17] m from home at 0.52[0.49,0.56] m/s | Return->stop 98.0[96.6,99.3] s | contact->stop 4.54[3.89,5.91] s | vh max 3.08[3.06,3.09]
+r2-auto | PASS | cells 15 | states S>P>H>A>H>R>L>S:15 | cmds ['start:accepted'] | trips 0 (by ['none']) | K-fire cells 0 | RETURN at 121.0[121.0,121.0] s, h 12.65[12.08,13.21], from home 29.83[29.47,30.05] | climb 3.08[2.93,3.30] s to 20.16[19.74,20.41] (drift 0.23[0.15,0.28]) | h max 20.39[20.20,20.51] (est-true at top -0.05[-0.16,0.35]) | leg 10.6[10.6,10.8] s | exit ['6'] at 1.35[1.34,1.36] m from home | carrot max 2.00[2.00,2.00] | LAND vz >10 m 1.35[1.34,1.39], <10 m 0.59[0.52,0.61] | touchdown 0.51[0.45,0.56] m from home at 0.48[0.44,0.50] m/s | Return->stop 42.7[41.3,46.2] s | contact->stop 4.09[3.54,5.61] s | vh max 3.07[3.07,3.08]
+r2-hold | PASS | cells 15 | states S>P>H>R>L>S:15 | cmds ['none'] | trips 0 (by ['none']) | K-fire cells 0 | RETURN at 115.0[115.0,115.0] s, h 5.98[5.72,6.37], from home 0.39[0.38,0.41] | climb 5.02[4.87,5.41] s to 20.40[20.01,20.67] (drift 0.25[0.23,0.35]) | h max 20.40[20.01,20.67] (est-true at top -0.03[-0.08,0.10]) | leg - s | exit ['6'] at 0.65[0.61,0.71] m from home | carrot max 0.41[0.34,0.46] | LAND vz >10 m 1.34[1.33,1.36], <10 m 0.58[0.51,0.59] | touchdown 0.62[0.55,0.72] m from home at 0.60[0.55,0.74] m/s | Return->stop 36.3[34.7,37.9] s | contact->stop 5.77[3.83,7.38] s | vh max 0.35[0.35,0.38]
+
+## P3 (sim d573883, firmware 8425f59, 2026-11-24T04:02:26-06:00)
+p3-crit-auto | cells 15 | states S>P>H>A>L>S:15 | stops in air 0 | K-fire cells 0 | cmds ['start@103.241:accepted', 'start@103.261:accepted', 'start@103.465:accepted', 'start@103.781:accepted', 'start@103.805:accepted', 'start@103.809:accepted'] | battery cell byte changes ['8@0.0,9@110.9,2@111.1,8@132.7', '8@0.0,9@110.9,2@111.1,8@132.8', '8@0.0,9@110.9,2@111.1,8@133.2'] | LAND at 111.1[111.1,111.1] | LAND->TD 1.48[1.43,1.54] m | touchdown from home (RETURN cells) - m | contact->stop 4.11[3.44,5.59] | wp reached [0]
+    p0-mapA-air1 S@0.001,P@60.002,H@98.465,A@103.465,L@111.101,S@134.830 msn_land 111.101:xt0.05:carrot_true0.19 d_land_m 16.70 land_to_td 1.46 ret_d_home_entry None ret_td_d_home None
+    p0-mapA-air2 S@0.001,P@60.002,H@98.465,A@103.465,L@111.101,S@133.200 msn_land 111.101:xt0.05:carrot_true0.18 d_land_m 16.78 land_to_td 1.50 ret_d_home_entry None ret_td_d_home None
+    p0-mapA-air3 S@0.001,P@60.002,H@98.465,A@103.465,L@111.101,S@133.140 msn_land 111.101:xt0.02:carrot_true0.25 d_land_m 16.52 land_to_td 1.43 ret_d_home_entry None ret_td_d_home None
+p3-crit-ret | cells 15 | states S>P>H>A>R>L>S:15 | stops in air 0 | K-fire cells 0 | cmds ['start@103.241:accepted,return@111.241:accepted', 'start@103.261:accepted,return@111.261:accepted', 'start@103.465:accepted,return@111.465:accepted', 'start@103.781:accepted,return@111.781:accepted', 'start@103.805:accepted,return@111.805:accepted', 'start@103.809:accepted,return@111.809:accepted'] | battery cell byte changes ['8@0.0,9@115.9,2@116.1,8@145.3', '8@0.0,9@115.9,2@116.1,8@145.5', '8@0.0,9@115.9,2@116.1,8@145.8'] | LAND at 116.1[116.1,116.1] | LAND->TD 0.99[0.45,1.25] m | touchdown from home (RETURN cells) 15.92[14.75,17.62] m | contact->stop 5.25[3.73,5.93] | wp reached [0]
+    p0-mapA-air1 S@0.001,P@60.002,H@98.465,A@103.465,R@111.465,L@116.101,S@147.109 msn_land 116.101:xtnone:carrot_true1.26 d_land_m 17.45 land_to_td 1.03 ret_d_home_entry 17.19 ret_td_d_home 15.92
+    p0-mapA-air2 S@0.001,P@60.002,H@98.465,A@103.465,R@111.465,L@116.101,S@145.455 msn_land 116.101:xtnone:carrot_true1.33 d_land_m 17.80 land_to_td 0.88 ret_d_home_entry 17.27 ret_td_d_home 16.39
+    p0-mapA-air3 S@0.001,P@60.002,H@98.465,A@103.465,R@111.465,L@116.101,S@145.921 msn_land 116.101:xtnone:carrot_true1.26 d_land_m 17.19 land_to_td 0.99 ret_d_home_entry 17.00 ret_td_d_home 15.67
+p3-low | cells 15 | states S>P>H>A>H>T>P>S:15 | stops in air 0 | K-fire cells 0 | cmds ['start@103.241:accepted', 'start@103.261:accepted', 'start@103.465:accepted', 'start@103.781:accepted', 'start@103.805:accepted', 'start@103.809:accepted'] | battery cell byte changes ['8@0.0,9@111.0,8@188.4', '8@0.0,9@111.0,8@188.5', '8@0.0,9@111.0,8@188.8'] | LAND at - | LAND->TD - m | touchdown from home (RETURN cells) - m | contact->stop 5.20[5.20,5.21] | wp reached [4]
+    p0-mapA-air1 S@0.001,P@60.002,H@98.465,A@103.465,H@149.511,T@159.512,P@164.512,S@188.912 msn_land none d_land_m none land_to_td none ret_d_home_entry None ret_td_d_home None
+    p0-mapA-air2 S@0.001,P@60.002,H@98.465,A@103.465,H@149.772,T@159.776,P@164.776,S@189.732 msn_land none d_land_m none land_to_td none ret_d_home_entry None ret_td_d_home None
+    p0-mapA-air3 S@0.001,P@60.002,H@98.465,A@103.465,H@149.620,T@159.621,P@164.621,S@189.101 msn_land none d_land_m none land_to_td none ret_d_home_entry None ret_td_d_home None
+p3-start-crit | cells 15 | states S>P>H>L>S:15 | stops in air 0 | K-fire cells 0 | cmds ['start@103.241:denied:4:NotInThisState', 'start@103.261:denied:4:NotInThisState', 'start@103.465:denied:4:NotInThisState', 'start@103.781:denied:4:NotInThisState', 'start@103.805:denied:4:NotInThisState', 'start@103.809:denied:4:NotInThisState'] | battery cell byte changes ['8@0.0,2@70.2,8@112.9', '8@0.0,2@70.2,8@113.0', '8@0.0,2@70.2,8@113.4'] | LAND at 98.5[98.2,98.8] | LAND->TD 0.35[0.17,0.41] m | touchdown from home (RETURN cells) - m | contact->stop 3.85[2.90,5.63] | wp reached [0]
+    p0-mapA-air1 S@0.001,P@60.002,H@98.465,L@98.466,S@114.954 msn_land none d_land_m 0.00 land_to_td 0.39 ret_d_home_entry None ret_td_d_home None
+    p0-mapA-air2 S@0.001,P@60.002,H@98.465,L@98.466,S@113.322 msn_land none d_land_m 0.00 land_to_td 0.33 ret_d_home_entry None ret_td_d_home None
+    p0-mapA-air3 S@0.001,P@60.002,H@98.465,L@98.466,S@113.360 msn_land none d_land_m 0.00 land_to_td 0.29 ret_d_home_entry None ret_td_d_home None
+p3-start-off | cells 15 | states S>P>H:15 | stops in air 0 | K-fire cells 0 | cmds ['start@103.241:denied:14:BatteryNotOk', 'start@103.261:denied:14:BatteryNotOk', 'start@103.465:denied:14:BatteryNotOk', 'start@103.781:denied:14:BatteryNotOk', 'start@103.805:denied:14:BatteryNotOk', 'start@103.809:denied:14:BatteryNotOk'] | battery cell byte changes ['0@0.0'] | LAND at - | LAND->TD - m | touchdown from home (RETURN cells) - m | contact->stop - | wp reached [0]
+    p0-mapA-air1 S@0.001,P@60.002,H@98.465 msn_land none d_land_m none land_to_td none ret_d_home_entry None ret_td_d_home None
+    p0-mapA-air2 S@0.001,P@60.002,H@98.465 msn_land none d_land_m none land_to_td none ret_d_home_entry None ret_td_d_home None
+    p0-mapA-air3 S@0.001,P@60.002,H@98.465 msn_land none d_land_m none land_to_td none ret_d_home_entry None ret_td_d_home None
+
+## PCC (sim d573883, firmware 8425f59, 2026-11-24T04:02:42-06:00)
+c-pos3 | PASS | cells 15 | air stops 0 | states S>P>L>S:15 | vz at loss 0.28[-0.07,0.36] | lowest coll 1st s 0.885[0.641,1.378] m g | dh 5 s -2.81[-3.21,-2.43] (max 0.00[0.00,0.03], min -2.81[-3.21,-2.43]) m | h_gain 0.00[0.00,0.03] | TD vz 0.88[0.52,0.95] | contact->stop 5.90[3.87,7.87] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+c-pos5 | PASS | cells 15 | air stops 0 | states S>P>L>S:15 | vz at loss 0.28[-0.23,0.32] | lowest coll 1st s 0.934[0.691,1.380] m g | dh 5 s -2.90[-3.27,-2.34] (max 0.00[0.00,0.07], min -2.90[-3.27,-2.34]) m | h_gain 0.00[0.00,0.07] | TD vz 0.69[0.53,0.94] | contact->stop 5.71[3.91,7.75] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+c-climb | PASS | cells 15 | air stops 0 | states S>P>L>S:15 | vz at loss -4.17[-4.42,-3.59] | lowest coll 1st s 0.573[0.427,0.637] m g | dh 5 s 2.68[-5.63,2.95] (max 4.46[1.27,4.71], min -0.00[-5.63,-0.00]) m | h_gain 4.46[1.27,4.71] | TD vz 0.86[0.47,1.08] | contact->stop 4.89[3.63,5.42] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+c-chop30 | PASS | cells 15 | air stops 0 | states S>P>L>S:10 S>P>L:5 | vz at loss 11.75[0.00,13.23] | lowest coll 1st s 2.000[2.000,2.000] m g | dh 5 s 39.24[14.25,59.90] (max 39.24[14.26,59.90], min -5.93[-9.79,-0.00]) m | h_gain 65.86[14.26,201.12] | TD vz 14.88[0.87,18.70] | contact->stop 5.50[5.02,19.04] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+c-chop60 | PASS | cells 15 | air stops 0 | states S>P>L>S:9 S>P>L:6 | vz at loss 13.55[12.59,14.38] | lowest coll 1st s 2.000[2.000,2.000] m g | dh 5 s -21.02[-27.81,24.80] (max 0.00[0.00,24.80], min -21.02[-27.81,-13.32]) m | h_gain 0.00[0.00,283.45] | TD vz 0.54[0.46,22.12] | contact->stop 4.17[3.81,4.37] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+
+## PA (sim d573883, firmware 8425f59, 2026-11-24T04:03:24-06:00)
+a-h2-t3-g088 | FAIL | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 4.91[4.02,6.72] s (>5 or none: 6) | LAND->TD 0.22[0.18,0.23] m (>2: 0) | TD vz 0.64[0.50,0.66] | h_gain 0.00[0.00,0.00] | vz mean 0.53[0.49,0.59] max 0.66[0.54,0.91] | H 0.962[0.867,1.587] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h2-t3-g100 | FAIL | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 4.45[3.73,6.15] s (>5 or none: 6) | LAND->TD 0.21[0.19,0.23] m (>2: 0) | TD vz 0.64[0.50,0.66] | h_gain 0.00[0.00,0.00] | vz mean 0.55[0.50,0.60] max 0.68[0.55,0.94] | H 0.913[0.773,1.400] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h2-t3-g112 | FAIL | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 4.10[3.55,5.40] s (>5 or none: 6) | LAND->TD 0.21[0.18,0.23] m (>2: 0) | TD vz 0.63[0.50,0.66] | h_gain 0.00[0.00,0.00] | vz mean 0.56[0.51,0.60] max 0.70[0.57,0.95] | H 0.875[0.695,1.254] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h2-t2-g088 | FAIL | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 4.91[4.01,6.45] s (>5 or none: 6) | LAND->TD 6.75[0.40,7.80] m (>2: 10, not judged) | TD vz 0.54[0.51,0.55] | h_gain 0.01[0.00,0.02] | vz mean 0.46[0.45,0.47] max 0.61[0.58,0.63] | H 0.988[0.868,1.605] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h2-t2-g100 | FAIL | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 4.47[3.74,5.86] s (>5 or none: 6) | LAND->TD 7.10[0.60,8.30] m (>2: 10, not judged) | TD vz 0.54[0.51,0.55] | h_gain 0.01[0.00,0.01] | vz mean 0.46[0.45,0.47] max 0.61[0.57,0.63] | H 0.927[0.773,1.415] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h2-t2-g112 | FAIL | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 4.11[3.57,5.38] s (>5 or none: 6) | LAND->TD 7.25[0.59,8.47] m (>2: 10, not judged) | TD vz 0.54[0.51,0.54] | h_gain 0.00[0.00,0.01] | vz mean 0.46[0.45,0.47] max 0.60[0.56,0.62] | H 0.879[0.693,1.266] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h2-t1-g088 | FAIL | cells 15 | air stops 0 | states S>P>B>S:15 | contact->stop 2.17[1.85,2.86] s (>5 or none: 9) | LAND->TD 7.42[0.21,9.59] m (>2: 13, not judged) | TD vz 1.11[0.79,1.13] | h_gain 0.00[0.00,0.08] | vz mean 0.00[0.00,0.90] max 0.00[0.00,1.13] | H 0.967[0.868,1.601] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h2-t1-g100 | FAIL | cells 15 | air stops 0 | states S>P>B>S:15 | contact->stop 2.62[1.79,3.01] s (>5 or none: 9) | LAND->TD 23.58[0.82,26.36] m (>2: 13, not judged) | TD vz 3.82[1.50,4.04] | h_gain 0.00[0.00,6.35] | vz mean 0.00[0.00,0.49] max 0.00[0.00,4.04] | H 0.917[0.773,1.412] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h2-t1-g112 | FAIL | cells 15 | air stops 0 | states S>P>B>S:15 | contact->stop 2.90[2.18,3.12] s (>5 or none: 6) | LAND->TD 5.15[0.16,23.86] m (>2: 12, not judged) | TD vz 2.38[0.37,7.39] | h_gain 0.00[0.00,11.06] | vz mean 0.37[0.00,1.03] max 1.01[0.00,7.39] | H 0.878[0.693,1.264] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h10-t3-g088 | FAIL | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 6.45[4.04,8.43] s (>5 or none: 12) | LAND->TD 0.42[0.36,0.63] m (>2: 0) | TD vz 0.82[0.50,0.94] | h_gain 0.00[0.00,0.00] | vz mean 0.59[0.52,0.59] max 0.95[0.62,1.09] | H 0.950[0.863,1.580] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h10-t3-g100 | FAIL | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 5.85[3.82,7.90] s (>5 or none: 12) | LAND->TD 0.44[0.37,0.64] m (>2: 0) | TD vz 0.80[0.50,0.93] | h_gain 0.00[0.00,0.00] | vz mean 0.59[0.52,0.59] max 0.95[0.62,1.09] | H 0.910[0.774,1.396] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h10-t3-g112 | FAIL | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 5.37[3.63,7.44] s (>5 or none: 10) | LAND->TD 0.42[0.39,0.63] m (>2: 0) | TD vz 0.76[0.50,0.92] | h_gain 0.00[0.00,0.00] | vz mean 0.59[0.52,0.59] max 0.94[0.62,1.09] | H 0.875[0.696,1.251] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h10-t2-g088 | FAIL | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 4.59[3.71,6.27] s (>5 or none: 6) | LAND->TD 87.20[4.39,90.80] m (>2: 15, not judged) | TD vz 0.44[0.43,0.49] | h_gain 0.00[0.00,0.00] | vz mean 0.53[0.51,0.55] max 0.72[0.58,0.74] | H 0.973[0.861,1.601] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h10-t2-g100 | FAIL | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 4.14[3.50,5.68] s (>5 or none: 6) | LAND->TD 87.67[4.73,90.93] m (>2: 15, not judged) | TD vz 0.44[0.43,0.49] | h_gain 0.00[0.00,0.00] | vz mean 0.54[0.51,0.55] max 0.72[0.56,0.75] | H 0.919[0.773,1.411] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h10-t2-g112 | FAIL | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 3.78[3.33,5.22] s (>5 or none: 4) | LAND->TD 88.18[4.56,90.94] m (>2: 15, not judged) | TD vz 0.44[0.43,0.49] | h_gain 0.00[0.00,0.00] | vz mean 0.54[0.51,0.55] max 0.73[0.55,0.75] | H 0.874[0.693,1.263] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h10-t1-g088 | PASS | cells 15 | air stops 0 | states S>P>B>S:15 | contact->stop 2.87[1.84,3.23] s (>5 or none: 0) | LAND->TD 0.70[0.05,13.00] m (>2: 4, not judged) | TD vz 6.21[2.62,9.34] | h_gain 0.00[0.00,0.00] | vz mean 5.36[1.60,8.41] max 6.21[2.62,9.34] | H 0.964[0.863,1.597] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h10-t1-g100 | PASS | cells 15 | air stops 0 | states S>P>B>S:15 | contact->stop 2.93[2.41,3.19] s (>5 or none: 0) | LAND->TD 0.93[0.08,27.05] m (>2: 6, not judged) | TD vz 4.99[3.04,8.52] | h_gain 0.00[0.00,3.23] | vz mean 3.65[1.09,7.54] max 4.99[3.04,8.52] | H 0.917[0.774,1.409] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h10-t1-g112 | PASS | cells 15 | air stops 0 | states S>P>B>S:15 | contact->stop 3.11[2.16,3.15] s (>5 or none: 0) | LAND->TD 1.33[0.11,24.26] m (>2: 6, not judged) | TD vz 7.54[2.67,8.49] | h_gain 0.00[0.00,7.80] | vz mean 1.92[1.30,6.65] max 7.53[2.67,8.49] | H 0.877[0.695,1.261] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h30-t3-g088 | FAIL | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 5.89[3.85,7.92] s (>5 or none: 8) | LAND->TD 0.37[0.18,0.40] m (>2: 0) | TD vz 0.51[0.48,0.61] | h_gain 0.01[0.00,0.04] | vz mean 0.99[0.92,1.01] max 1.65[1.59,1.68] | H 0.951[0.856,1.570] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h30-t3-g100 | FAIL | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 5.38[3.64,7.10] s (>5 or none: 8) | LAND->TD 0.39[0.17,0.40] m (>2: 0) | TD vz 0.51[0.48,0.56] | h_gain 0.01[0.00,0.04] | vz mean 0.99[0.92,1.00] max 1.65[1.58,1.67] | H 0.907[0.775,1.388] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h30-t3-g112 | FAIL | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 5.00[3.45,6.43] s (>5 or none: 7) | LAND->TD 0.39[0.16,0.44] m (>2: 0) | TD vz 0.51[0.48,0.53] | h_gain 0.00[0.00,0.04] | vz mean 0.98[0.92,1.00] max 1.64[1.57,1.65] | H 0.874[0.699,1.246] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h30-t2-g088 | FAIL | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 5.24[4.01,6.73] s (>5 or none: 8) | LAND->TD 186.81[9.95,191.99] m (>2: 15, not judged) | TD vz 0.56[0.51,0.56] | h_gain 0.00[0.00,0.00] | vz mean 0.92[0.89,0.94] max 1.65[1.60,1.69] | H 0.975[0.858,1.594] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h30-t2-g100 | FAIL | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 4.90[3.81,6.26] s (>5 or none: 7) | LAND->TD 187.33[9.60,193.30] m (>2: 15, not judged) | TD vz 0.56[0.51,0.56] | h_gain 0.00[0.00,0.00] | vz mean 0.92[0.89,0.93] max 1.63[1.58,1.68] | H 0.919[0.772,1.406] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h30-t2-g112 | FAIL | cells 15 | air stops 0 | states S>P>L>S:15 | contact->stop 4.54[3.63,5.86] s (>5 or none: 6) | LAND->TD 188.19[9.00,194.01] m (>2: 15, not judged) | TD vz 0.56[0.51,0.56] | h_gain 0.00[0.00,0.00] | vz mean 0.92[0.89,0.93] max 1.62[1.58,1.67] | H 0.875[0.693,1.259] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h30-t1-g088 | PASS | cells 15 | air stops 0 | states S>P>B>S:15 | contact->stop 2.86[2.10,3.22] s (>5 or none: 0) | LAND->TD 3.63[0.14,25.89] m (>2: 10, not judged) | TD vz 9.93[5.33,16.26] | h_gain 0.00[0.00,0.00] | vz mean 8.00[3.38,12.48] max 9.93[5.33,16.26] | H 0.960[0.857,1.588] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h30-t1-g100 | PASS | cells 15 | air stops 0 | states S>P>B>S:15 | contact->stop 2.69[1.86,3.19] s (>5 or none: 0) | LAND->TD 4.27[0.17,34.35] m (>2: 10, not judged) | TD vz 7.69[5.64,14.68] | h_gain 0.00[0.00,0.39] | vz mean 5.54[2.85,11.22] max 7.69[5.64,14.68] | H 0.908[0.773,1.401] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+a-h30-t1-g112 | PASS | cells 15 | air stops 0 | states S>P>B>S:15 | contact->stop 3.10[1.95,3.14] s (>5 or none: 0) | LAND->TD 5.25[0.24,28.73] m (>2: 10, not judged) | TD vz 11.21[5.29,12.88] | h_gain 0.00[0.00,4.39] | vz mean 3.74[3.27,9.87] max 11.20[5.29,12.88] | H 0.874[0.694,1.255] | K fire cells 0 (in air 0; steps max 0) | TD restarts after contact 0 in 0 cells, floor drops 0 | TD max in air 0[0,0] ms
+
+## Verdict (all groups on hands-off a3217e5 + hooks = hands-off-sim-a32 8425f59; sim d573883)
+- P1: M1 identical to part 1 (square 21/21 PASS; owner's list 15 PASS, seed 2 wp0 at a true 2.54 m: 3 FAIL, as before). R1/R2 PASS
+  60/60: LAND mean descent between LAND entry - 2 m and 11 m 1.46 (square), 1.53 (far), 1.45 (link loss in AUTO), 1.62 (from HOLD)
+  m/s (part 2 "above 10.5 m" means: 1.31 / 1.45 / 1.28 / 0.70); Return->stop 38.5-42.8 s (part 2 41-44), far 96.6-99.3 s (98-101),
+  from HOLD 34.7-37.9 s (42-44); touchdown 0.35-1.17 m from home; contact->stop 3.5-7.4 s.
+- P2: groups A (405) and C (75) of N2: 0 motor stops above 0.3 m, K 0. A's FAIL marks are the 5 s contact-to-stop rule only, as in
+  N2: LAND 6.45 s median at real gain 0.62 (36/36 over 5 s), 5.85 (0.70), 5.37 (0.78), 4.92 (0.88), 4.47 (1.00) ... 3.67 (1.46);
+  BLIND 2.4-3.2 s. Chop-from-60 m family (PC rows): 1 s chop: never stops descending, LAND brakes to its rate and descends to
+  contact (0.5 m/s) at P0/P3/P4; P1/P2 (real 0.7) hit at 13.6-14.1 m/s from 38 m. 2 s chop: P3/P4 fall stopped at 4.9-5.7 m, then
+  rise 0.01-0.03 m, hover 0.5 s, descend to contact in ~10 s (N18 works); P0 hits at 15.7-16.8 m/s from 44 m, P1/P2 at 28 m/s
+  from 24 m (never stopped: 6 cells). 3 s and 4 s chops: the vehicle is on the ground (crashed) before or at LAND entry; afterwards
+  P0/P3/P4 (and P1/P2 at 3 s) climb away 480-1006 m and never stop (the S3 mechanism of N2: the contact model releases at full
+  collective and the estimator does not see the impact); at 4 s P1/P2 stop at once (STOP from PILOT via TD).
+- P3: CRITICAL mid-leg (cell byte 2 at 111.1 s): LAND at once, holding position (LAND->TD 1.43-1.54 m), STOP. CRITICAL in RETURN
+  (116.1 s): LAND where it is, touchdown 14.8-17.6 m from home (not at home: confirmed). LOW only: nothing in flight, mission and
+  hand-back complete. Pack at 13.9 V from the start: the cell byte is 8 (known OK) on the ground, CRITICAL 10 s after arming
+  (70.2 s, in PILOT: warn only), the stick loss then goes HOLD -> LAND at once, and Start is DENIED 4 NotInThisState (LAND).
+  BATT_CELLS 0: cell byte 0, Start DENIED 14 BatteryNotOk.
+- P4: after TAKEOVER -> PILOT the lock leaves the switch where the pilot put it: Altitude (selected/effective 2/2). Sticks centred
+  30 s in Altitude: true drift 2.2-5.4 m calm, 121-127 m in 5 m/s wind (the firmware's Altitude mode holds height only, so the
+  vehicle goes with the wind). Switch back to Position: drift 0.17-1.47 m in 30 s. Conclusion: the far landings of parts 1-2 were
+  Altitude mode after the hand-back drifting with the wind, which the pilot model's own xy correction only partly removed; not a
+  firmware fault in Position.
+- P5: 0 motor stops above 0.3 m in every cell; K would-fire 0 everywhere.
