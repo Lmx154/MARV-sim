@@ -1567,7 +1567,8 @@ fn ho_line(scenario: &Scenario, trace: &Trace, ho: &[HoStep]) -> String {
             hist.push(format!("{}@{:.3}", letter(ho[k].state), secs(st[k].t_us)));
         }
     }
-    let k_hold = (0..n).find(|&k| ho[k].state == 3);
+    // The hands-off entry: the first HOLD step, else (stick loss straight into LAND or BLIND) the first hands-off step.
+    let k_hold = (0..n).find(|&k| ho[k].state == 3).or_else(|| (0..n).find(|&k| !matches!(ho[k].state, 1 | 7)));
     let hp = k_hold.map(|k| {
         let p = &st[k];
         if p.pos_target_ne.iter().all(|v| v.is_finite()) {
