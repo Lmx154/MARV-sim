@@ -1336,7 +1336,16 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
     // N2 plumbing state.
     MSN.with(|m| *m.borrow_mut() = MsnRec::default());
     let mut msvc = fw_core::mission::MissionService::new();
-    let (mut mission_done, mut plan_in, mut hb_last, mut cmd_next) = (false, None, None, 0usize);
+    let (mut up_next, mut plan_in, mut hb_last, mut cmd_next) = (0usize, None, None, 0usize);
+    let mut gdn_in: Option<fw_core::mission::GdnTargets> = None;
+    // Campaign mission: the first HOLD step, the first accepted Start, AUTO's end at the last waypoint (for `resume` and
+    // `after_hold_s`), the previous step's state and leg.
+    let (mut t_hold1, mut t_start1, mut t_done) = (None::<u64>, None::<u64>, None::<u64>);
+    let (mut st_prev, mut leg_prev) = (0u8, None::<u8>);
+    if !scenario.mission.is_empty() || !scenario.commands.is_empty() {
+        // The board gives false until the battery monitor is merged; mission cells set it true (stated in the report).
+        flight.set_battery_ok(true);
+    }
     let mut gdn = GdnShadow::from_args();
     let mut flight_steps: u64 = 0;
     let mut ran = 0;
@@ -1406,6 +1415,14 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             let row = match pilot.as_deref_mut() {
                 None => row_at(&scenario.rc_script, now),
                 Some(p) => {
+                    let due = match scenario.resume {
+                        Some((0, d)) => t_done.is_some_and(|t| now >= t + d),
+                        Some((_, d)) => t_start1.is_some_and(|t| now >= t + d),
+                        None => false,
+                    };
+                    if due && scenario.phases.get(p.index()).is_some_and(|ph| ph.lost) {
+                        p.end_phase(now);
+                    }
                     let view = PilotView::see(world.backend.truth(), touched);
                     touched = false;
                     let Some(report) = p.report(now, view) else { break };
@@ -1509,17 +1526,22 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
                 flight.set_last_radio_status_us(Some(newest + off));
             }
             TRUTH_YAW.store(yaw_of(truth.attitude).to_bits(), std::sync::atomic::Ordering::Relaxed);
-            if let Some(m) = scenario.mission.as_ref().filter(|m| !mission_done && truth.t_us >= m.at_us) {
-                mission_done = true;
+            if let Some(m) = scenario.mission.get(up_next).filter(|m| truth.t_us >= m.at_us) {
+                up_next += 1;
                 let origin = GDN_SIM_ORIGIN.get().expect("sim origin for the mission");
                 // The board's service input `armed` is false since H2 (src/mission.rs): an upload is taken while armed.
                 let (ack, g) = upload(&mut msvc, m, sensors_f.imu1.t_us, false, origin);
                 plan_in = fw_flight::station::plan_id_of(if msvc.count() == 0 { 0 } else { msvc.plan_id() });
-                MSN.with(|r| r.borrow_mut().upload = Some((truth.t_us, ack, msvc.count(), msvc.plan_id(), g.count,
-                    g.alts_m[..usize::from(g.count)].to_vec(), g.return_m)));
+                MSN.with(|r| r.borrow_mut().uploads.push((truth.t_us, ack, msvc.count(), msvc.plan_id(), g.count,
+                    g.alts_m[..usize::from(g.count)].to_vec(), g.return_m, g.heights_ok, m.waypoints.clone())));
+                gdn_in = Some(g);
             }
-            if scenario.mission.is_some() {
+            if !scenario.mission.is_empty() {
+                // The board: station::push_plan's plan id and the Stepper's FLIGHT_GDN set, given every step.
                 flight.set_plan_id(plan_in);
+                if let Some(g) = gdn_in {
+                    flight.set_mission(g);
+                }
             }
             if let Some((a, b)) = scenario.station_hb {
                 if truth.t_us >= a && truth.t_us < b {
@@ -1528,7 +1550,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
                 flight.set_last_radio_heartbeat_us(hb_last);
             }
             let mut cmd_now: Option<&'static str> = None;
-            if let Some(c) = scenario.commands.get(cmd_next).filter(|c| truth.t_us >= c.0) {
+            if let Some(c) = scenario.commands.get(cmd_next).filter(|c| if c.3 { t_hold1.is_some_and(|h| truth.t_us >= h + c.0) } else { truth.t_us >= c.0 }) {
                 use fw_flight::hands_off::{Command, Link as CLink, StationCommand};
                 cmd_next += 1;
                 let (name, command) = match c.1.as_str() {
@@ -1545,13 +1567,29 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             if let Some(name) = cmd_now {
                 use fw_flight::hands_off::CommandResult;
                 let r = match flight.take_command_result() {
-                    Some(CommandResult::Accepted) => "accepted".to_string(),
+                    Some(CommandResult::Accepted) => {
+                        if name == "start" {
+                            t_start1.get_or_insert(truth.t_us);
+                        }
+                        "accepted".to_string()
+                    }
                     Some(CommandResult::Denied(why)) => format!("denied:{}:{:?}", why.code(), why),
                     None => "no-answer".to_string(),
                 };
                 MSN.with(|m| m.borrow_mut().cmds.push((truth.t_us, name, r)));
             }
             let anchor = flight.sim_anchor();
+            {
+                let (code, leg) = (flight.hands_off_state().code(), flight.leg_active());
+                if code == 3 {
+                    t_hold1.get_or_insert(truth.t_us);
+                }
+                let last = gdn_in.map(|g| g.count.saturating_sub(1));
+                if st_prev == 4 && code == 3 && leg_prev.is_some() && leg_prev == last {
+                    t_done.get_or_insert(truth.t_us);
+                }
+                (st_prev, leg_prev) = (code, leg);
+            }
             if flag(&X_INF) {
                 flight.sim_clear_track_error();
             }
@@ -1560,7 +1598,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
                 pne: out_f.nav.valid.position_ne, nav_v: [out_f.nav.velocity_ms[0], out_f.nav.velocity_ms[1]],
                 gated: GATED_STEP.swap(0, std::sync::atomic::Ordering::Relaxed),
                 coll_n: out_f.demand.map_or(f32::NAN, |d| d.thrust_n), hover: flight.sim_hover(), m_bit: flight.radio_status_seen(),
-                crash: flight.crash_would_fire(), td: flight.sim_td() });
+                crash: flight.crash_would_fire(), td: flight.sim_td(), leg: flight.leg_active() });
             let mut out = out_f;
             out.t_us -= off;
             out.nav.t_us -= off;
@@ -1636,13 +1674,17 @@ struct HoStep {
     /// N2: crash rule K would fire after the step (shadow); Flight::sim_td (TD's held time us, the time needed, the low mark).
     crash: bool,
     td: (u64, u64, bool),
+    /// Campaign mission: Flight::leg_active after the step.
+    leg: Option<u8>,
 }
 
 /// N2 plumbing, per run (one run per thread): the upload (time, the service's last answer, items committed, plan id, the
 /// GDN_SRC 1 target count, their heights, the return height) and every command (time, name, result).
 #[derive(Default)]
 struct MsnRec {
-    upload: Option<(u64, String, u8, u32, u8, Vec<f32>, f32)>,
+    /// Every upload: time, the service's last answer, items committed, plan id, GDN_SRC 1 count, heights, return height,
+    /// heights_ok, and the list's TRUE waypoints.
+    uploads: Vec<(u64, String, u8, u32, u8, Vec<f32>, f32, bool, Vec<[f64; 3]>)>,
     cmds: Vec<(u64, &'static str, String)>,
 }
 
@@ -1657,6 +1699,7 @@ thread_local! {
 /// return item, command 20, x = y = 0), then the board's `push_gdn` choice with GDN_SRC 1 (`select_targets`).
 fn upload(svc: &mut fw_core::mission::MissionService, m: &marv_sim::scenario::Mission, now_us: u64, armed: bool, origin: &Origin)
     -> (String, fw_core::mission::GdnTargets) {
+    svc.set_limits(m.upload_limits.0, m.upload_limits.1);
     use fw_core::mission::{Frame, Link as MLink, Rx, RxItem, select_targets};
     let frame = |msg| Frame { link: MLink::Radio, src_system: 255, src_component: 190, target_system: 1, target_component: 1, msg };
     let n = m.waypoints.len() + 1;
@@ -1668,7 +1711,7 @@ fn upload(svc: &mut fw_core::mission::MissionService, m: &marv_sim::scenario::Mi
         let item = RxItem { seq: seq as u16, frame: 3, command, x, y, z_bits: (w[2] as f32).to_bits(), mission_type: 0 };
         last = svc.handle(now_us, armed, &frame(Rx::ItemInt(item)));
     }
-    let g = select_targets(1, 0, m.radius_m as f32, &[], svc.items(), svc.plan_id());
+    let g = select_targets(1, 0, m.radius_m as f32, &[], svc.items(), svc.plan_id(), m.limits);
     (format!("{:?}", last.map(|t| t.msg)).replace(' ', ""), g)
 }
 
@@ -1960,51 +2003,84 @@ floor_first_after_contact_s {} td_max_air_ms {}",
         }
         DUMP2.with(|d| *d.borrow_mut() = text);
     }
-    if scenario.mission.is_none() && scenario.commands.is_empty() {
+    if scenario.mission.is_empty() && scenario.commands.is_empty() {
         return out;
     }
     MSN.with(|m| {
         let m = m.borrow();
-        let up = m.upload.as_ref().map_or("none".to_string(), |(t, ack, items, plan, gc, alts, ret)| {
+        let ups: Vec<String> = m.uploads.iter().map(|(t, ack, items, plan, gc, alts, ret, hok, _)| {
             let a: Vec<String> = alts.iter().map(|v| format!("{v:.1}")).collect();
-            format!("{:.3} msn_ack {ack} msn_items {items} msn_plan {plan:08x} msn_gdn_count {gc} msn_gdn_alts_m {} msn_return_m {ret:.1}", secs(*t), a.join(","))
-        });
+            format!("{:.3}:{ack}:items{items}:plan{plan:08x}:gdn{gc}:alts{}:ret{ret:.1}:hok{}", secs(*t), a.join("/"), u8::from(*hok))
+        }).collect();
         let cmds: Vec<String> = m.cmds.iter().map(|(t, c, r)| format!("{c}@{:.3}:{r}", secs(*t))).collect();
-        out.push_str(&format!(" msn_upload_s {up} msn_cmds {}", if cmds.is_empty() { "none".to_string() } else { cmds.join(",") }));
-        // Legs from the first accepted Start (else the upload): a waypoint is reached at the first step within the radius
-        // (true horizontal distance), then the next is current; per leg the largest true cross-track distance from the segment
-        // (the previous waypoint, or the position at the go time, to this one); true height error at arrival.
-        let t_go = m.cmds.iter().find(|c| c.1 == "start" && c.2 == "accepted").map(|c| c.0).or(m.upload.as_ref().map(|u| u.0));
-        let wps = scenario.mission.as_ref().map_or(Vec::new(), |m| m.waypoints.clone());
-        let radius = scenario.mission.as_ref().map_or(0.0, |m| m.radius_m);
-        let (mut arr_t, mut arr_d, mut herr, mut xt, mut dmin) = (vec![None; wps.len()], vec![None; wps.len()], vec![None; wps.len()], vec![0.0f64; wps.len()], vec![f64::INFINITY; wps.len()]);
-        if let Some(tg) = t_go.filter(|_| !wps.is_empty()) {
-            let k0 = st[..n].partition_point(|p| p.t_us < tg).min(n - 1);
-            let mut prev = [st[k0].truth_pos[0], st[k0].truth_pos[1]];
-            let mut cur = 0;
-            for k in k0..n {
+        let list = |v: Vec<String>| if v.is_empty() { "none".to_string() } else { v.join(",") };
+        out.push_str(&format!(" msn_uploads {} msn_cmds {}", list(ups), list(cmds)));
+        // From the LAST accepted Start, with the list uploaded before it. The firmware's arrival at waypoint i: the step its
+        // leg index leaves i for i + 1, or (the last) AUTO -> another state with the leg at the last index.
+        let t_go = m.cmds.iter().rev().find(|c| c.1 == "start" && c.2 == "accepted").map(|c| c.0);
+        let wps: Vec<[f64; 3]> = t_go.and_then(|tg| m.uploads.iter().rev().find(|u| u.0 <= tg)).map_or(Vec::new(), |u| u.8.clone());
+        let nw = wps.len();
+        let (mut arr, mut xt) = (vec![None::<usize>; nw], vec![0.0f64; nw]);
+        let (mut car_e, mut car_t, mut sag, mut hdg) = (0.0f64, 0.0f64, f64::NEG_INFINITY, 0.0f64);
+        let mut land_at = "none".to_string();
+        let k_go = t_go.map(|t| st[..n].partition_point(|p| p.t_us < t).min(n - 1));
+        if let Some(k0) = k_go.filter(|_| nw > 0) {
+            let off = [st[k0].truth_pos[0] - st[k0].nav_ne[0], st[k0].truth_pos[1] - st[k0].nav_ne[1]];
+            let off_h = (-st[k0].nav_d) - h(k0);
+            let yaw0 = yaw_of(st[k0].truth_q);
+            let seg = |i: usize| (if i == 0 { [st[k0].truth_pos[0], st[k0].truth_pos[1]] } else { [wps[i - 1][0], wps[i - 1][1]] }, [wps[i][0], wps[i][1]]);
+            let xtd = |k: usize, i: usize| {
+                let (a, b) = seg(i);
                 let p = [st[k].truth_pos[0], st[k].truth_pos[1]];
-                let w = wps[cur];
-                let d = (p[0] - w[0]).hypot(p[1] - w[1]);
-                let (sx, sy) = (w[0] - prev[0], w[1] - prev[1]);
+                let (sx, sy) = (b[0] - a[0], b[1] - a[1]);
                 let l2 = sx * sx + sy * sy;
-                let u = if l2 > 0.0 { (((p[0] - prev[0]) * sx + (p[1] - prev[1]) * sy) / l2).clamp(0.0, 1.0) } else { 0.0 };
-                xt[cur] = xt[cur].max((p[0] - prev[0] - u * sx).hypot(p[1] - prev[1] - u * sy));
-                dmin[cur] = dmin[cur].min(d);
-                if d < radius {
-                    (arr_t[cur], arr_d[cur], herr[cur]) = (Some(secs(st[k].t_us)), Some(d), Some(h(k) - w[2]));
-                    prev = [w[0], w[1]];
-                    cur += 1;
-                    if cur == wps.len() {
-                        break;
+                let u = if l2 > 0.0 { (((p[0] - a[0]) * sx + (p[1] - a[1]) * sy) / l2).clamp(0.0, 1.0) } else { 0.0 };
+                (p[0] - a[0] - u * sx).hypot(p[1] - a[1] - u * sy)
+            };
+            let mut landed_once = false;
+            for k in k0 + 1..n {
+                if let (Some(a), Some(b)) = (ho[k - 1].leg, ho[k].leg) {
+                    if b == a + 1 && usize::from(a) < nw {
+                        arr[usize::from(a)] = Some(k);
                     }
+                }
+                if ho[k - 1].state == 4 && ho[k].state != 4 && ho[k - 1].leg.is_some_and(|l| usize::from(l) + 1 == nw) && arr[nw - 1].is_none() {
+                    arr[nw - 1] = Some(k);
+                }
+                if ho[k].state == 4 {
+                    if let Some(i) = ho[k].leg.map(usize::from).filter(|&i| i < nw) {
+                        xt[i] = xt[i].max(xtd(k, i));
+                    }
+                    let c = st[k].pos_target_ne;
+                    if c.iter().all(|v| v.is_finite()) {
+                        car_e = car_e.max((st[k].nav_ne[0] - c[0]).hypot(st[k].nav_ne[1] - c[1]));
+                        car_t = car_t.max((st[k].truth_pos[0] - c[0] - off[0]).hypot(st[k].truth_pos[1] - c[1] - off[1]));
+                    }
+                    if st[k].target_d.is_finite() {
+                        sag = sag.max((-st[k].target_d - off_h) - h(k));
+                    }
+                    hdg = hdg.max(wrap_pi(yaw_of(st[k].truth_q) - yaw0).to_degrees().abs());
+                }
+                if !landed_once && (ho[k].state == 6 || ho[k].state == 8) {
+                    landed_once = true;
+                    let i = ho[k - 1].leg.map(usize::from).filter(|&i| i < nw);
+                    let c = st[k - 1].pos_target_ne;
+                    land_at = format!("{:.3}:xt{}:carrot_true{}", secs(st[k].t_us), i.map_or("none".to_string(), |i| format!("{:.2}", xtd(k, i))),
+                        if c.iter().all(|v| v.is_finite()) { format!("{:.2}", (st[k].truth_pos[0] - c[0] - off[0]).hypot(st[k].truth_pos[1] - c[1] - off[1])) } else { "none".to_string() });
                 }
             }
         }
-        let list = |v: Vec<String>| if v.is_empty() { "none".to_string() } else { v.join(",") };
-        let o = |x: &Option<f64>, p: usize| x.map_or("none".to_string(), |v| format!("{v:.p$}"));
+        let tk = |k: usize| secs(st[k].t_us);
+        let o = |v: Option<f64>, p: usize| v.map_or("none".to_string(), |v| format!("{v:.p$}"));
+        let t_arr: Vec<Option<f64>> = arr.iter().map(|k| k.map(tk)).collect();
+        let d_arr: Vec<String> = (0..nw).map(|i| o(arr[i].map(|k| (st[k].truth_pos[0] - wps[i][0]).hypot(st[k].truth_pos[1] - wps[i][1])), 2)).collect();
+        let herr: Vec<String> = (0..nw).map(|i| o(arr[i].map(|k| h(k) - wps[i][2]), 2)).collect();
+        let legt: Vec<String> = (0..nw).map(|i| o(t_arr[i].zip(if i == 0 { t_go.map(secs) } else { t_arr[i - 1] }).map(|(a, b)| a - b), 1)).collect();
+        // The largest true horizontal speed in a hands-off state (not PILOT, not STOP), armed.
+        let vh = (0..n).filter(|&k| !matches!(ho[k].state, 1 | 7) && st[k].armed).map(|k| st[k].truth_vel[0].hypot(st[k].truth_vel[1])).fold(0.0f64, f64::max);
         let mut modes: Vec<String> = Vec::new();
         let mut codes: Vec<String> = Vec::new();
+        let mut legs: Vec<String> = Vec::new();
         for k in 0..n {
             if k == 0 || (st[k].selected, st[k].mode) != (st[k - 1].selected, st[k - 1].mode) {
                 modes.push(format!("{}/{}@{:.3}", st[k].selected, st[k].mode, secs(st[k].t_us)));
@@ -2012,12 +2088,16 @@ floor_first_after_contact_s {} td_max_air_ms {}",
             if k == 0 || ho[k].state != ho[k - 1].state {
                 codes.push(format!("{}@{:.3}", ho[k].state, secs(st[k].t_us)));
             }
+            if k > 0 && ho[k].leg != ho[k - 1].leg {
+                legs.push(format!("{}@{:.3}", ho[k].leg.map_or("-".to_string(), |l| l.to_string()), secs(st[k].t_us)));
+            }
         }
         out.push_str(&format!(
-            " msn_go_s {} msn_wp_t_s {} msn_wp_d_arr_m {} msn_wp_d_min_m {} msn_wp_herr_m {} msn_leg_xt_max_m {} msn_carrot_max_m none(not-exposed) msn_modes {} msn_state_codes {}",
-            t_go.map_or("none".to_string(), |t| format!("{:.3}", secs(t))), list(arr_t.iter().map(|x| o(x, 3)).collect()),
-            list(arr_d.iter().map(|x| o(x, 2)).collect()), list(dmin.iter().map(|x| if x.is_finite() { format!("{x:.2}") } else { "none".to_string() }).collect()),
-            list(herr.iter().map(|x| o(x, 2)).collect()), list(xt.iter().map(|x| format!("{x:.2}")).collect()), list(modes), list(codes)));
+            " msn_go_s {} msn_nwp {nw} msn_wp_t_s {} msn_leg_time_s {} msn_wp_d_arr_m {} msn_wp_herr_m {} msn_leg_xt_max_m {} msn_carrot_est_max_m {:.2} \
+msn_carrot_true_max_m {:.2} msn_x_m {:.2} msn_sag_true_max_m {} msn_hdg_dev_max_deg {:.1} msn_land {} ho_vh_max_ms {:.2} msn_legs {} msn_modes {} msn_state_codes {}",
+            o(t_go.map(secs), 3), list(t_arr.iter().map(|x| o(*x, 3)).collect()), list(legt), list(d_arr), list(herr),
+            list(xt.iter().map(|x| format!("{x:.2}")).collect()), car_e, car_t, ho[n - 1].x_m, if sag.is_finite() { format!("{sag:.2}") } else { "none".to_string() },
+            hdg, land_at, vh, list(legs), list(modes), list(codes)));
     });
     out
 }
@@ -2116,7 +2196,7 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
         None => env.wind_mean_ned.v.ok_or("wind.mean_ned is \"ask\"")?,
     };
 
-    if !GDN_TARGETS.lock().unwrap().is_empty() || scenario.mission.is_some() {
+    if !GDN_TARGETS.lock().unwrap().is_empty() || !scenario.mission.is_empty() {
         let _ = GDN_SIM_ORIGIN.set(Origin::from_env(env)?);
     }
     let mut log = Log::with_header();

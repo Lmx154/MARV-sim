@@ -15,6 +15,8 @@ pub struct Mission {
     pub return_h: f64,
     /// TRUE north, east (m from the sim origin) and height above home (m).
     pub waypoints: Vec<[f64; 3]>,
+    pub limits: (f32, f32),
+    pub upload_limits: (f32, f32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,10 +98,18 @@ pub struct Scenario {
     /// `at_s` the list (the waypoints, TRUE north/east from the sim origin and height above home, then the return item at
     /// `return_h`) is uploaded to fw_core's mission service on the radio link as the board does; its committed set goes to the
     /// flight step as the board's station feed (plan id) and to the shadow guidance with GDN_SRC 1.
-    pub mission: Option<Mission>,
+    /// Campaign mission: `mission` may also be an array of such tables (uploads in time order), each with optional
+    /// `limits = [min, max]` (the GDN_ALT_MIN/MAX in force given to select_targets; default 5, 50) and `upload_limits` (the
+    /// mission service's at upload; default 5, 50).
+    pub mission: Vec<Mission>,
     /// `[scenario] commands = [{ at_s, cmd, link }, ...]` (N2 plumbing): a station command (`start`, `pause`, `abort`, `land`,
     /// `return`; link `radio` (default) or `usb`) given to Flight::set_command at the first flight step at or after `at_s`.
-    pub commands: Vec<(u64, String, bool)>,
+    /// Campaign mission: `after_hold_s` instead of `at_s` times the command from the first HOLD step (the 4th field true).
+    pub commands: Vec<(u64, String, bool, bool)>,
+    /// `[scenario] resume = { after_done_s }` or `{ after_start_s }` (campaign mission): the pilot's current lost phase ends
+    /// (stick reports resume with the next phase) that long after AUTO's last waypoint (AUTO -> HOLD at the last index) or
+    /// after the first accepted Start. (0 done, 1 start; us.)
+    pub resume: Option<(u8, u64)>,
     /// `[scenario] station_hb = { from_s, to_s }` (N2 plumbing): the station HEARTBEAT time fed every flight step from `from_s`
     /// while before `to_s` (Flight::set_last_radio_heartbeat_us); after `to_s` the last time stays (the heartbeat stops).
     pub station_hb: Option<(u64, u64)>,
@@ -815,7 +825,7 @@ impl Scenario {
                 return Err(format!("{key}: unknown table"));
             }
         }
-        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz", "mag_expected", "gnss_velocity", "baro_motion", "baro_lost", "gnss_lost", "gnss_hold", "mag_fault", "gnss_latency_s", "wind_steps", "yaw_inject", "yaw_hold", "gnss_jump", "motor_thrust", "push", "thrust_gain", "radio_status", "mission", "commands", "station_hb"])?;
+        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz", "mag_expected", "gnss_velocity", "baro_motion", "baro_lost", "gnss_lost", "gnss_hold", "mag_fault", "gnss_latency_s", "wind_steps", "yaw_inject", "yaw_hold", "gnss_jump", "motor_thrust", "push", "thrust_gain", "radio_status", "mission", "commands", "station_hb", "resume"])?;
         let ground = match root.get("initial").and_then(Value::as_table).and_then(|i| i.get("contact")) {
             None => false,
             Some(Value::String(c)) if c == "air" => false,
@@ -1043,42 +1053,61 @@ impl Scenario {
             Some(_) => return Err("scenario.radio_status: must be an inline table".to_string()),
         };
         let secs = |v: f64| (v * 1e6).round() as u64;
-        let mission = match s.get("mission") {
-            None => None,
-            Some(Value::Table(t)) => {
-                known_keys(t, "scenario.mission", &["at_s", "radius_m", "return_h", "waypoints"])?;
-                let at = scalar(t, "scenario.mission", "at_s")?;
-                let radius_m = scalar(t, "scenario.mission", "radius_m")?;
-                let return_h = scalar(t, "scenario.mission", "return_h")?;
-                let bad = || "scenario.mission.waypoints: 1 to 15 rows of [north_m, east_m, h_m]".to_string();
-                let a = get(t, "scenario.mission", "waypoints")?.as_array().ok_or_else(bad)?;
-                let mut waypoints = Vec::new();
-                for r in a {
-                    let r = r.as_array().filter(|r| r.len() == 3).ok_or_else(bad)?;
-                    waypoints.push([number(&r[0]).ok_or_else(bad)?, number(&r[1]).ok_or_else(bad)?, number(&r[2]).ok_or_else(bad)?]);
-                }
-                if waypoints.is_empty() || waypoints.len() > 15 || !(at >= 0.0 && radius_m > 0.0 && return_h.is_finite()) {
-                    return Err(bad());
-                }
-                Some(Mission { at_us: secs(at), radius_m, return_h, waypoints })
+        let one = |t: &Table| -> Result<Mission, String> {
+            known_keys(t, "scenario.mission", &["at_s", "radius_m", "return_h", "waypoints", "limits", "upload_limits"])?;
+            let at = scalar(t, "scenario.mission", "at_s")?;
+            let radius_m = scalar(t, "scenario.mission", "radius_m")?;
+            let return_h = scalar(t, "scenario.mission", "return_h")?;
+            let bad = || "scenario.mission.waypoints: 1 to 15 rows of [north_m, east_m, h_m]".to_string();
+            let a = get(t, "scenario.mission", "waypoints")?.as_array().ok_or_else(bad)?;
+            let mut waypoints = Vec::new();
+            for r in a {
+                let r = r.as_array().filter(|r| r.len() == 3).ok_or_else(bad)?;
+                waypoints.push([number(&r[0]).ok_or_else(bad)?, number(&r[1]).ok_or_else(bad)?, number(&r[2]).ok_or_else(bad)?]);
             }
-            Some(_) => return Err("scenario.mission: must be an inline table".to_string()),
+            if waypoints.is_empty() || waypoints.len() > 15 || !(at >= 0.0 && radius_m > 0.0 && return_h.is_finite()) {
+                return Err(bad());
+            }
+            let pair = |k: &str| -> Result<(f32, f32), String> {
+                match t.get(k) {
+                    None => Ok((5.0, 50.0)),
+                    Some(_) => {
+                        let v = numbers(t, "scenario.mission", k)?;
+                        if v.len() != 2 { return Err(format!("scenario.mission.{k}: [min, max]")); }
+                        Ok((v[0] as f32, v[1] as f32))
+                    }
+                }
+            };
+            Ok(Mission { at_us: secs(at), radius_m, return_h, waypoints, limits: pair("limits")?, upload_limits: pair("upload_limits")? })
         };
+        let mut mission = Vec::new();
+        match s.get("mission") {
+            None => {}
+            Some(Value::Table(t)) => mission.push(one(t)?),
+            Some(Value::Array(a)) => {
+                for r in a {
+                    mission.push(one(r.as_table().ok_or("scenario.mission: tables")?)?);
+                }
+            }
+            Some(_) => return Err("scenario.mission: an inline table or an array of them".to_string()),
+        }
+        mission.sort_by_key(|m| m.at_us);
         let mut commands = Vec::new();
         if let Some(v) = s.get("commands") {
             let bad = || "scenario.commands: rows of { at_s, cmd = start|pause|abort|land|return, link = radio|usb }".to_string();
             for r in v.as_array().ok_or_else(bad)? {
                 let t = r.as_table().ok_or_else(bad)?;
-                known_keys(t, "scenario.commands", &["at_s", "cmd", "link"])?;
+                known_keys(t, "scenario.commands", &["at_s", "after_hold_s", "cmd", "link"])?;
                 let cmd = t.get("cmd").and_then(Value::as_str).filter(|c| ["start", "pause", "abort", "land", "return"].contains(c)).ok_or_else(bad)?;
                 let radio = match t.get("link").map(|l| l.as_str()) {
                     None | Some(Some("radio")) => true,
                     Some(Some("usb")) => false,
                     _ => return Err(bad()),
                 };
-                commands.push((secs(scalar(t, "scenario.commands", "at_s")?), cmd.to_string(), radio));
+                let rel = t.contains_key("after_hold_s");
+                let at = scalar(t, "scenario.commands", if rel { "after_hold_s" } else { "at_s" })?;
+                commands.push((secs(at), cmd.to_string(), radio, rel));
             }
-            commands.sort_by_key(|c| c.0);
         }
         let station_hb = match s.get("station_hb") {
             None => None,
@@ -1091,6 +1120,18 @@ impl Scenario {
                 Some((secs(a), secs(b)))
             }
             Some(_) => return Err("scenario.station_hb: must be an inline table".to_string()),
+        };
+        let resume = match s.get("resume") {
+            None => None,
+            Some(Value::Table(t)) => {
+                known_keys(t, "scenario.resume", &["after_done_s", "after_start_s"])?;
+                if t.contains_key("after_done_s") {
+                    Some((0, secs(scalar(t, "scenario.resume", "after_done_s")?)))
+                } else {
+                    Some((1, secs(scalar(t, "scenario.resume", "after_start_s")?)))
+                }
+            }
+            Some(_) => return Err("scenario.resume: an inline table".to_string()),
         };
         let mut disturbances = Vec::new();
         for (i, row) in rows(&root, "", "disturbance", &["from_s", "to_s", "torque_nm"])?.into_iter().enumerate() {
@@ -1156,6 +1197,7 @@ impl Scenario {
             mission,
             commands,
             station_hb,
+            resume,
             gnss_latency_s,
             wind_steps,
             disturbances,

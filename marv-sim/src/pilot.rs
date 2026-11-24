@@ -217,6 +217,19 @@ impl Pilot {
 
     /// The report at `now_us` from what the pilot sees now (`view`, delayed here). `None` once the phase table has
     /// ended: the run is over.
+    /// The current phase's index (campaign mission: the run ends a lost phase on a firmware event).
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// Ends the current phase now (as by its event) and enters the next.
+    pub fn end_phase(&mut self, now_us: u64) {
+        if self.index < self.phases.len() {
+            self.timeline[self.index].end = Some((now_us, Ending::Event));
+            self.enter(self.index + 1, now_us);
+        }
+    }
+
     pub fn report(&mut self, now_us: u64, view: PilotView) -> Option<Report> {
         self.seen.push_back(view);
         if self.seen.len() > self.delay_reports + 1 {
