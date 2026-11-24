@@ -1,3 +1,22 @@
+# Hands-off campaign (FS_HOLD_EN 1, H12 5 m track fault) in MARV-sim. Firmware hands-off-sim = 678cf1f + c66aee0 (sim hooks only;
+# board image identical in .vector_table .start_block .ram_text .text .data, no sim_ symbol); sim hands-off-sim b3bca8a.
+# Setup: air start 5 m over a ground plane (contact air_over_ground), eskf3, pre-roll 60 s, Position with centred sticks from
+# 0.04 s, stick reports stop at 20 s -> HOLD at 21.0 s. heading_ok = the estimator's heading flag after every step (one step late);
+# radio HEARTBEAT = the step's own time every step (G7: absent). Faults at 60 s (39 s into HOLD) unless stated. 45 cells per tag =
+# 5 plant points x {calm, 5 m/s toward N, 5 m/s toward E} x seeds 1-3 (G1 steady: 5 points x 8 winds x 3 seeds = 120).
+# Columns: tf = cells where the 5 m track fault latched; LAND by = what was below T3' when the 1.0 s debounce began (ne position
+# flags, hdg heading flag, tf, link = 10 s rule); d = TRUE horizontal distance from the hold point (Position target at HOLD entry in
+# the truth frame); |p-r| = nav position minus the controller's target (what the 5 m rule measures); target walk = how far that
+# target moved during HOLD; nav gap = nav-truth error change in HOLD; TD = plant touchdown; bounce = cells with a lift-off after
+# the first touchdown; -xinf = the control with the rule disabled (Flight::sim_clear_track_error after every step).
+# Per-cell data: csv/<G>.csv; raw lines raw/<tag>.txt; re-run: tools/group.sh <G> (env SIMDIR, FW for another firmware build).
+#
+# FINDING: the 5 m rule latched in 0 of 1290 cells. In G4 (yaw held wrong 35-45 deg) the vehicle went 10-22.5 m from the hold
+# point before LAND (or never landed) while |p-r| stayed <= 2.2 m: the Position target walks with the vehicle. Mechanism (code
+# reading, step.rs:156-165 and 271-276): any step without position coverage (NE flags down for less than the 1.0 s debounce) makes
+# the effective mode Altitude, which clears target_ne; back in Position the target is re-captured where the vehicle is once it is
+# slow. Every LAND in G3/G4/G5 came from the NE flags (G3 inj90: 5 with heading too), G7 from the link rule.
+
 ## G0 (sim b3bca8a, firmware c66aee0, 2026-11-23T22:34:35-06:00)
 g0 | cells 45 hold 45 | tf 0 | LAND 0 by - | fault->tf - s | fault->LAND - s | d@LAND - m (>10: 0) | d@TD - m | TD 0 stop+motors off 0 | TD vz - vh - tilt - | bounce 0 | h@STOP max - | max |p-r| in HOLD 0.30[0.27,0.34] | target walk in HOLD 0.0[0.0,0.0] | nav gap 0.68[0.58,1.17] | |e| max in HOLD 1.6[1.2,2.3] deg | max d before LAND 0.8[0.7,1.2] | max d run 0.8[0.7,1.2]
 g0-xinf | cells 45 tf 0 | LAND 0 by - | max d before LAND (or run end) 0.8[0.7,1.2] m | cells > 10 m: 0 
@@ -23,4 +42,48 @@ g3-inj60 | cells 45 hold 45 | tf 0 | LAND 10 by ne:10 | fault->tf - s | fault->L
 g3-inj60-xinf | cells 45 tf 0 | LAND 10 by ne:10 | max d before LAND (or run end) 2.4[1.1,2.6] m | cells > 10 m: 0 
 g3-inj90 | cells 45 hold 45 | tf 0 | LAND 45 by hdg+ne:5,ne:40 | fault->tf - s | fault->LAND 4.2[3.4,5.1] s | d@LAND 5.1[2.3,8.0] m (>10: 0) | d@TD 11.1[5.9,15.5] m | TD 45 stop+motors off 45 | TD vz 0.54[0.41,0.78] vh 4.41[0.31,5.60] tilt 4.2[1.2,6.6] | bounce 23 | h@STOP max 0.000 | max |p-r| in HOLD 1.40[0.69,2.17] | target walk in HOLD 0.0[0.0,5.2] | nav gap 1.66[0.72,2.40] | |e| max in HOLD 92.2[89.8,100.2] deg | max d before LAND 5.1[2.3,8.0] | max d run 11.5[8.7,15.5]
 g3-inj90-xinf | cells 45 tf 0 | LAND 45 by hdg+ne:5,ne:40 | max d before LAND (or run end) 5.1[2.3,8.0] m | cells > 10 m: 0 
+
+## G2 (sim b3bca8a, firmware c66aee0, 2026-11-23T22:45:39-06:00)
+g2-rot15 | cells 45 hold 45 | tf 0 | LAND 0 by - | fault->tf - s | fault->LAND - s | d@LAND - m (>10: 0) | d@TD - m | TD 0 stop+motors off 0 | TD vz - vh - tilt - | bounce 0 | h@STOP max - | max |p-r| in HOLD 0.31[0.27,0.37] | target walk in HOLD 0.0[0.0,0.0] | nav gap 0.69[0.58,1.16] | |e| max in HOLD 10.7[7.0,14.1] deg | max d before LAND 0.8[0.7,1.1] | max d run 0.8[0.7,1.1]
+g2-rot15-xinf | cells 45 tf 0 | LAND 0 by - | max d before LAND (or run end) 0.8[0.7,1.1] m | cells > 10 m: 0 
+g2-rot30 | cells 45 hold 45 | tf 0 | LAND 0 by - | fault->tf - s | fault->LAND - s | d@LAND - m (>10: 0) | d@TD - m | TD 0 stop+motors off 0 | TD vz - vh - tilt - | bounce 0 | h@STOP max - | max |p-r| in HOLD 0.36[0.30,0.40] | target walk in HOLD 0.0[0.0,0.0] | nav gap 0.69[0.58,1.17] | |e| max in HOLD 17.4[11.0,23.2] deg | max d before LAND 0.8[0.7,1.1] | max d run 0.8[0.7,1.1]
+g2-rot30-xinf | cells 45 tf 0 | LAND 0 by - | max d before LAND (or run end) 0.8[0.7,1.1] m | cells > 10 m: 0 
+g2-rot45 | cells 45 hold 45 | tf 0 | LAND 0 by - | fault->tf - s | fault->LAND - s | d@LAND - m (>10: 0) | d@TD - m | TD 0 stop+motors off 0 | TD vz - vh - tilt - | bounce 0 | h@STOP max - | max |p-r| in HOLD 0.41[0.31,0.74] | target walk in HOLD 0.0[0.0,0.0] | nav gap 0.72[0.51,1.20] | |e| max in HOLD 24.4[16.2,33.4] deg | max d before LAND 0.9[0.7,1.2] | max d run 0.9[0.7,1.2]
+g2-rot45-xinf | cells 45 tf 0 | LAND 0 by - | max d before LAND (or run end) 0.9[0.7,1.2] m | cells > 10 m: 0 
+g2-rot60 | cells 45 hold 45 | tf 0 | LAND 0 by - | fault->tf - s | fault->LAND - s | d@LAND - m (>10: 0) | d@TD - m | TD 0 stop+motors off 0 | TD vz - vh - tilt - | bounce 0 | h@STOP max - | max |p-r| in HOLD 0.48[0.36,0.67] | target walk in HOLD 0.0[0.0,0.0] | nav gap 0.76[0.52,1.19] | |e| max in HOLD 27.7[22.0,31.2] deg | max d before LAND 1.1[0.7,1.2] | max d run 1.1[0.7,1.2]
+g2-rot60-xinf | cells 45 tf 0 | LAND 0 by - | max d before LAND (or run end) 1.1[0.7,1.2] m | cells > 10 m: 0 
+g2-ramp1 | cells 45 hold 45 | tf 0 | LAND 0 by - | fault->tf - s | fault->LAND - s | d@LAND - m (>10: 0) | d@TD - m | TD 0 stop+motors off 0 | TD vz - vh - tilt - | bounce 0 | h@STOP max - | max |p-r| in HOLD 0.86[0.71,1.26] | target walk in HOLD 0.0[0.0,0.0] | nav gap 0.96[0.82,1.31] | |e| max in HOLD 34.8[32.5,39.5] deg | max d before LAND 1.6[1.3,2.2] | max d run 1.6[1.3,2.2]
+g2-ramp1-xinf | cells 45 tf 0 | LAND 0 by - | max d before LAND (or run end) 1.6[1.3,2.2] m | cells > 10 m: 0 
+g2-ramp02 | cells 45 hold 45 | tf 0 | LAND 0 by - | fault->tf - s | fault->LAND - s | d@LAND - m (>10: 0) | d@TD - m | TD 0 stop+motors off 0 | TD vz - vh - tilt - | bounce 0 | h@STOP max - | max |p-r| in HOLD 0.56[0.45,0.90] | target walk in HOLD 0.0[0.0,0.0] | nav gap 1.03[0.89,1.19] | |e| max in HOLD 28.6[23.9,34.1] deg | max d before LAND 1.4[1.0,1.4] | max d run 1.4[1.0,1.4]
+g2-ramp02-xinf | cells 45 tf 0 | LAND 0 by - | max d before LAND (or run end) 1.4[1.0,1.4] m | cells > 10 m: 0 
+
+## G7 (sim a7d998e, firmware c66aee0, 2026-11-23T22:46:23-06:00)
+g7 | cells 45 hold 45 | tf 0 | LAND 45 by link:45 | fault->tf - s | fault->LAND 10.0[10.0,10.0] s | d@LAND 0.3[0.1,0.3] m (>10: 0) | d@TD 0.2[0.1,0.5] m | TD 45 stop+motors off 45 | TD vz 0.51[0.44,0.65] vh 0.18[0.09,0.29] tilt 6.4[0.3,8.1] | bounce 31 | h@STOP max 0.000 | max |p-r| in HOLD 0.21[0.19,0.24] | target walk in HOLD 0.0[0.0,0.0] | nav gap 0.34[0.24,0.52] | |e| max in HOLD 0.8[0.4,1.4] deg | max d before LAND 0.3[0.2,0.4] | max d run 0.6[0.3,0.7]
+g7-xinf | cells 45 tf 0 | LAND 45 by link:45 | max d before LAND (or run end) 0.3[0.2,0.4] m | cells > 10 m: 0 
+
+## G5 (sim a7d998e, firmware c66aee0, 2026-11-23T22:48:55-06:00)
+g5-lost10 | cells 45 hold 45 | tf 0 | LAND 45 by ne:45 | fault->tf - s | fault->LAND 5.8[5.8,5.8] s | d@LAND 0.7[0.3,1.2] m (>10: 0) | d@TD 12.0[0.1,13.9] m | TD 45 stop+motors off 45 | TD vz 0.54[0.33,0.67] vh 0.10[0.03,0.21] tilt 6.5[0.1,7.2] | bounce 30 | h@STOP max 0.000 | max |p-r| in HOLD 0.28[0.21,0.31] | target walk in HOLD 0.0[0.0,0.0] | nav gap 0.68[0.53,0.99] | |e| max in HOLD 1.5[1.2,2.3] deg | max d before LAND 0.8[0.7,1.2] | max d run 12.4[0.7,14.5]
+g5-lost10-xinf | cells 45 tf 0 | LAND 45 by ne:45 | max d before LAND (or run end) 0.8[0.7,1.2] m | cells > 10 m: 0 
+g5-lost30 | cells 45 hold 45 | tf 0 | LAND 45 by ne:45 | fault->tf - s | fault->LAND 5.8[5.8,5.8] s | d@LAND 0.7[0.3,1.2] m (>10: 0) | d@TD 36.4[1.3,42.0] m | TD 45 stop+motors off 45 | TD vz 0.53[0.45,0.58] vh 5.65[0.25,6.07] tilt 2.9[0.4,3.3] | bounce 29 | h@STOP max 0.000 | max |p-r| in HOLD 0.28[0.21,0.31] | target walk in HOLD 0.0[0.0,0.0] | nav gap 0.68[0.53,0.99] | |e| max in HOLD 1.5[1.2,2.3] deg | max d before LAND 0.8[0.7,1.2] | max d run 36.6[1.3,42.0]
+g5-lost30-xinf | cells 45 tf 0 | LAND 45 by ne:45 | max d before LAND (or run end) 0.8[0.7,1.2] m | cells > 10 m: 0 
+g5-jump5 | cells 45 hold 45 | tf 0 | LAND 45 by ne:45 | fault->tf - s | fault->LAND 1.0[1.0,1.0] s | d@LAND 0.5[0.2,1.1] m (>10: 0) | d@TD 10.4[0.0,11.2] m | TD 45 stop+motors off 45 | TD vz 0.58[0.47,0.78] vh 0.10[0.09,0.16] tilt 6.1[0.4,6.9] | bounce 14 | h@STOP max 0.000 | max |p-r| in HOLD 0.28[0.21,0.31] | target walk in HOLD 0.0[0.0,0.0] | nav gap 0.68[0.53,0.72] | |e| max in HOLD 1.5[1.2,2.3] deg | max d before LAND 0.8[0.7,1.1] | max d run 10.9[0.7,11.9]
+g5-jump5-xinf | cells 45 tf 0 | LAND 45 by ne:45 | max d before LAND (or run end) 0.8[0.7,1.1] m | cells > 10 m: 0 
+g5-jump10 | cells 45 hold 45 | tf 0 | LAND 45 by ne:45 | fault->tf - s | fault->LAND 1.0[1.0,1.0] s | d@LAND 0.5[0.2,1.1] m (>10: 0) | d@TD 10.4[0.0,11.2] m | TD 45 stop+motors off 45 | TD vz 0.58[0.47,0.78] vh 0.10[0.09,0.16] tilt 6.1[0.4,6.9] | bounce 14 | h@STOP max 0.000 | max |p-r| in HOLD 0.28[0.21,0.31] | target walk in HOLD 0.0[0.0,0.0] | nav gap 0.68[0.53,0.72] | |e| max in HOLD 1.5[1.2,2.3] deg | max d before LAND 0.8[0.7,1.1] | max d run 10.9[0.7,11.9]
+g5-jump10-xinf | cells 45 tf 0 | LAND 45 by ne:45 | max d before LAND (or run end) 0.8[0.7,1.1] m | cells > 10 m: 0 
+
+## G1 (sim a7d998e, firmware c66aee0, 2026-11-23T22:52:39-06:00)
+g1-steady | cells 120 hold 120 | tf 0 | LAND 0 by - | fault->tf - s | fault->LAND - s | d@LAND - m (>10: 0) | d@TD - m | TD 0 stop+motors off 0 | TD vz - vh - tilt - | bounce 0 | h@STOP max - | max |p-r| in HOLD 0.35[0.26,0.52] | target walk in HOLD 0.0[0.0,0.0] | nav gap 0.68[0.58,1.18] | |e| max in HOLD 1.4[0.7,2.6] deg | max d before LAND 0.8[0.7,1.4] | max d run 0.8[0.7,1.4]
+g1-steady-xinf | cells 120 tf 0 | LAND 0 by - | max d before LAND (or run end) 0.8[0.7,1.4] m | cells > 10 m: 0 
+g1-step2 | cells 45 hold 45 | tf 0 | LAND 0 by - | fault->tf - s | fault->LAND - s | d@LAND - m (>10: 0) | d@TD - m | TD 0 stop+motors off 0 | TD vz - vh - tilt - | bounce 0 | h@STOP max - | max |p-r| in HOLD 0.30[0.27,0.34] | target walk in HOLD 0.0[0.0,0.0] | nav gap 0.68[0.59,1.17] | |e| max in HOLD 1.6[1.2,2.3] deg | max d before LAND 0.8[0.7,1.1] | max d run 0.8[0.7,1.1]
+g1-step2-xinf | cells 45 tf 0 | LAND 0 by - | max d before LAND (or run end) 0.8[0.7,1.1] m | cells > 10 m: 0 
+g1-step4 | cells 45 hold 45 | tf 0 | LAND 0 by - | fault->tf - s | fault->LAND - s | d@LAND - m (>10: 0) | d@TD - m | TD 0 stop+motors off 0 | TD vz - vh - tilt - | bounce 0 | h@STOP max - | max |p-r| in HOLD 0.40[0.36,0.50] | target walk in HOLD 0.0[0.0,0.0] | nav gap 0.69[0.59,1.17] | |e| max in HOLD 1.6[1.2,2.5] deg | max d before LAND 0.8[0.8,1.1] | max d run 0.8[0.8,1.1]
+g1-step4-xinf | cells 45 tf 0 | LAND 0 by - | max d before LAND (or run end) 0.8[0.8,1.1] m | cells > 10 m: 0 
+g1-step6 | cells 45 hold 45 | tf 0 | LAND 0 by - | fault->tf - s | fault->LAND - s | d@LAND - m (>10: 0) | d@TD - m | TD 0 stop+motors off 0 | TD vz - vh - tilt - | bounce 0 | h@STOP max - | max |p-r| in HOLD 0.61[0.55,0.69] | target walk in HOLD 0.0[0.0,0.0] | nav gap 0.70[0.58,1.17] | |e| max in HOLD 1.6[1.2,2.7] deg | max d before LAND 1.0[0.8,1.1] | max d run 1.0[0.8,1.1]
+g1-step6-xinf | cells 45 tf 0 | LAND 0 by - | max d before LAND (or run end) 1.0[0.8,1.1] m | cells > 10 m: 0 
+
+## G6 (sim a7d998e, firmware c66aee0, 2026-11-23T22:53:58-06:00)
+g6-thrust80 | cells 45 hold 45 | tf 0 | LAND 0 by - | fault->tf - s | fault->LAND - s | d@LAND - m (>10: 0) | d@TD - m | TD 0 stop+motors off 0 | TD vz - vh - tilt - | bounce 0 | h@STOP max - | max |p-r| in HOLD 0.36[0.28,0.51] | target walk in HOLD 0.0[0.0,0.0] | nav gap 0.68[0.60,1.17] | |e| max in HOLD 1.6[1.2,2.3] deg | max d before LAND 0.8[0.7,1.1] | max d run 0.8[0.7,1.1]
+g6-thrust80-xinf | cells 45 tf 0 | LAND 0 by - | max d before LAND (or run end) 0.8[0.7,1.1] m | cells > 10 m: 0 
+g6-thrust60 | cells 45 hold 45 | tf 0 | LAND 0 by - | fault->tf - s | fault->LAND - s | d@LAND - m (>10: 0) | d@TD - m | TD 0 stop+motors off 0 | TD vz - vh - tilt - | bounce 0 | h@STOP max - | max |p-r| in HOLD 0.85[0.63,1.27] | target walk in HOLD 0.0[0.0,0.0] | nav gap 0.68[0.58,1.17] | |e| max in HOLD 1.5[1.2,2.3] deg | max d before LAND 1.1[0.8,1.6] | max d run 1.1[0.8,1.6]
+g6-thrust60-xinf | cells 45 tf 0 | LAND 0 by - | max d before LAND (or run end) 1.1[0.8,1.6] m | cells > 10 m: 0 
 
