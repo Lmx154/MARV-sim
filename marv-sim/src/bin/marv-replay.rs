@@ -16,7 +16,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 const HELP: &str = "\
-marv-replay <log.BIN> <outdir> [--every N] [--imu-period-us US] [--mag-expected UT,INC_DEG,STR_PCT,TOL_DEG] [--noaid-sigma M] [--no-baro-from-armed N] [--gps-delay-ms MS] [--gps-min-rate-hz HZ] [--no-mag] [--nki] [--steering mahony-baro|eskf2|eskf3] [--veld] [--holdout-vd-odd] [--vd-sigma M_S] [--notch] [--notch-harmonics 1|3] [--notch-fs HZ] [--heading-mon]
+marv-replay <log.BIN> <outdir> [--every N] [--imu-period-us US] [--mag-expected UT,INC_DEG,STR_PCT,TOL_DEG] [--noaid-sigma M] [--no-baro-from-armed N] [--gps-delay-ms MS] [--gps-min-rate-hz HZ] [--no-mag] [--nki] [--steering mahony-baro|eskf2|eskf3] [--veld] [--holdout-vd-odd] [--vd-sigma M_S] [--notch] [--notch-harmonics 1|3] [--notch-fs HZ] [--heading-mon] [--yaw-inject DEG@T]
 
 Replays a flight log through the flight code's estimators (the real Rust code, Tuning::DEFAULT) and prints a
 validation table against the log's own NAV and NKF1 records. One CSV per estimator goes into <outdir>
@@ -44,6 +44,10 @@ rebuilt from the log, MOT.Arm and each step's DMD (Ok, Thr against Tuning::groun
 land_detect_us), the value after the previous step, as Flight::step passes it. Prints per armed session the evaluated,
 R2-screened and R5-refused (NE flag false) pairs, informed % (sig <= 15 deg), max |d_hat| over informed epochs, the time from take-off
 to confirmed, any fault, the blind time; writes <outdir>/eskf3_headmon.csv (every Src 13 record).
+
+--yaw-inject DEG@T (HM0r): the eskf3 row's nominal yaw is turned by DEG degrees once, before the first step whose IMU time
+is >= T seconds of board time (the firmware's sim-fault hook EskfN::sim_rotate_yaw; P, the monitor and the events are not
+touched). Open loop: the recorded vehicle does not react. No other row sees it.
 ";
 
 /// When the estimator is told the armed state: the steering estimator gets the gate's state after the previous step
@@ -75,6 +79,8 @@ trait Replayed: Estimator {
     fn heading_mon(&self) -> Option<(HeadingMon, u32)> {
         None
     }
+    /// `--yaw-inject`: the nominal yaw + `dpsi` rad (eskf3 only).
+    fn sim_rotate_yaw(&mut self, _dpsi: f32) {}
 }
 impl Replayed for Mahony {}
 impl Replayed for MahonyBaro {}
@@ -104,6 +110,9 @@ impl Replayed for Eskf {
     }
     fn heading_mon(&self) -> Option<(HeadingMon, u32)> {
         Some((Eskf::heading_mon(self), self.heading_mon_dropped()))
+    }
+    fn sim_rotate_yaw(&mut self, dpsi: f32) {
+        Eskf::sim_rotate_yaw(self, dpsi);
     }
 }
 
@@ -178,6 +187,8 @@ struct Args {
     notch_fs: f32,
     /// `--heading-mon`: the eskf3 row's heading monitor gets the rebuilt airborne latch; per-session report and CSV.
     heading_mon: bool,
+    /// `--yaw-inject DEG@T`: the eskf3 row's yaw turned by DEG degrees at board time T (us).
+    yaw_inject: Option<(f32, u64)>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -197,6 +208,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let (mut notch, mut notch_harmonics, mut notch_fs) = (false, 3usize, 800.0f32);
     let mut opts = StreamOpts { imu_period_us: None, expected_cli: None };
     let mut heading_mon = false;
+    let mut yaw_inject = None;
     while let Some(a) = it.next() {
         match a.as_str() {
             "-h" | "--help" => {
@@ -222,6 +234,13 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             "--vd-sigma" => vd_sigma = Some(it.next().and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite() && *v > 0.0).ok_or("--vd-sigma M_S")?),
             "--notch" => notch = true,
             "--heading-mon" => heading_mon = true,
+            "--yaw-inject" => {
+                let v = it.next().unwrap_or_default();
+                let (d, t) = v.split_once('@').ok_or("--yaw-inject DEG@T")?;
+                let d = d.parse::<f32>().ok().filter(|d| d.is_finite() && d.abs() <= 360.0).ok_or("--yaw-inject: DEG is not a number in [-360, 360]")?;
+                let t = t.parse::<f64>().ok().filter(|t| t.is_finite() && *t >= 0.0).ok_or("--yaw-inject: T is not seconds >= 0")?;
+                yaw_inject = Some((d, (t * 1e6).round() as u64));
+            }
             "--notch-harmonics" => notch_harmonics = it.next().and_then(|v| v.parse::<usize>().ok()).filter(|v| [1, 3].contains(v)).ok_or("--notch-harmonics 1|3")?,
             "--notch-fs" => notch_fs = it.next().and_then(|v| v.parse::<f32>().ok()).filter(|v| v.is_finite() && *v > 0.0).ok_or("--notch-fs HZ")?,
             "--steering" => match it.next().as_deref() {
@@ -248,7 +267,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         }
     }
     let [log, out]: [String; 2] = pos.try_into().map_err(|_| "usage: marv-replay <log.BIN> <outdir> [options]; --help")?;
-    Ok(Args { log: log.into(), out: out.into(), every, opts, noaid, no_baro_from_armed, gps_delay_ms, gps_min_rate_hz, no_mag, nki, steering, steer_eskf3, veld, holdout_vd_odd, vd_sigma, notch, notch_harmonics, notch_fs, heading_mon })
+    Ok(Args { log: log.into(), out: out.into(), every, opts, noaid, no_baro_from_armed, gps_delay_ms, gps_min_rate_hz, no_mag, nki, steering, steer_eskf3, veld, holdout_vd_odd, vd_sigma, notch, notch_harmonics, notch_fs, heading_mon, yaw_inject })
 }
 
 fn bits(v: &Valid) -> [u8; 7] {
@@ -950,8 +969,17 @@ fn run() -> Result<(), String> {
     let air = if args.heading_mon { airborne_latch(&log, &stream, &tuning)? } else { Vec::new() };
     let mut hm = args.heading_mon.then(HmReport::default);
     let mut prev_armed = false;
+    let mut inject = args.yaw_inject;
     for (k, s) in stream.steps.iter().enumerate() {
+        let inject_now = inject.filter(|i| s.sensors.imu1.t_us >= i.1);
+        if let Some((d, _)) = inject_now {
+            println!("yaw inject: eskf3 yaw + {d} deg before the step at {:.6} s (armed {})", s.sensors.imu1.t_us as f64 * 1e-6, s.armed);
+            inject = None;
+        }
         for r in &mut rows {
+            if let (Some((d, _)), "eskf3") = (inject_now, r.name) {
+                r.est.sim_rotate_yaw(d.to_radians());
+            }
             r.est.set_armed(if r.armed_at == ArmedAt::Before { prev_armed } else { s.armed });
             if args.heading_mon && r.name == "eskf3" {
                 r.est.set_airborne(k > 0 && air[k - 1]);
@@ -1348,6 +1376,16 @@ mod tests {
         assert!(args(&["--heading-mon", "a.BIN", "out"]).unwrap().heading_mon);
         assert!(args(&["a.BIN", "--heading-mon"]).is_err(), "the out dir is still required");
         assert!(args(&["a.BIN", "out", "--heading-monitor"]).is_err());
+    }
+
+    #[test]
+    fn yaw_inject_option_parses() {
+        assert_eq!(args(&["a.BIN", "out"]).unwrap().yaw_inject, None);
+        assert_eq!(args(&["a.BIN", "out", "--yaw-inject", "45@123.5"]).unwrap().yaw_inject, Some((45.0, 123_500_000)));
+        assert_eq!(args(&["a.BIN", "out", "--yaw-inject", "-90@0"]).unwrap().yaw_inject, Some((-90.0, 0)));
+        for bad in ["45", "45@", "@10", "x@10", "45@-1", "400@10"] {
+            assert!(args(&["a.BIN", "out", "--yaw-inject", bad]).is_err(), "{bad}");
+        }
     }
 
     /// The rebuilt latch on a synthetic DMD stream: rises only armed with a demand at or above the ground thrust and not
