@@ -60,6 +60,9 @@ pub struct Scenario {
     pub pilot: Option<PilotParams>,
     /// `[from_us, to_us)` intervals in which no stick report is made.
     pub rc_lost: Vec<(u64, u64)>,
+    /// `[scenario] rc_source = "receiver"` (N19): stick reports are receiver reports (`RcSource::Receiver`, channel 8 from
+    /// the row or phase `mission`) at 100 reports/s; `"crsf"` (the default): CRSF reports at 250/s as before.
+    pub receiver: bool,
     /// `[scenario] baro_lost = [[from_s, to_s], ...]`: `[from_us, to_us)` intervals in which no barometer sample reaches
     /// the flight code (the model keeps running).
     pub baro_lost: Vec<(u64, u64)>,
@@ -169,6 +172,8 @@ pub struct RcRow {
     pub throttle: f32,
     pub arm: bool,
     pub mode: Switch3,
+    /// Channel 8, the mission switch, ON (N19 1(2)); false when not given.
+    pub mission: bool,
 }
 
 /// `[pilot]`: the sim pilot's limits and gains (decision-sim-takeoff-landing, sections 2 and 10).
@@ -231,6 +236,8 @@ pub struct Phase {
     pub xy_hold: bool,
     /// The channel-6 switch from this phase on; `None` keeps the previous phase's (Low at the start).
     pub mode: Option<Switch3>,
+    /// The mission switch (channel 8) from this phase on; `None` keeps the previous phase's (OFF at the start).
+    pub mission: Option<bool>,
     /// `lost = true` (hands-off campaign N): no stick report reaches the flight code while this phase runs (the pilot flies
     /// on); the reports resume with the next phase's sticks, arm and switch.
     pub lost: bool,
@@ -466,7 +473,7 @@ fn ranged(t: &Table, table: &str, key: &str, lo: f64, hi: f64) -> Result<f32, St
 }
 
 fn rc_script(rc: &Table) -> Result<Vec<RcRow>, String> {
-    let keys = ["t_s", "roll", "pitch", "yaw", "throttle", "arm", "mode"];
+    let keys = ["t_s", "roll", "pitch", "yaw", "throttle", "arm", "mode", "mission"];
     let mut script: Vec<RcRow> = Vec::new();
     for (i, row) in rows(rc, "rc", "script", &keys)?.into_iter().enumerate() {
         let name = format!("rc.script[{i}]");
@@ -488,6 +495,7 @@ fn rc_script(rc: &Table) -> Result<Vec<RcRow>, String> {
                 Some(Value::String(m)) if m == "high" => Switch3::High,
                 Some(_) => return Err(format!("{name}.mode: must be \"low\", \"middle\" or \"high\"")),
             },
+            mission: flag_of(row, &name, "mission")?,
         });
     }
     if script.is_empty() {
@@ -534,7 +542,7 @@ fn flag_of(row: &Table, at: &str, k: &str) -> Result<bool, String> {
 
 fn rc_phases(rc: &Table) -> Result<Vec<Phase>, String> {
     let keys = ["name", "after_s", "event", "below_m", "timeout_s", "arm", "throttle", "height_m", "descend_ms", "xy",
-        "roll", "pitch", "yaw", "mode", "lost", "baro_lost", "gnss_lost"];
+        "roll", "pitch", "yaw", "mode", "mission", "lost", "baro_lost", "gnss_lost"];
     let mut phases: Vec<Phase> = Vec::new();
     for (i, row) in rows(rc, "rc", "phase", &keys)?.into_iter().enumerate() {
         let at = format!("rc.phase[{i}]");
@@ -597,8 +605,12 @@ fn rc_phases(rc: &Table) -> Result<Vec<Phase>, String> {
             Some(Value::String(m)) if m == "high" => Some(Switch3::High),
             Some(_) => return Err(format!("{at}.mode: must be \"low\", \"middle\" or \"high\"")),
         };
+        let mission = match row.get("mission") {
+            None => None,
+            Some(v) => Some(v.as_bool().ok_or(format!("{at}.mission: must be true or false"))?),
+        };
         phases.push(Phase { name, end, arm, throttle, roll: stick("roll")?, pitch: stick("pitch")?, yaw: stick("yaw")?,
-            xy_hold, mode, lost: flag_of(row, &at, "lost")?, baro_lost: flag_of(row, &at, "baro_lost")?,
+            xy_hold, mode, mission, lost: flag_of(row, &at, "lost")?, baro_lost: flag_of(row, &at, "baro_lost")?,
             gnss_lost: flag_of(row, &at, "gnss_lost")? });
     }
     if phases.is_empty() {
@@ -829,7 +841,7 @@ impl Scenario {
                 return Err(format!("{key}: unknown table"));
             }
         }
-        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz", "mag_expected", "gnss_velocity", "baro_motion", "baro_lost", "gnss_lost", "gnss_hold", "mag_fault", "gnss_latency_s", "wind_steps", "yaw_inject", "yaw_hold", "gnss_jump", "motor_thrust", "push", "thrust_gain", "radio_status", "mission", "commands", "station_hb", "resume", "battery"])?;
+        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz", "mag_expected", "gnss_velocity", "baro_motion", "baro_lost", "gnss_lost", "gnss_hold", "mag_fault", "gnss_latency_s", "wind_steps", "yaw_inject", "yaw_hold", "gnss_jump", "motor_thrust", "push", "thrust_gain", "radio_status", "mission", "commands", "station_hb", "resume", "battery", "rc_source"])?;
         let ground = match root.get("initial").and_then(Value::as_table).and_then(|i| i.get("contact")) {
             None => false,
             Some(Value::String(c)) if c == "air" => false,
@@ -1043,6 +1055,12 @@ impl Scenario {
             }
             Some(_) => return Err("scenario.thrust_gain: must be an inline table".to_string()),
         };
+        let receiver = match s.get("rc_source") {
+            None => false,
+            Some(Value::String(v)) if v == "crsf" => false,
+            Some(Value::String(v)) if v == "receiver" => true,
+            Some(_) => return Err("scenario.rc_source: must be \"crsf\" or \"receiver\"".to_string()),
+        };
         let radio_status = match s.get("radio_status") {
             None => None,
             Some(Value::Table(t)) => {
@@ -1209,6 +1227,7 @@ impl Scenario {
             phases,
             pilot,
             rc_lost,
+            receiver,
             baro_lost,
             gnss_lost,
             gnss_hold,

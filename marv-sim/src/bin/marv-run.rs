@@ -4,7 +4,7 @@
 //! the matrix of cells (decision-sim-takeoff-landing, section 4) is the spread file with more axes.
 
 use fw_core::handshake::Handshake;
-use fw_core::rc::{RcSample, Sticks};
+use fw_core::rc::{RcSample, RcSource, Sticks};
 use fw_flight::alloc::CardAllocator;
 use fw_core::esc::{LINES, line_of_element};
 use fw_flight::esc::hold;
@@ -74,6 +74,9 @@ fn erpm_lines(speeds_rads: [f64; 4], t_us: u64) -> [Option<(u32, u64)>; LINES] {
 }
 /// A stick report: every 32 ticks, 4 ms (B10).
 const RC_TICKS: u64 = 32;
+/// A receiver report (N19, `[scenario] rc_source = "receiver"`): every 80 ticks, 10 ms (100 reports/s, section 65). The
+/// pilot still makes its report every RC_TICKS; the newest one is sent.
+const RX_TICKS: u64 = 80;
 /// Noise streams, one per sensor (src/rng.rs).
 const STREAM_IMU1: u64 = 1;
 const STREAM_IMU2: u64 = 2;
@@ -1380,12 +1383,14 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
         let row = row_at(&scenario.rc_script, 0);
         let mut pending: Option<RcSample> = None;
         let mut contact = false;
+        let (period, source) = if scenario.receiver { (RX_TICKS, RcSource::Receiver) } else { (RC_TICKS, RcSource::Crsf) };
         for k in 1..=preroll_ticks {
             pinned.t_us = k * TICK_US;
             world.slow.tick(&pinned);
-            if (k - 1).is_multiple_of(RC_TICKS) {
+            if (k - 1).is_multiple_of(period) {
                 let sticks = Sticks { roll: row.roll, pitch: row.pitch, throttle: row.throttle, yaw: row.yaw };
-                pending = Some(RcSample { sticks, arm: row.arm, switch6: row.mode, t_us: pinned.t_us - TICK_US });
+                pending = Some(RcSample { sticks, arm: row.arm, switch6: row.mode, source, mission: row.mission,
+                    t_us: pinned.t_us - TICK_US });
             }
             if pinned.t_us.is_multiple_of(IMU_PERIOD_US) {
                 let s1 = world.imu1.sample(&pinned);
@@ -1412,6 +1417,8 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
         // A sample made at the last pre-roll ticks, not yet taken, would carry a pre-roll stamp into the shifted clock.
         let _ = world.slow.take();
     }
+    // Receiver reports (N19): the newest row the pilot or script made, and whether its phase is a lost one.
+    let mut rx_newest: Option<(marv_sim::scenario::RcRow, bool)> = None;
     for k in 0..ticks {
         let now = world.backend.truth().t_us;
         if k.is_multiple_of(ESC_TICKS) {
@@ -1446,10 +1453,22 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             };
             // Only the newest report reaches the next flight step, once.
             let lost = phase_lost || scenario.rc_lost.iter().any(|&(from, to)| now >= from && now < to);
-            if !lost {
+            rx_newest = Some((row, phase_lost));
+            if !lost && !scenario.receiver {
                 let given = row;
                 let sticks = Sticks { roll: given.roll, pitch: given.pitch, throttle: given.throttle, yaw: given.yaw };
-                pending = Some(RcSample { sticks, arm: given.arm, switch6: given.mode, t_us: now + off });
+                pending = Some(RcSample { sticks, arm: given.arm, switch6: given.mode, source: RcSource::Crsf,
+                    mission: given.mission, t_us: now + off });
+                trace.rc_us.push(now);
+                log.rc(now, [given.roll, given.pitch, given.throttle, given.yaw], given.arm);
+            }
+        }
+        if scenario.receiver && k.is_multiple_of(RX_TICKS) && let Some((given, phase_lost)) = rx_newest {
+            // The transmitter off: a lost phase, or a scripted `[rc] lost` window at this report's time.
+            if !(phase_lost || scenario.rc_lost.iter().any(|&(from, to)| now >= from && now < to)) {
+                let sticks = Sticks { roll: given.roll, pitch: given.pitch, throttle: given.throttle, yaw: given.yaw };
+                pending = Some(RcSample { sticks, arm: given.arm, switch6: given.mode, source: RcSource::Receiver,
+                    mission: given.mission, t_us: now + off });
                 trace.rc_us.push(now);
                 log.rc(now, [given.roll, given.pitch, given.throttle, given.yaw], given.arm);
             }
@@ -1835,7 +1854,7 @@ fn ho_line(scenario: &Scenario, trace: &Trace, ho: &[HoStep]) -> String {
     let mot_off = trace.esc.last().is_some_and(|e| e.1 == [0; 4]);
     let hp_off = k_hold.zip(hp).map(|(k, h)| (st[k].truth_pos[0] - h[0]).hypot(st[k].truth_pos[1] - h[1]));
     // The stick loss: the first scripted window, else (a phase with lost = true) the first gap in the reports given.
-    let per = RC_TICKS * TICK_US;
+    let per = if scenario.receiver { RX_TICKS } else { RC_TICKS } * TICK_US;
     let rc_gap = trace.rc_us.windows(2).find(|w| w[1] - w[0] > 3 * per).map(|w| w[0] + per)
         .or(trace.rc_us.last().filter(|&&l| l + 1_000_000 < st[n - 1].t_us).map(|l| l + per));
     let lost = scenario.rc_lost.first().map(|w| w.0).or(rc_gap);
@@ -2497,6 +2516,25 @@ vh_ms {:.4} vz_ms {:.4}",
                 -p.truth_pos[2], h.gated, u8::from(h.anchor.is_some())));
         }
         std::fs::write(Path::new(&dir).join(format!("{name}.csv")), text).map_err(|e| format!("MARV_HO_DUMP: {e}"))?;
+    }
+    // `MARV_MS_CSV=<dir>` (N19 smoke): one CSV per run, every 8th flight step (10 ms) and every step whose state code changes:
+    // state, mode, leg, armed, motors running (any ESC level above 0 at that time), truth position (h up) and velocity (NED).
+    if let Ok(dir) = std::env::var("MARV_MS_CSV") {
+        let name = cell.map_or(format!("{}-seed{seed}", scenario.name), |r| r.cell.name.clone());
+        let mut text = String::from("t_s,state,mode,leg,armed,motors,on_ground,true_n,true_e,true_h,true_vn,true_ve,true_vd\n");
+        let mut prev = u8::MAX;
+        for (k, (p, h)) in trace.steps.iter().zip(&ho).enumerate() {
+            if k % 8 != 0 && h.state == prev {
+                continue;
+            }
+            prev = h.state;
+            let i = trace.esc.partition_point(|e| e.0 <= p.t_us);
+            let motors = i > 0 && trace.esc[i - 1].1.iter().any(|&l| l > 0);
+            text.push_str(&format!("{:.4},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}\n", p.t_us as f64 * 1e-6, h.state, p.mode,
+                h.leg.map_or(-1, i32::from), u8::from(p.armed), u8::from(motors), u8::from(p.on_ground), p.truth_pos[0], p.truth_pos[1],
+                -p.truth_pos[2], p.truth_vel[0], p.truth_vel[1], p.truth_vel[2]));
+        }
+        std::fs::write(Path::new(&dir).join(format!("{name}.csv")), text).map_err(|e| format!("MARV_MS_CSV: {e}"))?;
     }
     let steer = steer_cfg.zip(steer).map(|(cfg, st)| {
         let info = match cfg.est {
