@@ -1342,10 +1342,19 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
     // `after_hold_s`), the previous step's state and leg.
     let (mut t_hold1, mut t_start1, mut t_done, mut t_ret1) = (None::<u64>, None::<u64>, None::<u64>, None::<u64>);
     let (mut st_prev, mut leg_prev) = (0u8, None::<u8>);
-    if !scenario.mission.is_empty() || !scenario.commands.is_empty() {
-        // The board gives false until the battery monitor is merged; mission cells set it true (stated in the report).
-        flight.set_battery_ok(true);
-    }
+    // Part 3: the board's battery path (src/batt_fs.rs): fw_core::battery::Monitor stepped at 10 Hz with the pack voltage, the
+    // armed flag and the BATT_* settings; its cell byte | CELL_KNOWN_OK (known not critical) to Flight::set_battery_cell every step.
+    let (bvolts, bc) = &scenario.battery;
+    let bcfg = fw_core::battery::Config { cells: bc[0] as i32, low_cell_v: bc[1] as f32, crt_cell_v: bc[2] as f32, timer_s: bc[3] as i32, act: bc[4] as i32 };
+    let mut bmon = fw_core::battery::Monitor::new();
+    let (mut bnext, mut bcell, mut barmed) = (0u64, 0u8, false);
+    let volts_at = |t: u64| -> f64 {
+        let i = bvolts.partition_point(|r| r.0 <= t);
+        if i == 0 { return bvolts[0].1; }
+        if i == bvolts.len() { return bvolts[i - 1].1; }
+        let (a, b) = (bvolts[i - 1], bvolts[i]);
+        a.1 + (b.1 - a.1) * (t - a.0) as f64 / (b.0 - a.0) as f64
+    };
     let mut gdn = GdnShadow::from_args();
     let mut flight_steps: u64 = 0;
     let mut ran = 0;
@@ -1550,6 +1559,17 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
                 }
                 flight.set_last_radio_heartbeat_us(hb_last);
             }
+            if truth.t_us >= bnext {
+                bnext = truth.t_us + 100_000;
+                let t_ms = (truth.t_us + off) / 1000;
+                let up = bmon.step(&bcfg, t_ms, barmed, Some(fw_core::battery::Sample { volts: volts_at(truth.t_us) as f32, t_ms }));
+                let cell = up.cell | if bmon.known_not_critical() { fw_core::battery::CELL_KNOWN_OK } else { 0 };
+                if cell != bcell || MSN.with(|m| m.borrow().batt.is_empty()) {
+                    MSN.with(|m| m.borrow_mut().batt.push((truth.t_us, cell)));
+                }
+                bcell = cell;
+            }
+            flight.set_battery_cell(bcell);
             let mut cmd_now: Option<&'static str> = None;
             if let Some(c) = scenario.commands.get(cmd_next).filter(|c| if c.3 { t_hold1.is_some_and(|h| truth.t_us >= h + c.0) } else { truth.t_us >= c.0 }) {
                 use fw_flight::hands_off::{Command, Link as CLink, StationCommand};
@@ -1579,6 +1599,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
                 };
                 MSN.with(|m| m.borrow_mut().cmds.push((truth.t_us, name, r)));
             }
+            barmed = out_f.armed;
             let anchor = flight.sim_anchor();
             {
                 let (code, leg) = (flight.hands_off_state().code(), flight.leg_active());
@@ -1690,6 +1711,8 @@ struct MsnRec {
     /// heights_ok, and the list's TRUE waypoints.
     uploads: Vec<(u64, String, u8, u32, u8, Vec<f32>, f32, bool, Vec<[f64; 3]>)>,
     cmds: Vec<(u64, &'static str, String)>,
+    /// Part 3: every change of the battery cell byte given to Flight::set_battery_cell (time, byte).
+    batt: Vec<(u64, u8)>,
 }
 
 thread_local! {
@@ -2007,6 +2030,41 @@ floor_first_after_contact_s {} td_max_air_ms {}",
         }
         DUMP2.with(|d| *d.borrow_mut() = text);
     }
+    // Part 3 (P2): after the first LAND/BLIND step, the step the fall is stopped (true vz <= 0, down +), its height, the largest
+    // rise after it before contact, the time after it with |vz| < 0.1 m/s above 1 m before contact (hover), and contact.
+    if let Some(kl) = (0..n).find(|&k| ho[k].state == 6 || ho[k].state == 8) {
+        let kc = trace.touchdowns.iter().find(|t| t.t_us >= st[kl].t_us).map(|t| st[..n].partition_point(|p| p.t_us < t.t_us).min(n - 1));
+        let end = kc.unwrap_or(n);
+        let kf = (kl..end).find(|&k| st[k].truth_vel[2] <= 0.0);
+        let rise = kf.map(|f| (f..end).map(|k| h(k) - h(f)).fold(0.0f64, f64::max));
+        let hov = kf.map(|f| (f..end).filter(|&k| st[k].truth_vel[2].abs() < 0.1 && h(k) > 1.0).count() as f64 * IMU_PERIOD_US as f64 * 1e-6);
+        out.push_str(&format!(" fall_stop_s {} fall_stop_h_m {} rise_after_fall_m {} hover_after_fall_s {} contact_after_land_s {}",
+            kf.map_or("none".to_string(), |k| format!("{:.3}", secs(st[k].t_us))), kf.map_or("none".to_string(), |k| format!("{:.2}", h(k))),
+            rise.map_or("none".to_string(), |v| format!("{v:.2}")), hov.map_or("none".to_string(), |v| format!("{v:.1}")),
+            kc.map_or("none".to_string(), |k| format!("{:.3}", secs(st[k].t_us)))));
+    }
+    // Part 3 (P4): the first PILOT step after a TAKEOVER: true horizontal displacement 30 s later and its largest value; and from
+    // the first step after it with the selected mode Position (3), the same.
+    if let Some(kp) = (1..n).find(|&k| ho[k].state == 1 && ho[k - 1].state == 2) {
+        let drift = |a: usize| {
+            let b = st[..n].partition_point(|p| p.t_us < st[a].t_us + 30_000_000).min(n - 1);
+            let d = |k: usize| (st[k].truth_pos[0] - st[a].truth_pos[0]).hypot(st[k].truth_pos[1] - st[a].truth_pos[1]);
+            format!("{:.3} {:.2} {:.2} {}/{}", secs(st[a].t_us), d(b), (a..=b).map(d).fold(0.0f64, f64::max), st[a].selected, st[a].mode)
+        };
+        let kq = (kp + 1..n).find(|&k| st[k].selected == 3);
+        let w = |s: String| s.split(' ').collect::<Vec<_>>().join(" ");
+        let a = drift(kp);
+        let p: Vec<&str> = a.split(' ').collect();
+        out.push_str(&format!(" hb_pilot_s {} hb_drift30_m {} hb_drift30_max_m {} hb_mode {}", p[0], p[1], p[2], p[3]));
+        match kq {
+            Some(q) => { let b = w(drift(q)); let p: Vec<&str> = b.split(' ').collect(); out.push_str(&format!(" hb_pos_s {} hb_pos_drift30_m {} hb_pos_drift30_max_m {} hb_pos_mode {}", p[0], p[1], p[2], p[3])); }
+            None => out.push_str(" hb_pos_s none"),
+        }
+    }
+    {
+        let b: Vec<String> = MSN.with(|m| m.borrow().batt.iter().map(|(t, c)| format!("{c}@{:.1}", secs(*t))).collect());
+        out.push_str(&format!(" batt_cells {}", if b.is_empty() { "none".to_string() } else { b.join(",") }));
+    }
     // RETURN (campaign part 2): entry, the climb (until the setpoint NE first moves 0.5 m from its value at entry), the leg home,
     // LAND; home = the TRUE take-off point (0, 0). Heights and distances TRUE.
     if let Some(kr) = (0..n).find(|&k| ho[k].state == 5) {
@@ -2031,12 +2089,13 @@ floor_first_after_contact_s {} td_max_air_ms {}",
         out.push_str(&format!(
             " ret_s {:.3} ret_h_entry_m {:.2} ret_d_home_entry_m {:.2} ret_climb_s {:.2} ret_h_climb_end_m {:.2} ret_climb_drift_m {:.2} ret_h_max_m {:.2} \
 ret_top_est_err_m {:.2} ret_leg_s {} ret_exit_state {} ret_exit_s {} ret_d_home_exit_m {} ret_carrot_max_m {:.2} ret_land_vz_hi_ms {} ret_land_vz_lo_ms {} \
-ret_td_s {} ret_td_d_home_m {} ret_td_vz_ms {} ret_mstop_s {} ret_to_stop_s {} ret_contact_to_stop_s {}",
+ret_td_s {} ret_td_d_home_m {} ret_td_vz_ms {} ret_mstop_s {} ret_to_stop_s {} ret_contact_to_stop_s {} ret_land_vz_band_ms {}",
             secs(tr), h(kr), hd(kr), secs(st[kc.min(n - 1)].t_us) - secs(tr), h(kc.min(n - 1)), drift, h(ktop), (-st[ktop].nav_d) - h(ktop),
             o((kre > kc).then(|| secs(st[kre.min(n - 1)].t_us) - secs(st[kc.min(n - 1)].t_us)), 2), after,
             if kre < n { format!("{:.3}", secs(st[kre].t_us)) } else { "none".to_string() }, o((kre < n).then(|| hd(kre)), 2), car,
             o(vmean(10.5, 1e9), 2), o(vmean(0.5, 9.5), 2), o(tdn.map(|t| secs(t.t_us)), 3), o(ktd.map(hd), 2), o(tdn.map(|t| t.velocity_ms[2]), 2),
-            o(mstop.map(secs), 3), o(mstop.map(|m| secs(m) - secs(tr)), 2), o(mstop.zip(tdn).map(|(m, t)| secs(m) - secs(t.t_us)), 2)));
+            o(mstop.map(secs), 3), o(mstop.map(|m| secs(m) - secs(tr)), 2), o(mstop.zip(tdn).map(|(m, t)| secs(m) - secs(t.t_us)), 2),
+            o(if kre < n { vmean(11.0, h(kre) - 2.0) } else { None }, 2)));
     } else {
         out.push_str(" ret_s none");
     }

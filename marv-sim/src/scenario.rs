@@ -110,6 +110,10 @@ pub struct Scenario {
     /// (stick reports resume with the next phase) that long after AUTO's last waypoint (AUTO -> HOLD at the last index) or
     /// after the first accepted Start, or (`after_return_s`) after the first RETURN step. (0 done, 1 start, 2 return; us.)
     pub resume: Option<(u8, u64)>,
+    /// `[scenario] battery = { volts = [[t_s, pack_V], ...], cells, low_cell, crt_cell, timer_s, act }` (part 3): the pack voltage,
+    /// linear between rows (the first before, the last after), and the five BATT_* settings (defaults: 4, 3.6, 3.5, 10, 0).
+    /// Without the key: a steady 16.0 V pack (4.0 V per cell) and the defaults.
+    pub battery: (Vec<(u64, f64)>, [f64; 5]),
     /// `[scenario] station_hb = { from_s, to_s }` (N2 plumbing): the station HEARTBEAT time fed every flight step from `from_s`
     /// while before `to_s` (Flight::set_last_radio_heartbeat_us); after `to_s` the last time stays (the heartbeat stops).
     pub station_hb: Option<(u64, u64)>,
@@ -825,7 +829,7 @@ impl Scenario {
                 return Err(format!("{key}: unknown table"));
             }
         }
-        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz", "mag_expected", "gnss_velocity", "baro_motion", "baro_lost", "gnss_lost", "gnss_hold", "mag_fault", "gnss_latency_s", "wind_steps", "yaw_inject", "yaw_hold", "gnss_jump", "motor_thrust", "push", "thrust_gain", "radio_status", "mission", "commands", "station_hb", "resume"])?;
+        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz", "mag_expected", "gnss_velocity", "baro_motion", "baro_lost", "gnss_lost", "gnss_hold", "mag_fault", "gnss_latency_s", "wind_steps", "yaw_inject", "yaw_hold", "gnss_jump", "motor_thrust", "push", "thrust_gain", "radio_status", "mission", "commands", "station_hb", "resume", "battery"])?;
         let ground = match root.get("initial").and_then(Value::as_table).and_then(|i| i.get("contact")) {
             None => false,
             Some(Value::String(c)) if c == "air" => false,
@@ -1135,6 +1139,26 @@ impl Scenario {
             }
             Some(_) => return Err("scenario.resume: an inline table".to_string()),
         };
+        let battery = match s.get("battery") {
+            None => (vec![(0, 16.0)], [4.0, 3.6, 3.5, 10.0, 0.0]),
+            Some(Value::Table(t)) => {
+                known_keys(t, "scenario.battery", &["volts", "cells", "low_cell", "crt_cell", "timer_s", "act"])?;
+                let bad = || "scenario.battery.volts: rows of [t_s, pack_V]".to_string();
+                let mut v = Vec::new();
+                for r in get(t, "scenario.battery", "volts")?.as_array().ok_or_else(bad)? {
+                    let r = r.as_array().filter(|r| r.len() == 2).ok_or_else(bad)?;
+                    v.push((secs(number(&r[0]).ok_or_else(bad)?), number(&r[1]).ok_or_else(bad)?));
+                }
+                if v.is_empty() { return Err(bad()); }
+                let d = [4.0, 3.6, 3.5, 10.0, 0.0];
+                let mut c = d;
+                for (i, k) in ["cells", "low_cell", "crt_cell", "timer_s", "act"].iter().enumerate() {
+                    if t.contains_key(*k) { c[i] = scalar(t, "scenario.battery", k)?; }
+                }
+                (v, c)
+            }
+            Some(_) => return Err("scenario.battery: an inline table".to_string()),
+        };
         let mut disturbances = Vec::new();
         for (i, row) in rows(&root, "", "disturbance", &["from_s", "to_s", "torque_nm"])?.into_iter().enumerate() {
             let name = format!("disturbance[{i}]");
@@ -1200,6 +1224,7 @@ impl Scenario {
             commands,
             station_hb,
             resume,
+            battery,
             gnss_latency_s,
             wind_steps,
             disturbances,
