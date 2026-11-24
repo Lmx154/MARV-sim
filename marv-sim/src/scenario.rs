@@ -73,6 +73,9 @@ pub struct Scenario {
     /// `[scenario] motor_thrust = { at_s, line, scale }` (hands-off campaign): from scenario time `at_s` on, the thrust (and
     /// the reaction torque) of the rotor on DShot line `line` is scaled by `scale` in the plant.
     pub motor_thrust: Option<(u64, usize, f64)>,
+    /// `[scenario] push = { from_s, to_s, north_n, east_n }` (hands-off campaign H14): a horizontal world-frame force (N) on the
+    /// vehicle from `from_s` to `to_s`, added to the plant's wrench.
+    pub push: Option<(u64, u64, [f64; 2])>,
     /// `[scenario] gnss_latency_s` (G4): replaces the model's latency (the card's); `None` leaves it.
     pub gnss_latency_s: Option<f64>,
     /// `[scenario] wind_steps = [[t_s, d_north, d_east, d_down], ...]` (Amendment P, P6 and P7): from scenario time `t_s`
@@ -770,7 +773,7 @@ impl Scenario {
                 return Err(format!("{key}: unknown table"));
             }
         }
-        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz", "mag_expected", "gnss_velocity", "baro_motion", "baro_lost", "gnss_lost", "gnss_hold", "mag_fault", "gnss_latency_s", "wind_steps", "yaw_inject", "yaw_hold", "gnss_jump", "motor_thrust"])?;
+        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz", "mag_expected", "gnss_velocity", "baro_motion", "baro_lost", "gnss_lost", "gnss_hold", "mag_fault", "gnss_latency_s", "wind_steps", "yaw_inject", "yaw_hold", "gnss_jump", "motor_thrust", "push"])?;
         let ground = match root.get("initial").and_then(Value::as_table).and_then(|i| i.get("contact")) {
             None => false,
             Some(Value::String(c)) if c == "air" => false,
@@ -958,6 +961,19 @@ impl Scenario {
             }
             Some(_) => return Err("scenario.motor_thrust: must be an inline table".to_string()),
         };
+        let push = match s.get("push") {
+            None => None,
+            Some(Value::Table(t)) => {
+                known_keys(t, "scenario.push", &["from_s", "to_s", "north_n", "east_n"])?;
+                let (a, b) = (scalar(t, "scenario.push", "from_s")?, scalar(t, "scenario.push", "to_s")?);
+                let (n, e) = (scalar(t, "scenario.push", "north_n")?, scalar(t, "scenario.push", "east_n")?);
+                if !(a.is_finite() && b.is_finite() && a >= 0.0 && b > a && n.is_finite() && e.is_finite()) {
+                    return Err("scenario.push: 0 <= from_s < to_s and finite forces".to_string());
+                }
+                Some(((a * 1e6).round() as u64, (b * 1e6).round() as u64, [n, e]))
+            }
+            Some(_) => return Err("scenario.push: must be an inline table".to_string()),
+        };
         let mut disturbances = Vec::new();
         for (i, row) in rows(&root, "", "disturbance", &["from_s", "to_s", "torque_nm"])?.into_iter().enumerate() {
             let name = format!("disturbance[{i}]");
@@ -1016,6 +1032,7 @@ impl Scenario {
             yaw_hold,
             gnss_jump,
             motor_thrust,
+            push,
             gnss_latency_s,
             wind_steps,
             disturbances,

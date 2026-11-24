@@ -1428,6 +1428,13 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             world.plant.set_thrust_scale(line, scale);
         }
         let mut wrench = world.plant.step(levels, world.backend.truth(), wind, TICK_US);
+        if let Some((_, _, [fn_, fe])) = scenario.push.filter(|p| now >= p.0 && now < p.1) {
+            let rot = marv_sim::math::rot_matrix(world.backend.truth().attitude);
+            let fb = marv_sim::math::mat_t_vec(&rot, [fn_, fe, 0.0]);
+            for i in 0..3 {
+                wrench.force_n[i] += fb[i];
+            }
+        }
         for d in scenario.disturbances.iter().filter(|d| now >= d.from_us && now < d.to_us) {
             for i in 0..3 {
                 wrench.torque_nm[i] += d.torque_nm[i];
@@ -1691,13 +1698,50 @@ fn ho_line(scenario: &Scenario, trace: &Trace, ho: &[HoStep]) -> String {
             short_drops += usize::from(st[k].t_us - f < 1_000_000);
         }
     }
+    // H14: the LAND law flown on each LAND step (Position setpoint with the track fault: Brake; without: Hold; otherwise Level),
+    // seconds in each up to touchdown (or the end), the law at touchdown; peak true horizontal speed and tilt in Brake; true distance
+    // from the LAND start point to touchdown; motor stops (any ESC level 0) while armed... at a true height above 0.3 m.
+    let dt_step = IMU_PERIOD_US as f64 * 1e-6;
+    let law = |k: usize| -> Option<u8> {
+        (ho[k].state == 6).then(|| if st[k].pos_target_ne.iter().all(|v| v.is_finite()) { if ho[k].tf { 0 } else { 1 } } else { 2 })
+    };
+    let k_land_end = k_td.unwrap_or(n);
+    let mut law_s = [0.0f64; 3];
+    let (mut brake_vmax, mut brake_tilt) = (0.0f64, 0.0f64);
+    for k in k_land.unwrap_or(n)..k_land_end {
+        if let Some(l) = law(k) {
+            law_s[usize::from(l)] += dt_step;
+            if l == 0 {
+                brake_vmax = brake_vmax.max(st[k].truth_vel[0].hypot(st[k].truth_vel[1]));
+                brake_tilt = brake_tilt.max(tilt_err(st[k].truth_q, [1.0, 0.0, 0.0, 0.0]).to_degrees());
+            }
+        }
+    }
+    let law_td = k_td.and_then(|k| (k.saturating_sub(5)..=k).rev().find_map(|j| law(j)));
+    let law_name = |l: Option<u8>| ["brake", "hold", "level"].get(usize::from(l.unwrap_or(9))).copied().unwrap_or("none");
+    let land_to_td = k_land.zip(k_td).map(|(a, b)| (st[b].truth_pos[0] - st[a].truth_pos[0]).hypot(st[b].truth_pos[1] - st[a].truth_pos[1]));
+    let t_arm = st.iter().find(|p| p.armed).map_or(u64::MAX, |p| p.t_us);
+    let mut air_stops = 0usize;
+    let mut air_stop_first: Option<(u64, f64)> = None;
+    for &(t, lv) in &trace.esc {
+        if t <= t_arm + 100_000 || !lv.iter().any(|&l| l == 0) {
+            continue;
+        }
+        let k = st[..n].partition_point(|p| p.t_us < t).min(n - 1);
+        let h = -st[k].truth_pos[2];
+        if h > 0.3 {
+            air_stops += 1;
+            air_stop_first.get_or_insert((t, h));
+        }
+    }
     let hop = k_td.map(|kt| (kt..k_end).map(|k| -st[k].truth_pos[2]).fold(0.0, f64::max));
     format!(
         "hands_off hb {} xinf {} lost_s {} hold_s {} hp_off_m {} t_ref_s {} states {} tf_s {} land_s {} land_by {} blind_s {} td_s {} stop_s {} disarm_s {} \
 dt_tf_s {} dt_land_s {} d_tf_m {} d_land_m {} d_td_m {} d_stop_m {} d_max_m {} d_max_s {} d_hold_max_m {} trk_max_m {} hdg_drop_s {} ne_drop_s {} \
 e_land_deg {} h_land_m {} h_stop_m {} vz_stop_ms {} td_vz_ms {} td_vh_ms {} td_tilt_deg {} n_td {} liftoff_after_td {} mot_off {} armed_end {} d_end_m {} h_end_m {} e_hold_deg {} e_max_hold_deg {} hop_after_td_m {} r_walk_max_m {} r_moving_s {:.1} nav_gap_max_m {} \
 anchor_s {} b_m {} x_m {:.2} v_entry_ms {} trip_by {} dA_tf_m {} dAn_tf_m {} dA_land_m {} dAn_land_m {} dA_max_pre_land_m {} dAn_max_pre_land_m {} dA_max_m {} \
-dA_td_m {} stop_dist_m {} stopped_s {} ne_short_drops {}",
+dA_td_m {} stop_dist_m {} stopped_s {} ne_short_drops {} \
+law_brake_s {:.2} law_hold_s {:.2} law_level_s {:.2} law_td {} brake_vmax_ms {:.2} brake_tilt_deg {:.1} land_to_td_m {} air_stops {} air_stop_first {}",
         if flag(&NO_HEARTBEAT) { "absent" } else { "fed" }, u8::from(flag(&X_INF)), opt(lost), opt(k_hold.map(|k| st[k].t_us)), num(hp_off, 3),
         opt(t_ref), hist.join(","), opt(k_tf.map(|k| st[k].t_us)), opt(k_land.map(|k| st[k].t_us)), land_by.unwrap_or("none".to_string()),
         opt(k_blind.map(|k| st[k].t_us)), opt(td.map(|t| t.t_us)), opt(k_stop.map(|k| st[k].t_us)), opt(k_disarm.map(|k| st[k].t_us)),
@@ -1711,7 +1755,9 @@ dA_td_m {} stop_dist_m {} stopped_s {} ne_short_drops {}",
         opt(k_a.map(|k| st[k].t_us)), num(an.map(|a| a.2), 3), x_m, num(v_entry, 2), trip_by.unwrap_or("none"),
         num(k_tf.and_then(da_t), 2), num(k_tf.and_then(da_n), 2), num(k_land.and_then(da_t), 2), num(k_land.and_then(da_n), 2),
         num(da_max_pre, 2), num(dan_max_pre, 2), num(da_max, 2), num(k_td.and_then(da_t), 2), num(k_stopped.and_then(da_t), 2),
-        opt(k_stopped.map(|k| st[k].t_us)), short_drops
+        opt(k_stopped.map(|k| st[k].t_us)), short_drops,
+        law_s[0], law_s[1], law_s[2], law_name(law_td), brake_vmax, brake_tilt, num(land_to_td, 2), air_stops,
+        air_stop_first.map_or("none".to_string(), |(t, h)| format!("{:.3}@{:.2}m", secs(t), h))
     )
 }
 
