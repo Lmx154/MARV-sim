@@ -80,12 +80,8 @@ Tuning::nav_noaid_sigma_m, the armed no-aid position hold's sigma).
 --gdn <north_m>,<east_m> (repeatable, at most 4; one run only) runs the firmware's shadow guidance as the board does, with targets
 at those offsets from the origin the estimator reports, and --gdn-radius <m> (default 2.0) the arrival radius: one GDN record
 every 8th step, and one `gdn` line. Without --gdn the guidance is not called and no GDN record is written.
---hm-screen built|r2p-off (eskf3; HM3b): the heading monitor's norm screen as built, or with R2' off (a pair after an
-R2-screened one is evaluated; the firmware's sim-fault hook, called before every step). An eskf3 run logs the monitor's
-NKI Src 13 records (the board's layout) and prints one `heading_mon` line (HM3b verdict block).";
-
-/// `--hm-screen`: the heading monitor's screen mode (0 as built, 1 R2' off), eskf3 only.
-static HM_SCREEN: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+An eskf3 run logs the heading monitor's NKI Src 13 records (the board's layout) and prints one `heading_mon` line
+(HM3b verdict block).";
 
 /// `--noaid-sigma`: replaces `Tuning::nav_noaid_sigma_m` (the armed no-aid position hold's sigma) for every estimator.
 static NOAID_SIGMA: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -288,14 +284,6 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
             "--ground-s" => {
                 let v = value.parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0 && *v <= 300.0).ok_or(format!("--ground-s: {value} is not in (0, 300] seconds"))?;
                 let _ = GROUND_S.set(v);
-            }
-            "--hm-screen" => {
-                let m = match value.as_str() {
-                    "built" => 0,
-                    "r2p-off" => 1,
-                    _ => return Err(format!("--hm-screen: {value} is not built or r2p-off")),
-                };
-                let _ = HM_SCREEN.set(m);
             }
             "--window" => {
                 let bad = || format!("--window: {value} is not <from_s>,<to_s> with 0 <= from_s < to_s");
@@ -838,9 +826,6 @@ impl Estimator for Mix3 {
             self.inject = None;
             let mut i = self.info.borrow_mut();
             i.hm_inject_t_us = Some(sensors.imu1.t_us.saturating_sub(i.off_us));
-        }
-        if HM_SCREEN.get() == Some(&1) {
-            self.mix.sim_hm_clear_r2_prime();
         }
         let nav = self.mix.update(sensors);
         let steer = self.mix.steer();
@@ -1603,21 +1588,21 @@ fn hm_line(scenario: &Scenario, trace: &Trace, x: &Ext) -> String {
     let dhat_fault = fault.and_then(|t| eval.iter().rev().find(|r| r.0 <= t)).map(|r| d(f64::from(r.1.inn)));
     let sig_fault = fault.and_then(|t| eval.iter().rev().find(|r| r.0 <= t)).map(|r| d(f64::from(r.1.var).sqrt()));
     let last = i.hm_last;
+    let blind_total: f64 = i.hm_blind.iter().map(|b| secs(b.1.unwrap_or(st[n - 1].t_us).saturating_sub(b.0))).sum::<f64>() + 0.0;
     let blinds: Vec<String> = i.hm_blind.iter().take(6).map(|b| format!("{:.1}-{}", secs(b.0), b.1.map_or("end".to_string(), |t| format!("{:.1}", secs(t))))).collect();
     format!(
-        "heading_mon screen {} t_air_s {} t_ref_s {:.3} inject_s {} confirmed_s {} to_confirmed_s {} fault_s {} blind_s {} hdg_drop_s {} ne_drop_s {} \
-pos_exit_s {} g6b_s {} prot_s {} prot_by {} dhat_max_inf_deg {} n_eval {} n_screened {} n_dropped {} e_ref_deg {:.2} e_hist_deg {} \
+        "heading_mon t_air_s {} t_ref_s {:.3} inject_s {} confirmed_s {} to_confirmed_s {} fault_s {} blind_s {} blind_total_s {:.1} hdg_drop_s {} ne_drop_s {} \
+pos_exit_s {} g6b_s {} prot_s {} prot_by {} dhat_max_inf_deg {} n_eval {} n_screened {} n_ne_invalid {} e_ref_deg {:.2} e_hist_deg {} \
 e_peak_deg {:.2} e_peak_s {:.2} e_end_deg {:.2} e_fault_deg {} e_min_1s_before_fault_deg {} dhat_fault_deg {} sig_fault_deg {} \
-exc_fault_m {} exc_fault1_m {} exc_prot1_m {} exc_max_m {} exc_max_s {} exc_unprot_max_m {} exc_end_m {} exc_max_pre_lost_m {} \
+exc_fault_m {} exc_fault1_m {} exc_prot1_m {} exc_ne1_m {} exc_max_m {} exc_max_s {} exc_unprot_max_m {} exc_end_m {} exc_max_pre_lost_m {} \
 tilt_err_fault_deg {} tilt_err_max_deg {:.2}",
-        ["built", "r2p-off"][usize::from(*HM_SCREEN.get().unwrap_or(&0)).min(1)],
         opt(i.hm_air_t_us), secs(t_ref), opt(i.hm_inject_t_us), opt(i.hm_confirmed_t_us),
         num(i.hm_confirmed_t_us.zip(i.hm_air_t_us).map(|(c, a)| secs(c) - secs(a)), 3),
-        opt(fault), if blinds.is_empty() { "none".to_string() } else { blinds.join(",") }, opt(hdg_drop), opt(ne_drop),
+        opt(fault), if blinds.is_empty() { "none".to_string() } else { blinds.join(",") }, blind_total, opt(hdg_drop), opt(ne_drop),
         opt(pos_exit), opt(g6b), opt(prot.map(|p| p.0)), prot.map_or("none", |p| p.1),
-        num(dhat_max, 2), eval.len(), last.map_or(0, |o| o.screened_r2), last.map_or(0, |o| o.dropped_r2p),
+        num(dhat_max, 2), eval.len(), last.map_or(0, |o| o.screened_r2), last.map_or(0, |o| o.ne_invalid),
         e[k_ref], hist.join("/"), peak, secs(st[peak_k].t_us), e[n - 1], num(e_fault, 2), num(e_min_before, 2), num(dhat_fault, 2), num(sig_fault, 2),
-        num(exc_at(fault), 3), num(exc_at(fault.map(|t| t + 1_000_000)), 3), num(exc_at(prot.map(|p| p.0 + 1_000_000)), 3),
+        num(exc_at(fault), 3), num(exc_at(fault.map(|t| t + 1_000_000)), 3), num(exc_at(prot.map(|p| p.0 + 1_000_000)), 3), num(exc_at(ne_drop.map(|t| t + 1_000_000)), 3),
         num(all.map(|a| a.0), 3), opt(all.map(|a| a.1)), num(unprot.map(|a| a.0), 3), num(exc[n - 1], 3),
         num(pre_lost.map(|a| a.0), 3), num(tilt_fault, 2), d(tilt_max)
     )

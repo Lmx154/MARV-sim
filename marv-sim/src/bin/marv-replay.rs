@@ -42,7 +42,7 @@ Tuning::notch_harmonics (default 3, as built). --notch-fs HZ is the sample rate 
 --heading-mon: the eskf3 row's heading monitor (NKI Src 13) is told the airborne state: Flight's airborne latch (step.rs)
 rebuilt from the log, MOT.Arm and each step's DMD (Ok, Thr against Tuning::ground_thrust_g x weight, Sat bit 3 thrust_low,
 land_detect_us), the value after the previous step, as Flight::step passes it. Prints per armed session the evaluated,
-R2-screened and R2'-dropped pairs, informed % (sig <= 15 deg), max |d_hat| over informed epochs, the time from take-off
+R2-screened and R5-refused (NE flag false) pairs, informed % (sig <= 15 deg), max |d_hat| over informed epochs, the time from take-off
 to confirmed, any fault, the blind time; writes <outdir>/eskf3_headmon.csv (every Src 13 record).
 ";
 
@@ -496,8 +496,8 @@ impl HmReport {
             let Some(m) = s.out else { continue };
             let _ = writeln!(
                 o,
-                ", take-off {:.3}, airborne {:.1}; evaluated {} screened(R2) {} dropped(R2') {} non-finite {} out-of-interval {} slot drops {}; informed {:.1} %; max |d_hat| informed {:.2} deg; confirmed {}; fault {}; blind {:.2}; last d_hat {:.2} deg sig {:.2} deg",
-                sec(t0), sec(s.air_us), s.evaluated, s.screened, m.dropped_r2p, m.non_finite, m.out_of_interval, s.slot_drops,
+                ", take-off {:.3}, airborne {:.1}; evaluated {} screened(R2) {} ne-invalid(R5) {} non-finite {} out-of-interval {} slot drops {}; informed {:.1} %; max |d_hat| informed {:.2} deg; confirmed {}; fault {}; blind {:.2}; last d_hat {:.2} deg sig {:.2} deg",
+                sec(t0), sec(s.air_us), s.evaluated, s.screened, m.ne_invalid, m.non_finite, m.out_of_interval, s.slot_drops,
                 100.0 * f64::from(s.informed) / f64::from(s.evaluated.max(1)), s.max_d_rad.to_degrees(), after(s.confirmed_us),
                 after(s.fault_us), sec(s.blind_us), m.delta_rad.to_degrees(), m.sigma_rad.to_degrees()
             );
@@ -1387,7 +1387,7 @@ mod tests {
 
     fn mon(confirmed: bool, fault: bool, blind: bool) -> HeadingMon {
         HeadingMon { ok: confirmed && !fault && !blind, confirmed, fault, delta_rad: 0.0, sigma_rad: f32::INFINITY, info: 0.0,
-            screened_r2: 0, dropped_r2p: 0, non_finite: 0, out_of_interval: 0, blind }
+            screened_r2: 0, ne_invalid: 0, non_finite: 0, out_of_interval: 0, blind }
     }
 
     /// The session figures from synthetic steps: screened records are not evaluated, only informed ones (sig <= 15 deg)
