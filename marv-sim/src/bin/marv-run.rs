@@ -50,6 +50,8 @@ static FS_HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 static NO_HEARTBEAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static X_INF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// The truth yaw (rad, f64 bits) of the plant at the flight step about to run, for the `yaw_hold` hook in `Mix3`.
+/// `--pilot-speed <m/s>`: PILOT_SPEED_XY through Flight::set_pilot_speed_xy before arming (hands-off campaign H13 item 5).
+static PILOT_SPEED: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
 static TRUTH_YAW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn flag(f: &std::sync::atomic::AtomicBool) -> bool {
     f.load(std::sync::atomic::Ordering::Relaxed)
@@ -300,6 +302,10 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
             "--gdn-radius" => {
                 let v = value.parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0).ok_or(format!("--gdn-radius: {value} is not a number >= 0"))?;
                 let _ = GDN_RADIUS.set(v);
+            }
+            "--pilot-speed" => {
+                let v = value.parse::<f32>().ok().filter(|v| v.is_finite()).ok_or(format!("--pilot-speed: {value} is not a number"))?;
+                let _ = PILOT_SPEED.set(v);
             }
             "--ground-s" => {
                 let v = value.parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0 && *v <= 300.0).ok_or(format!("--ground-s: {value} is not in (0, 300] seconds"))?;
@@ -1334,6 +1340,9 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
     let off = preroll_ticks * TICK_US;
     flight.set_notch(NOTCH.load(std::sync::atomic::Ordering::Relaxed), MOTOR_POLES);
     flight.set_fs_hold_en(flag(&FS_HOLD));
+    if let Some(&v) = PILOT_SPEED.get() {
+        assert!(flight.set_pilot_speed_xy(v), "--pilot-speed {v} refused by Flight::set_pilot_speed_xy");
+    }
     if preroll_ticks > 0 {
         let mut pinned = world.backend.truth().clone();
         let row = row_at(&scenario.rc_script, 0);
@@ -1466,10 +1475,12 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             if flag(&FS_HOLD) {
                 flight.set_heading_ok(out_f.nav.valid.heading);
             }
+            let anchor = flight.sim_anchor();
             if flag(&X_INF) {
                 flight.sim_clear_track_error();
             }
-            ho.push(HoStep { state: flight.hands_off_state().code(), tf: flight.sim_track_fault(), hdg: out_f.nav.valid.heading });
+            ho.push(HoStep { state: flight.hands_off_state().code(), tf: flight.sim_track_fault(), hdg: out_f.nav.valid.heading, anchor,
+                x_m: fw_flight::hands_off::track_fault_m(flight.speed_xy_in_force()) });
             let mut out = out_f;
             out.t_us -= off;
             out.nav.t_us -= off;
@@ -1528,6 +1539,10 @@ struct HoStep {
     state: u8,
     tf: bool,
     hdg: bool,
+    /// H13: the anchor (nav NE) and the braking allowance b after the step (read before the rule-off control clears it);
+    /// X in force.
+    anchor: Option<([f32; 2], f32)>,
+    x_m: f32,
 }
 
 /// The `hands_off` verdict line (hands-off campaign). Times are scenario seconds. The hold point is the Position target at the
@@ -1635,11 +1650,42 @@ fn ho_line(scenario: &Scenario, trace: &Trace, ho: &[HoStep]) -> String {
     let g0 = k_hold.map(|k| [st[k].nav_ne[0] - st[k].truth_pos[0], st[k].nav_ne[1] - st[k].truth_pos[1]]);
     let nav_gap = g0.and_then(|g| (k0..k_end_hold).map(|k| (st[k].nav_ne[0] - st[k].truth_pos[0] - g[0]).hypot(st[k].nav_ne[1] - st[k].truth_pos[1] - g[1]))
         .fold(None, |a: Option<f64>, b| Some(a.map_or(b, |a| a.max(b)))));
+    // H13: the anchor in the truth frame (moved by the truth - nav offset of the step it was first seen), true and nav
+    // distances from it; which distance tripped; the stopping distance (true |p - A| at the first step after the anchor
+    // with true horizontal speed < 0.3 m/s); position-flag drops shorter than 1.0 s while hands-off before LAND.
+    let k_a = (0..n).find(|&k| ho[k].anchor.is_some());
+    let an = k_a.and_then(|k| ho[k].anchor.map(|(a, b)| (k, [f64::from(a[0]), f64::from(a[1])], f64::from(b))));
+    let a_true = an.map(|(k, a, _)| [a[0] + st[k].truth_pos[0] - st[k].nav_ne[0], a[1] + st[k].truth_pos[1] - st[k].nav_ne[1]]);
+    let da_t = |k: usize| a_true.map(|a| (st[k].truth_pos[0] - a[0]).hypot(st[k].truth_pos[1] - a[1]));
+    let da_n = |k: usize| an.map(|(_, a, _)| (st[k].nav_ne[0] - a[0]).hypot(st[k].nav_ne[1] - a[1]));
+    let x_m = f64::from(ho[n - 1].x_m);
+    let trip_by = k_tf.map(|k| match (da_n(k), an) {
+        (Some(d), Some((_, _, b))) if st[k].position_covered && d > x_m + b => "anchor",
+        _ => "target",
+    });
+    let ka0 = k_a.unwrap_or(n);
+    let fold_max = |from: usize, to: usize, f: &dyn Fn(usize) -> Option<f64>| (from..to).filter_map(|k| f(k)).fold(None, |a: Option<f64>, b| Some(a.map_or(b, |a| a.max(b))));
+    let da_max_pre = fold_max(ka0, k_land.unwrap_or(n), &da_t);
+    let da_max = fold_max(ka0, n, &da_t);
+    let dan_max_pre = fold_max(ka0, k_land.unwrap_or(n), &|k| if st[k].position_covered { da_n(k) } else { None });
+    let k_stopped = (ka0..n).find(|&k| st[k].truth_vel[0].hypot(st[k].truth_vel[1]) < 0.3);
+    let v_entry = k_a.map(|k| st[k].truth_vel[0].hypot(st[k].truth_vel[1]));
+    let mut short_drops = 0;
+    let mut run_from: Option<u64> = None;
+    for k in k0..k_land.unwrap_or(n) {
+        if !st[k].position_covered {
+            run_from.get_or_insert(st[k].t_us);
+        } else if let Some(f) = run_from.take() {
+            short_drops += usize::from(st[k].t_us - f < 1_000_000);
+        }
+    }
     let hop = k_td.map(|kt| (kt..k_end).map(|k| -st[k].truth_pos[2]).fold(0.0, f64::max));
     format!(
         "hands_off hb {} xinf {} lost_s {} hold_s {} hp_off_m {} t_ref_s {} states {} tf_s {} land_s {} land_by {} blind_s {} td_s {} stop_s {} disarm_s {} \
 dt_tf_s {} dt_land_s {} d_tf_m {} d_land_m {} d_td_m {} d_stop_m {} d_max_m {} d_max_s {} d_hold_max_m {} trk_max_m {} hdg_drop_s {} ne_drop_s {} \
-e_land_deg {} h_land_m {} h_stop_m {} vz_stop_ms {} td_vz_ms {} td_vh_ms {} td_tilt_deg {} n_td {} liftoff_after_td {} mot_off {} armed_end {} d_end_m {} h_end_m {} e_hold_deg {} e_max_hold_deg {} hop_after_td_m {} r_walk_max_m {} r_moving_s {:.1} nav_gap_max_m {}",
+e_land_deg {} h_land_m {} h_stop_m {} vz_stop_ms {} td_vz_ms {} td_vh_ms {} td_tilt_deg {} n_td {} liftoff_after_td {} mot_off {} armed_end {} d_end_m {} h_end_m {} e_hold_deg {} e_max_hold_deg {} hop_after_td_m {} r_walk_max_m {} r_moving_s {:.1} nav_gap_max_m {} \
+anchor_s {} b_m {} x_m {:.2} v_entry_ms {} trip_by {} dA_tf_m {} dAn_tf_m {} dA_land_m {} dAn_land_m {} dA_max_pre_land_m {} dAn_max_pre_land_m {} dA_max_m {} \
+dA_td_m {} stop_dist_m {} stopped_s {} ne_short_drops {}",
         if flag(&NO_HEARTBEAT) { "absent" } else { "fed" }, u8::from(flag(&X_INF)), opt(lost), opt(k_hold.map(|k| st[k].t_us)), num(hp_off, 3),
         opt(t_ref), hist.join(","), opt(k_tf.map(|k| st[k].t_us)), opt(k_land.map(|k| st[k].t_us)), land_by.unwrap_or("none".to_string()),
         opt(k_blind.map(|k| st[k].t_us)), opt(td.map(|t| t.t_us)), opt(k_stop.map(|k| st[k].t_us)), opt(k_disarm.map(|k| st[k].t_us)),
@@ -1649,7 +1695,11 @@ e_land_deg {} h_land_m {} h_stop_m {} vz_stop_ms {} td_vz_ms {} td_vh_ms {} td_t
         num(k_stop.map(|k| -st[k].truth_pos[2]), 3), num(k_stop.map(|k| st[k].truth_vel[2]), 3),
         num(td.map(|t| t.velocity_ms[2]), 3), num(td.map(|t| t.velocity_ms[0].hypot(t.velocity_ms[1])), 3), num(td.map(|t| t.tilt_rad.to_degrees()), 2),
         tds.len(), lift_after, if mot_off { "yes" } else { "no" }, st[n - 1].armed, num(d(n - 1), 2), format!("{:.2}", -st[n - 1].truth_pos[2]),
-        num(k_hold.map(e_deg), 1), num(e_max, 1), num(hop, 3), num(r_walk, 2), r_moving_s, num(nav_gap, 2)
+        num(k_hold.map(e_deg), 1), num(e_max, 1), num(hop, 3), num(r_walk, 2), r_moving_s, num(nav_gap, 2),
+        opt(k_a.map(|k| st[k].t_us)), num(an.map(|a| a.2), 3), x_m, num(v_entry, 2), trip_by.unwrap_or("none"),
+        num(k_tf.and_then(da_t), 2), num(k_tf.and_then(da_n), 2), num(k_land.and_then(da_t), 2), num(k_land.and_then(da_n), 2),
+        num(da_max_pre, 2), num(dan_max_pre, 2), num(da_max, 2), num(k_td.and_then(da_t), 2), num(k_stopped.and_then(da_t), 2),
+        opt(k_stopped.map(|k| st[k].t_us)), short_drops
     )
 }
 
