@@ -1,0 +1,15 @@
+# HM3b S-H4 (filter yaw rotated in a hold and in a shuttle): 5 points (as pos-hold-spread.toml) x 3 air x 3 seeds = 45 cells per scenario.
+scenarios = ["hm-inj30-hold.toml", "hm-inj45-hold.toml", "hm-inj60-hold.toml", "hm-inj90-hold.toml", "hm-inj30-shuttle.toml", "hm-inj45-shuttle.toml", "hm-inj60-shuttle.toml", "hm-inj90-shuttle.toml"]   # relative to this file
+points = [
+  { kf_scale = 1.0, inertia_scale = 1.0 },                    # P0: nominal card
+  { kf_scale = 0.7, inertia_scale = 1.25, lag_s = 0.060 },    # P1
+  { kf_scale = 0.7, inertia_scale = 1.25, lag_s = 0.030 },    # P2
+  { kf_scale = 1.3, inertia_scale = 0.75, lag_s = 0.060 },    # P3
+  { kf_scale = 1.3, inertia_scale = 0.75, lag_s = 0.030 },    # P4
+]
+air = [
+  { drag = 0.197 },                                    # 1: calm
+  { drag = 0.197, wind_ned = [5.0, 0.0, 0.0] },        # 2: 5 m/s toward the north
+  { drag = 0.197, wind_ned = [0.0, 5.0, 0.0] },        # 3: 5 m/s toward the east
+]
+seeds = [1, 2, 3]

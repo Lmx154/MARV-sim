@@ -1,0 +1,36 @@
+# HM3b (decision-heading-monitor H5 (ii)): S-H3: the compass turned about body z by a ramp of 1.0 deg/s from 60 s (17.5 s into the centred-stick hold), up to 90 deg.
+# Run: marv-run --estimator eskf3 --preroll 60, in a headmon/sh-*.toml spread (5 points x 3 air x 3 seeds).
+[scenario]
+name = "hm-ramp1"
+duration_s = 200.0
+wind_steps = [[90.0, 2.0, 0.0, 0.0]]   # P7: +2 m/s north at 90 s, as pos-hold.toml
+mag_fault = { from_s = 60.0, kind = "rotate", deg = 90.0, rate_dps = 1.0 }
+
+[initial]
+position_ned_m = [0.0, 0.0, 0.0]
+velocity_ned_ms = [0.0, 0.0, 0.0]
+roll_pitch_yaw_deg = [0.0, 0.0, 0.0]
+rates_rads = [0.0, 0.0, 0.0]
+rotors = "hover"
+
+[rc]
+script = [
+  { t_s = 0.0   , roll = 0, pitch = 0, yaw = 0, throttle = 0.0, arm = false },   # preamble, switch low, throttle 0
+  { t_s = 0.02  , roll = 0, pitch = 0, yaw = 0, throttle = 0.0, arm = true },   # arm
+  { t_s = 0.04  , roll = 0, pitch = 0, yaw = 0, throttle = 0.5, arm = true, mode = "high" },   # throttle 0.5, Position from here on
+  { t_s = 20.0  , roll = 0, pitch = 0.5, yaw = 0, throttle = 0.5, arm = true, mode = "high" },   # pitch 0.5: 2.2 m/s north (as pos-hold.toml), the monitor confirms on it
+  { t_s = 23.0  , roll = 0, pitch = 0, yaw = 0, throttle = 0.5, arm = true, mode = "high" },   # release
+  { t_s = 40.0  , roll = 1.0, pitch = 0, yaw = 0, throttle = 0.5, arm = true, mode = "high" },   # roll 1.0: 5 m/s east
+  { t_s = 42.5  , roll = 0, pitch = 0, yaw = 0, throttle = 0.5, arm = true, mode = "high" },   # release: the hold from here (centred sticks, HOLD law)
+]
+
+[verdict]
+check = "pos_hold"                # judged only to keep the file loadable; HM3b reads the heading_mon line
+windows = [[33.0, 40.0], [52.5, 60.0]]
+max_arm_to_position_s = 1.0
+max_hold_error_m = 1.5
+max_nav_gap_m = 1.0
+max_height_error_m = 0.5
+releases_s = [23.0, 42.5]
+modes = [1, 2, 3]
+selected = [1, 3]

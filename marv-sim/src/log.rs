@@ -105,6 +105,8 @@ pub struct Counts {
     pub pil: u64,
     /// Shadow guidance records (GDN), with `--gdn` only.
     pub gdn: u64,
+    /// Heading monitor records (NKI Src 13), eskf3 only (HM3b).
+    pub nki: u64,
 }
 
 pub struct Log {
@@ -219,6 +221,15 @@ impl Log {
         let n = dflog::encode_gdn(&mut buf, t_us, index, status, target_ne, position_ne, velocity_ne, dist_m, bearing_rad);
         self.append(&buf, n);
         self.counts.gdn += 1;
+    }
+
+    /// One NKI record (the firmware's type, already in the header), written by the firmware's `encode_nki`: the sim
+    /// logs only the heading monitor's Src 13 records (HM3b), with the board's layout (I 0, Inn d_hat, Var sig^2, Ok bits).
+    pub fn nki(&mut self, t_us: u64, inst: u8, src: u8, inn: f32, var: f32, ok: u8) {
+        let mut buf = [0u8; 64];
+        let n = dflog::encode_nki(&mut buf, t_us, inst, src, inn, var, ok);
+        self.append(&buf, n);
+        self.counts.nki += 1;
     }
 
     pub fn ground(&mut self, truth: &Truth) {

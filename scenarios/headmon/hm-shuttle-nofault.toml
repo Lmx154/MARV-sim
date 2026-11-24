@@ -1,0 +1,40 @@
+# HM3b (decision-heading-monitor H5 (ii)): S-H1 control: the shuttle script of the S-H4 shuttle cells with no fault, 128 s.
+# Run: marv-run --estimator eskf3 --preroll 60, in a headmon/sh-*.toml spread (5 points x 3 air x 3 seeds).
+[scenario]
+name = "hm-shuttle-nofault"
+duration_s = 128.0
+wind_steps = [[90.0, 2.0, 0.0, 0.0]]   # P7: +2 m/s north at 90 s, as pos-hold.toml
+
+[initial]
+position_ned_m = [0.0, 0.0, 0.0]
+velocity_ned_ms = [0.0, 0.0, 0.0]
+roll_pitch_yaw_deg = [0.0, 0.0, 0.0]
+rates_rads = [0.0, 0.0, 0.0]
+rotors = "hover"
+
+[rc]
+script = [
+  { t_s = 0.0   , roll = 0, pitch = 0, yaw = 0, throttle = 0.0, arm = false },   # preamble, switch low, throttle 0
+  { t_s = 0.02  , roll = 0, pitch = 0, yaw = 0, throttle = 0.0, arm = true },   # arm
+  { t_s = 0.04  , roll = 0, pitch = 0, yaw = 0, throttle = 0.5, arm = true, mode = "high" },   # throttle 0.5, Position from here on
+  { t_s = 20.0  , roll = 0, pitch = 0.5, yaw = 0, throttle = 0.5, arm = true, mode = "high" },   # pitch 0.5: 2.2 m/s north (as pos-hold.toml), the monitor confirms on it
+  { t_s = 23.0  , roll = 0, pitch = 0, yaw = 0, throttle = 0.5, arm = true, mode = "high" },   # release
+  { t_s = 40.0  , roll = 1.0, pitch = 0, yaw = 0, throttle = 0.5, arm = true, mode = "high" },   # roll 1.0: 5 m/s east
+  { t_s = 42.5  , roll = 0, pitch = 0, yaw = 0, throttle = 0.5, arm = true, mode = "high" },   # release: the hold from here (centred sticks, HOLD law)
+  { t_s = 44.0  , roll = 0, pitch = 0.3, yaw = 0, throttle = 0.5, arm = true, mode = "high" },   # shuttle: pitch +0.3 (about 1.3 m/s) for 6 s
+  { t_s = 50.0  , roll = 0, pitch = -0.3, yaw = 0, throttle = 0.5, arm = true, mode = "high" },   # pitch -0.3
+  { t_s = 56.0  , roll = 0, pitch = 0.3, yaw = 0, throttle = 0.5, arm = true, mode = "high" },   # pitch +0.3
+  { t_s = 62.0  , roll = 0, pitch = -0.3, yaw = 0, throttle = 0.5, arm = true, mode = "high" },   # pitch -0.3 (the S-H4 shuttle injection is at 64 s, mid-leg)
+  { t_s = 68.0  , roll = 0, pitch = 0, yaw = 0, throttle = 0.5, arm = true, mode = "high" },   # release: the hold from here
+]
+
+[verdict]
+check = "pos_hold"                # judged only to keep the file loadable; HM3b reads the heading_mon line
+windows = [[33.0, 40.0], [52.5, 60.0]]
+max_arm_to_position_s = 1.0
+max_hold_error_m = 1.5
+max_nav_gap_m = 1.0
+max_height_error_m = 0.5
+releases_s = [23.0, 42.5]
+modes = [1, 2, 3]
+selected = [1, 3]

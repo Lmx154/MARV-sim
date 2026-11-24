@@ -58,8 +58,11 @@ pub struct Scenario {
     /// before the interval and report zero speed and velocity (the receiver's low-speed freeze); after it the model's
     /// true solution returns with the jump.
     pub gnss_hold: Vec<(u64, u64)>,
-    /// `[scenario] mag_fault = { from_s, kind, deg, below_m, axis }` (G4).
+    /// `[scenario] mag_fault = { from_s, kind, deg, below_m, axis, rate_dps }` (G4; `rate_dps` HM3b).
     pub mag_fault: Option<MagFault>,
+    /// `[scenario] yaw_inject = { at_s, deg }` (HM3b, decision-heading-monitor H5 (ii)): at scenario time `at_s` (>= 0)
+    /// the filter's yaw is turned by `deg` (yaw + deg) through the firmware's `sim-fault` hook; eskf3 runs only.
+    pub yaw_inject: Option<YawInject>,
     /// `[scenario] gnss_latency_s` (G4): replaces the model's latency (the card's); `None` leaves it.
     pub gnss_latency_s: Option<f64>,
     /// `[scenario] wind_steps = [[t_s, d_north, d_east, d_down], ...]` (Amendment P, P6 and P7): from scenario time `t_s`
@@ -81,6 +84,16 @@ pub struct MagFault {
     pub below_m: Option<f64>,
     /// `Rotate` only: the body axis (0 x, 1 y, 2 z) the field is rotated about; z when not given.
     pub axis: usize,
+    /// `Rotate` only (HM3b): a ramp, rad/s (> 0): the angle is `rate x (t - from)`, up to `deg` in size, with `deg`'s
+    /// sign; `None` is the step to `deg` at `from`.
+    pub rate_rad_s: Option<f64>,
+}
+
+/// `[scenario] yaw_inject` (HM3b): the time (scenario, us) and the angle (rad) of the filter yaw rotation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct YawInject {
+    pub at_us: u64,
+    pub rad: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -747,7 +760,7 @@ impl Scenario {
                 return Err(format!("{key}: unknown table"));
             }
         }
-        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz", "mag_expected", "gnss_velocity", "baro_motion", "baro_lost", "gnss_lost", "gnss_hold", "mag_fault", "gnss_latency_s", "wind_steps"])?;
+        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz", "mag_expected", "gnss_velocity", "baro_motion", "baro_lost", "gnss_lost", "gnss_hold", "mag_fault", "gnss_latency_s", "wind_steps", "yaw_inject"])?;
         let ground = match root.get("initial").and_then(Value::as_table).and_then(|i| i.get("contact")) {
             None => false,
             Some(Value::String(c)) if c == "air" => false,
@@ -850,7 +863,7 @@ impl Scenario {
         let mag_fault = match s.get("mag_fault") {
             None => None,
             Some(Value::Table(t)) => {
-                known_keys(t, "scenario.mag_fault", &["from_s", "kind", "deg", "below_m", "axis"])?;
+                known_keys(t, "scenario.mag_fault", &["from_s", "kind", "deg", "below_m", "axis", "rate_dps"])?;
                 let kind = match t.get("kind").and_then(Value::as_str) {
                     Some("rotate") => MagFaultKind::Rotate,
                     Some("stuck") => MagFaultKind::Stuck,
@@ -864,15 +877,33 @@ impl Scenario {
                     Some(Some("y")) => 1,
                     _ => return Err("scenario.mag_fault.axis: must be \"x\", \"y\" or \"z\"".to_string()),
                 };
+                let rate_dps = optional_scalar(t, "scenario.mag_fault", "rate_dps")?;
+                if rate_dps.is_some_and(|r| kind != MagFaultKind::Rotate || !(r.is_finite() && r > 0.0)) {
+                    return Err("scenario.mag_fault.rate_dps: only with kind \"rotate\", and > 0".to_string());
+                }
                 Some(MagFault {
                     from_us: (from_s * 1e6).round() as i64,
                     kind,
                     deg_rad: deg.to_radians(),
                     below_m: optional_scalar(t, "scenario.mag_fault", "below_m")?,
                     axis,
+                    rate_rad_s: rate_dps.map(f64::to_radians),
                 })
             }
             Some(_) => return Err("scenario.mag_fault: must be an inline table".to_string()),
+        };
+        let yaw_inject = match s.get("yaw_inject") {
+            None => None,
+            Some(Value::Table(t)) => {
+                known_keys(t, "scenario.yaw_inject", &["at_s", "deg"])?;
+                let at_s = scalar(t, "scenario.yaw_inject", "at_s")?;
+                let deg = scalar(t, "scenario.yaw_inject", "deg")?;
+                if !(at_s.is_finite() && at_s >= 0.0 && deg.is_finite()) {
+                    return Err("scenario.yaw_inject: at_s must be >= 0 and deg finite".to_string());
+                }
+                Some(YawInject { at_us: (at_s * 1e6).round() as u64, rad: deg.to_radians() })
+            }
+            Some(_) => return Err("scenario.yaw_inject: must be an inline table".to_string()),
         };
         let mut disturbances = Vec::new();
         for (i, row) in rows(&root, "", "disturbance", &["from_s", "to_s", "torque_nm"])?.into_iter().enumerate() {
@@ -928,6 +959,7 @@ impl Scenario {
             gnss_lost,
             gnss_hold,
             mag_fault,
+            yaw_inject,
             gnss_latency_s,
             wind_steps,
             disturbances,

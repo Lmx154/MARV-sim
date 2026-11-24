@@ -13,7 +13,8 @@ use fw_flight::gnc::{Allocator, Controller, Estimator, GeoPoint, Sensors, Setpoi
 use fw_flight::guidance::Guidance;
 use fw_flight::gnc::NavState;
 use fw_flight::mahony::Mahony;
-use fw_flight::eskf::{Aiding, Eskf, EskfStats, RING, code};
+use fw_flight::eskf::{Aiding, Eskf, EskfStats, Nki, RING, code};
+use fw_flight::heading_mon::{HeadingMon, SIG_CONF_RAD};
 use fw_flight::eskf_out::{EskfSteer, SteerMix};
 use fw_flight::mahony_baro::MahonyBaro;
 use fw_flight::pid::CascadedPid;
@@ -78,7 +79,13 @@ and --noaid-sigma <m> (replaces
 Tuning::nav_noaid_sigma_m, the armed no-aid position hold's sigma).
 --gdn <north_m>,<east_m> (repeatable, at most 4; one run only) runs the firmware's shadow guidance as the board does, with targets
 at those offsets from the origin the estimator reports, and --gdn-radius <m> (default 2.0) the arrival radius: one GDN record
-every 8th step, and one `gdn` line. Without --gdn the guidance is not called and no GDN record is written.";
+every 8th step, and one `gdn` line. Without --gdn the guidance is not called and no GDN record is written.
+--hm-screen built|r2p-off (eskf3; HM3b): the heading monitor's norm screen as built, or with R2' off (a pair after an
+R2-screened one is evaluated; the firmware's sim-fault hook, called before every step). An eskf3 run logs the monitor's
+NKI Src 13 records (the board's layout) and prints one `heading_mon` line (HM3b verdict block).";
+
+/// `--hm-screen`: the heading monitor's screen mode (0 as built, 1 R2' off), eskf3 only.
+static HM_SCREEN: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
 
 /// `--noaid-sigma`: replaces `Tuning::nav_noaid_sigma_m` (the armed no-aid position hold's sigma) for every estimator.
 static NOAID_SIGMA: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -281,6 +288,14 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
             "--ground-s" => {
                 let v = value.parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0 && *v <= 300.0).ok_or(format!("--ground-s: {value} is not in (0, 300] seconds"))?;
                 let _ = GROUND_S.set(v);
+            }
+            "--hm-screen" => {
+                let m = match value.as_str() {
+                    "built" => 0,
+                    "r2p-off" => 1,
+                    _ => return Err(format!("--hm-screen: {value} is not built or r2p-off")),
+                };
+                let _ = HM_SCREEN.set(m);
             }
             "--window" => {
                 let bad = || format!("--window: {value} is not <from_s>,<to_s> with 0 <= from_s < to_s");
@@ -793,16 +808,40 @@ struct Info3 {
     bias_max_axis: usize,
     /// The core's gyro bias (rad/s) at the last step of each whole board second.
     bias_by_s: Vec<(u64, [f32; 3])>,
+    /// HM3b: the heading monitor read after every step (scenario times): the first step after Flight's airborne latch
+    /// was handed to the core set, the first step with confirmed, with fault, the blind intervals (from, to), the yaw
+    /// injection; every Src 13 record with its step time, the records not yet logged, the last output.
+    hm_air_t_us: Option<u64>,
+    hm_confirmed_t_us: Option<u64>,
+    hm_fault_t_us: Option<u64>,
+    hm_blind: Vec<(u64, Option<u64>)>,
+    hm_inject_t_us: Option<u64>,
+    hm_records: Vec<(u64, Nki)>,
+    hm_pending: Vec<Nki>,
+    hm_last: Option<HeadingMon>,
 }
 
-/// `SteerMix` over leaked storage (the host is not memory-constrained), wrapped to fill `Info3`.
+/// `SteerMix` over leaked storage (the host is not memory-constrained), wrapped to fill `Info3`. HM3b: `inject` is the
+/// scenario's `yaw_inject` (board time, rad), applied once before the first update at or after its time; `air` is the
+/// airborne latch Flight last handed over.
 struct Mix3 {
     mix: SteerMix<'static, RING>,
     info: Rc<RefCell<Info3>>,
+    inject: Option<(u64, f32)>,
+    air: bool,
 }
 
 impl Estimator for Mix3 {
     fn update(&mut self, sensors: &Sensors) -> NavState {
+        if let Some((_, rad)) = self.inject.filter(|(at, _)| sensors.imu1.t_us >= *at) {
+            self.mix.sim_rotate_yaw(rad);
+            self.inject = None;
+            let mut i = self.info.borrow_mut();
+            i.hm_inject_t_us = Some(sensors.imu1.t_us.saturating_sub(i.off_us));
+        }
+        if HM_SCREEN.get() == Some(&1) {
+            self.mix.sim_hm_clear_r2_prime();
+        }
         let nav = self.mix.update(sensors);
         let steer = self.mix.steer();
         let core = steer.core();
@@ -840,6 +879,29 @@ impl Estimator for Mix3 {
             _ => i.bias_by_s.push((nav.t_us / 1_000_000, bg)),
         }
         i.origin = self.mix.origin();
+        let o = core.heading_mon();
+        if self.air && i.hm_air_t_us.is_none() {
+            i.hm_air_t_us = Some(t);
+        }
+        if o.confirmed && i.hm_confirmed_t_us.is_none() {
+            i.hm_confirmed_t_us = Some(t);
+        }
+        if o.fault && i.hm_fault_t_us.is_none() {
+            i.hm_fault_t_us = Some(t);
+        }
+        let open = matches!(i.hm_blind.last(), Some((_, None)));
+        if o.blind && !open {
+            i.hm_blind.push((t, None));
+        } else if !o.blind && open {
+            if let Some(l) = i.hm_blind.last_mut() {
+                l.1 = Some(t);
+            }
+        }
+        for e in core.events().filter(|e| e.src == code::HEADING_MON) {
+            i.hm_records.push((t, *e));
+            i.hm_pending.push(*e);
+        }
+        i.hm_last = Some(o);
         nav
     }
     fn origin(&self) -> Option<fw_flight::gnc::GeoPoint> {
@@ -849,6 +911,7 @@ impl Estimator for Mix3 {
         self.mix.set_armed(armed);
     }
     fn set_airborne(&mut self, airborne: bool) {
+        self.air = airborne;
         self.mix.set_airborne(airborne);
     }
 }
@@ -1151,7 +1214,12 @@ impl Faults {
                 match f.kind {
                     MagFaultKind::Rotate if f.below_m.is_none_or(|b| height_m < b) => {
                         let (a, b) = ((f.axis + 1) % 3, (f.axis + 2) % 3);
-                        let (sn, cs) = (f.deg_rad.sin() as f32, f.deg_rad.cos() as f32);
+                        // HM3b: a ramp of rate_rad_s from `from`, up to deg in size; without a rate the step to deg.
+                        let ang = match f.rate_rad_s {
+                            None => f.deg_rad,
+                            Some(r) => f.deg_rad.signum() * (r * (t_us - f.from_us) as f64 * 1e-6).min(f.deg_rad.abs()),
+                        };
+                        let (sn, cs) = (ang.sin() as f32, ang.cos() as f32);
                         let v = m.reading.field_ut;
                         m.reading.field_ut[a] = cs * v[a] - sn * v[b];
                         m.reading.field_ut[b] = sn * v[a] + cs * v[b];
@@ -1402,6 +1470,8 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             if let Some(st) = steer.as_deref_mut() {
                 st.feed(&out, &truth);
             }
+            // HM3b: the heading monitor's Src 13 records of this step, as the board logs them (horizon time, here scenario time).
+            let hm: Vec<Nki> = steer.as_deref().and_then(|s| s.ext.as_ref()).map_or(Vec::new(), |x| std::mem::take(&mut x.info.borrow_mut().hm_pending));
             flight_steps += 1;
 
             // The firmware's rule (`log_due`): IMU1 every step; NAV, SETP, DMD, MOT every step armed, every 8th disarmed.
@@ -1424,6 +1494,9 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             if due.block && matches!(out.setpoint, Setpoint::Altitude { .. } | Setpoint::Position { .. }) {
                 log.spn(&out);
             }
+            for e in hm {
+                log.nki(e.t_us.saturating_sub(off), 0, e.src, e.inn, e.var, e.ok);
+            }
             if pilot.is_some() {
                 log.ground(&truth);
             }
@@ -1438,6 +1511,116 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
         println!("{}", g.line(log));
     }
     (ran, flight_steps, trace)
+}
+
+/// HM3b, the `heading_mon` verdict block of an eskf3 run (decision-heading-monitor H5 (ii)). Times are scenario seconds.
+/// The reference time is the yaw injection, else a compass fault that starts at or after 0, else the first airborne step.
+/// The hold point is the truth N, E at the step that set a locked Position target (as the pos_hold check's capture), taken
+/// at the first lock after the sticks were last moved and kept while they stay centred (through a fall out of Position);
+/// the excursion is the truth N, E distance from it. A protection is the first drop after the reference time of the
+/// heading flag, the NE flags or Position in effect (each after having been up since the reference), the G6-B latch, the
+/// monitor's blind or fault; e is the steering yaw minus the truth yaw.
+fn hm_line(scenario: &Scenario, trace: &Trace, x: &Ext) -> String {
+    let i = x.info.borrow();
+    let st = &trace.steps;
+    let n = st.len().min(x.rows.len());
+    if n == 0 {
+        return "heading_mon no steps".to_string();
+    }
+    let d = f64::to_degrees;
+    let secs = |t: u64| t as f64 * 1e-6;
+    let opt = |t: Option<u64>| t.map_or("none".to_string(), |t| format!("{:.3}", secs(t)));
+    let num = |v: Option<f64>, p: usize| v.map_or("none".to_string(), |v| format!("{v:.p$}"));
+    let at = |t: u64| st[..n].partition_point(|p| p.t_us < t).min(n - 1);
+    let centred: Vec<bool> = if scenario.rc_script.is_empty() {
+        st[..n].iter().map(|p| {
+            let k = trace.pilot.partition_point(|r| r.row.t_us <= p.t_us);
+            k == 0 || { let r = trace.pilot[k - 1].row; r.roll == 0.0 && r.pitch == 0.0 && r.yaw == 0.0 }
+        }).collect()
+    } else {
+        st[..n].iter().map(|p| { let r = row_at(&scenario.rc_script, p.t_us); r.roll == 0.0 && r.pitch == 0.0 && r.yaw == 0.0 }).collect()
+    };
+    let e: Vec<f64> = st[..n].iter().map(|p| d(wrap_pi(yaw_of(p.nav_q) - yaw_of(p.truth_q)))).collect();
+    let mut cap: Option<[f64; 2]> = None;
+    let mut exc: Vec<Option<f64>> = Vec::with_capacity(n);
+    for k in 0..n {
+        if !centred[k] {
+            cap = None;
+        } else if cap.is_none() && k > 0 && st[k].mode == 3 && st[k - 1].mode == 3 && st[k].pos_target_ne == st[k - 1].pos_target_ne {
+            cap = Some([st[k - 1].truth_pos[0], st[k - 1].truth_pos[1]]);
+        }
+        exc.push(cap.map(|c| (st[k].truth_pos[0] - c[0]).hypot(st[k].truth_pos[1] - c[1])));
+    }
+    let t_ref = scenario.yaw_inject.map(|y| y.at_us)
+        .or(scenario.mag_fault.filter(|f| f.from_us >= 0).map(|f| f.from_us as u64))
+        .or(i.hm_air_t_us)
+        .unwrap_or(0);
+    let k_ref = at(t_ref);
+    let drop = |up: &dyn Fn(usize) -> bool| -> Option<u64> {
+        let mut seen = false;
+        for k in k_ref..n {
+            if up(k) {
+                seen = true;
+            } else if seen {
+                return Some(st[k].t_us);
+            }
+        }
+        None
+    };
+    let hdg_drop = drop(&|k| x.rows[k].2.is_some());
+    let ne_drop = drop(&|k| x.rows[k].3.is_some());
+    let pos_exit = drop(&|k| st[k].mode == 3);
+    let g6b = i.latch_t_us.filter(|&t| t >= t_ref);
+    let blind = i.hm_blind.iter().map(|b| b.0).find(|&t| t >= t_ref);
+    let fault = i.hm_fault_t_us;
+    let prots = [("fault", fault), ("blind", blind), ("heading", hdg_drop), ("ne", ne_drop), ("position", pos_exit), ("g6b", g6b)];
+    let prot = prots.iter().filter_map(|(w, t)| t.map(|t| (t, *w))).min_by_key(|p| p.0);
+    let exc_at = |t: Option<u64>| t.and_then(|t| if t > st[n - 1].t_us { None } else { exc[at(t)] });
+    let max_exc = |from: usize, to: usize| -> Option<(f64, u64)> {
+        (from..to).filter_map(|k| exc[k].map(|v| (v, st[k].t_us))).fold(None, |a: Option<(f64, u64)>, b| match a {
+            Some(a) if a.0 >= b.0 => Some(a),
+            _ => Some(b),
+        })
+    };
+    let all = max_exc(k_ref, n);
+    let lost_k = scenario.gnss_lost.iter().map(|w| w.0).filter(|&t| t >= t_ref).min().map_or(n, at);
+    let pre_lost = max_exc(k_ref, lost_k);
+    let tilt_fault = fault.and_then(|t| x.rows[at(t)].1).map(d);
+    let tilt_max = (k_ref..n).filter_map(|k| x.rows[k].1).fold(0.0, f64::max);
+    let unprot = max_exc(k_ref, prot.map_or(n, |p| at(p.0)));
+    let hist: Vec<String> = [0u64, 1, 2, 5, 10, 20, 30, 60, 120, 240]
+        .iter()
+        .map(|&s| t_ref + s * 1_000_000)
+        .filter(|&t| t <= st[n - 1].t_us)
+        .map(|t| format!("{:.1}", e[at(t)]))
+        .collect();
+    let (peak_k, peak) = (k_ref..n).map(|k| (k, e[k].abs())).fold((k_ref, 0.0), |a, b| if b.1 > a.1 { b } else { a });
+    let e_fault = fault.map(|t| e[at(t)]);
+    let e_min_before = fault.map(|t| (at(t.saturating_sub(1_000_000))..=at(t)).map(|k| e[k].abs()).fold(f64::INFINITY, f64::min));
+    let sig2 = SIG_CONF_RAD * SIG_CONF_RAD;
+    let eval: Vec<&(u64, Nki)> = i.hm_records.iter().filter(|r| r.1.ok & code::HM_SCREENED == 0).collect();
+    let dhat_max = eval.iter().filter(|r| r.1.var <= sig2).map(|r| d(f64::from(r.1.inn.abs()))).fold(None, |a: Option<f64>, b| Some(a.map_or(b, |a| a.max(b))));
+    let dhat_fault = fault.and_then(|t| eval.iter().rev().find(|r| r.0 <= t)).map(|r| d(f64::from(r.1.inn)));
+    let sig_fault = fault.and_then(|t| eval.iter().rev().find(|r| r.0 <= t)).map(|r| d(f64::from(r.1.var).sqrt()));
+    let last = i.hm_last;
+    let blinds: Vec<String> = i.hm_blind.iter().take(6).map(|b| format!("{:.1}-{}", secs(b.0), b.1.map_or("end".to_string(), |t| format!("{:.1}", secs(t))))).collect();
+    format!(
+        "heading_mon screen {} t_air_s {} t_ref_s {:.3} inject_s {} confirmed_s {} to_confirmed_s {} fault_s {} blind_s {} hdg_drop_s {} ne_drop_s {} \
+pos_exit_s {} g6b_s {} prot_s {} prot_by {} dhat_max_inf_deg {} n_eval {} n_screened {} n_dropped {} e_ref_deg {:.2} e_hist_deg {} \
+e_peak_deg {:.2} e_peak_s {:.2} e_end_deg {:.2} e_fault_deg {} e_min_1s_before_fault_deg {} dhat_fault_deg {} sig_fault_deg {} \
+exc_fault_m {} exc_fault1_m {} exc_prot1_m {} exc_max_m {} exc_max_s {} exc_unprot_max_m {} exc_end_m {} exc_max_pre_lost_m {} \
+tilt_err_fault_deg {} tilt_err_max_deg {:.2}",
+        ["built", "r2p-off"][usize::from(*HM_SCREEN.get().unwrap_or(&0)).min(1)],
+        opt(i.hm_air_t_us), secs(t_ref), opt(i.hm_inject_t_us), opt(i.hm_confirmed_t_us),
+        num(i.hm_confirmed_t_us.zip(i.hm_air_t_us).map(|(c, a)| secs(c) - secs(a)), 3),
+        opt(fault), if blinds.is_empty() { "none".to_string() } else { blinds.join(",") }, opt(hdg_drop), opt(ne_drop),
+        opt(pos_exit), opt(g6b), opt(prot.map(|p| p.0)), prot.map_or("none", |p| p.1),
+        num(dhat_max, 2), eval.len(), last.map_or(0, |o| o.screened_r2), last.map_or(0, |o| o.dropped_r2p),
+        e[k_ref], hist.join("/"), peak, secs(st[peak_k].t_us), e[n - 1], num(e_fault, 2), num(e_min_before, 2), num(dhat_fault, 2), num(sig_fault, 2),
+        num(exc_at(fault), 3), num(exc_at(fault.map(|t| t + 1_000_000)), 3), num(exc_at(prot.map(|p| p.0 + 1_000_000)), 3),
+        num(all.map(|a| a.0), 3), opt(all.map(|a| a.1)), num(unprot.map(|a| a.0), 3), num(exc[n - 1], 3),
+        num(pre_lost.map(|a| a.0), 3), num(tilt_fault, 2), d(tilt_max)
+    )
 }
 
 fn firmware_text() -> String {
@@ -1455,6 +1638,8 @@ struct Outcome {
     shadow: Option<String>,
     /// The `steer` line, with `--estimator`.
     steer: Option<String>,
+    /// The `heading_mon` line, with `--estimator eskf3` (HM3b).
+    heading_mon: Option<String>,
 }
 
 /// The cell of a matrix run: its name and the values of its axes, for the plant, the sensors and the log.
@@ -1605,6 +1790,9 @@ every row's time is scenario time (the flight code's clock was scenario time + {
         st.ext = Some(Ext { info: info3.clone(), sim_origin: Origin::from_env(env)?, hdg: (0, 0.0, 0.0), ne: (0, 0.0, 0.0),
             hdg_flag_steps: 0, ne_flag_steps: 0, steps: 0, rows: Vec::new(), ne_prev: false, ne_drops: Vec::new() });
     }
+    if scenario.yaw_inject.is_some() && !matches!(steer_cfg, Some(SteerCfg { est: EstKind::Eskf3 })) {
+        return Err(format!("scenario {}: yaw_inject needs --estimator eskf3", scenario.name));
+    }
     let (ran, flight_steps, mut trace) = match steer_cfg {
         None | Some(SteerCfg { est: EstKind::Mahony, .. }) => {
             let flight = Flight::new(Mahony::new(&tuning), CascadedPid::new(&tuning, IMU_RATE_HZ), CardAllocator::new(), &tuning, handshake);
@@ -1618,7 +1806,9 @@ every row's time is scenario time (the flight code's clock was scenario time + {
             let core: &'static mut Eskf = Box::leak(Box::new(Eskf::new(&t).map_err(|e| format!("Eskf: {e:?}"))?));
             let vert: &'static mut Eskf = Box::leak(Box::new(Eskf::with_aiding(&t, Aiding::ImuBaro).map_err(|e| format!("Eskf (vertical): {e:?}"))?));
             let h = EskfSteer::new(core, &t).map_err(|e| format!("EskfSteer: {e:?}"))?;
-            let est = Mix3 { mix: SteerMix::new(h, vert), info: info3.clone() };
+            let mix = SteerMix::new(h, vert);
+            let inject = scenario.yaw_inject.map(|y| (y.at_us + preroll.unwrap_or(0) * TICK_US, y.rad as f32));
+            let est = Mix3 { mix, info: info3.clone(), inject, air: false };
             let flight = Flight::new(est, CascadedPid::new(&tuning, IMU_RATE_HZ), CardAllocator::new(), &tuning, handshake);
             let flight = apply_param_gains(flight)?;
             run(flight, &mut world, scenario, pilot.as_mut(), ticks, &mut log, shadow.as_deref_mut(), steer.as_mut(), preroll.unwrap_or(0))
@@ -1712,6 +1902,7 @@ vh_ms {:.4} vz_ms {:.4}",
             summary.push(format!("PHASE {i:>2} {:<8} start {:>7.3} s  {how}", ph.name, ph.start_us as f64 * 1e-6));
         }
     }
+    let heading_mon = steer.as_ref().and_then(|st| st.ext.as_ref()).map(|x| hm_line(scenario, &trace, x));
     let steer = steer_cfg.zip(steer).map(|(cfg, st)| {
         let info = match cfg.est {
             EstKind::Mahony => None,
@@ -1723,7 +1914,7 @@ vh_ms {:.4} vz_ms {:.4}",
         };
         st.line(cfg, info, trace.liftoffs.first().copied(), windows)
     });
-    Ok(Outcome { summary, checks, notes, shadow: shadow.map(|s| s.line()), steer })
+    Ok(Outcome { summary, checks, notes, shadow: shadow.map(|s| s.line()), steer, heading_mon })
 }
 
 /// What `--spread` refuses before any run: a value outside a card range, or a slope on a scenario in the air. The
@@ -1807,7 +1998,7 @@ fn go(args: &Args) -> Result<bool, Failure> {
                 preroll_ok(&scenario).map_err(Failure::Usage)?;
             }
             let o = run_one(&card, &env, &scenario, seed, *point, None, out, true, args.shadow, args.steer, args.preroll, &args.windows)?;
-            for line in o.summary.iter().chain(&o.notes).chain(&o.shadow).chain(&o.steer) {
+            for line in o.summary.iter().chain(&o.notes).chain(&o.shadow).chain(&o.steer).chain(&o.heading_mon) {
                 println!("{line}");
             }
             for c in &o.checks {
@@ -1894,6 +2085,9 @@ fn go(args: &Args) -> Result<bool, Failure> {
                     println!("{:<width$}  {line}", cell.name);
                 }
                 if let Some(line) = &o.steer {
+                    println!("{:<width$}  {line}", cell.name);
+                }
+                if let Some(line) = &o.heading_mon {
                     println!("{:<width$}  {line}", cell.name);
                 }
                 let _ = std::io::stdout().flush();
