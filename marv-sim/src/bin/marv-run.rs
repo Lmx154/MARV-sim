@@ -1336,7 +1336,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
     // N2 plumbing state.
     MSN.with(|m| *m.borrow_mut() = MsnRec::default());
     let mut msvc = fw_core::mission::MissionService::new();
-    let (mut mission_done, mut plan_in, mut hb_last, mut cmd_next, mut armed_prev) = (false, None, None, 0usize, false);
+    let (mut mission_done, mut plan_in, mut hb_last, mut cmd_next) = (false, None, None, 0usize);
     let mut gdn = GdnShadow::from_args();
     let mut flight_steps: u64 = 0;
     let mut ran = 0;
@@ -1512,7 +1512,8 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             if let Some(m) = scenario.mission.as_ref().filter(|m| !mission_done && truth.t_us >= m.at_us) {
                 mission_done = true;
                 let origin = GDN_SIM_ORIGIN.get().expect("sim origin for the mission");
-                let (ack, g) = upload(&mut msvc, m, sensors_f.imu1.t_us, armed_prev, origin);
+                // The board's service input `armed` is false since H2 (src/mission.rs): an upload is taken while armed.
+                let (ack, g) = upload(&mut msvc, m, sensors_f.imu1.t_us, false, origin);
                 plan_in = fw_flight::station::plan_id_of(if msvc.count() == 0 { 0 } else { msvc.plan_id() });
                 MSN.with(|r| r.borrow_mut().upload = Some((truth.t_us, ack, msvc.count(), msvc.plan_id(), g.count,
                     g.alts_m[..usize::from(g.count)].to_vec(), g.return_m)));
@@ -1541,7 +1542,6 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
                 cmd_now = Some(name);
             }
             let out_f = flight.step(&FlightInputs { sensors: sensors_f, rc: pending.take(), erpm: erpm_lines(world.plant.rotor_speeds(), sensors_f.imu1.t_us) });
-            armed_prev = out_f.armed;
             if let Some(name) = cmd_now {
                 use fw_flight::hands_off::CommandResult;
                 let r = match flight.take_command_result() {
@@ -1654,7 +1654,7 @@ thread_local! {
 
 /// N2 plumbing: the list uploaded to fw_core's mission service on the radio link as the station does (MISSION_COUNT, then
 /// every MISSION_ITEM_INT in order: the waypoints, command 16, frame 3, at their geodetic points from the sim origin; the
-/// return item, command 20, at the origin), then the board's `push_gdn` choice with GDN_SRC 1 (`select_targets`).
+/// return item, command 20, x = y = 0), then the board's `push_gdn` choice with GDN_SRC 1 (`select_targets`).
 fn upload(svc: &mut fw_core::mission::MissionService, m: &marv_sim::scenario::Mission, now_us: u64, armed: bool, origin: &Origin)
     -> (String, fw_core::mission::GdnTargets) {
     use fw_core::mission::{Frame, Link as MLink, Rx, RxItem, select_targets};
@@ -1663,7 +1663,8 @@ fn upload(svc: &mut fw_core::mission::MissionService, m: &marv_sim::scenario::Mi
     let mut last = svc.handle(now_us, armed, &frame(Rx::Count { count: n as u16, mission_type: 0 }));
     for seq in 0..n {
         let (w, command) = if seq + 1 < n { (m.waypoints[seq], 16) } else { ([0.0, 0.0, m.return_h], 20) };
-        let (x, y, _) = geo_from_ned(origin, [w[0], w[1], 0.0]);
+        // The return item carries x = y = 0 (the contract's check): it returns to home.
+        let (x, y) = if command == 20 { (0, 0) } else { let (x, y, _) = geo_from_ned(origin, [w[0], w[1], 0.0]); (x, y) };
         let item = RxItem { seq: seq as u16, frame: 3, command, x, y, z_bits: (w[2] as f32).to_bits(), mission_type: 0 };
         last = svc.handle(now_us, armed, &frame(Rx::ItemInt(item)));
     }
