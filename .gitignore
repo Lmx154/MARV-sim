@@ -3,3 +3,7 @@
 /env/home.local.toml
 # Sim logs: a run with the home override carries GNSS coordinates
 /logs/
+
+# Campaign results stay local
+scenarios/**/summary.txt
+scenarios/**/results*.txt
