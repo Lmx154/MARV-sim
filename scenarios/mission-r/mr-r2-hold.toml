@@ -1,4 +1,4 @@
-# R2: in HOLD (no Start) the station heartbeat and RADIO_STATUS stop at 105 s: RETURN 10 s after the last link.
+# R2: in HOLD (no Start) the station heartbeat stops at 105 s: RETURN 10 s after the last link.
 [scenario]
 name = "mr-r2-hold"
 duration_s = 220.0
@@ -6,7 +6,6 @@ thrust_gain = { from_s = 0.0, to_s = 1.0, from = 1.000, to = 1.000 }
 mission = [{ at_s = 30.0, radius_m = 2.0, return_h = 20.0, waypoints = [[30.0, 0.0, 10.0], [30.0, 30.0, 15.0], [0.0, 30.0, 10.0], [0.0, 0.0, 10.0]] }]
 commands = []
 station_hb = { from_s = 96.0, to_s = 105.0 }
-radio_status = { from_s = 96.0, to_s = 105.0, period_s = 1.0 }
 
 [initial]
 contact = "ground"

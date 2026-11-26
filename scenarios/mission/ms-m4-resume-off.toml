@@ -1,11 +1,10 @@
-# M4: stick reports resume 8 s after Start with arm OFF (held: RADIO_STATUS seen).
+# M4: stick reports resume 8 s after Start with arm OFF (STOP).
 [scenario]
 name = "ms-m4-resume-off"
 duration_s = 200.0
 thrust_gain = { from_s = 0.0, to_s = 1.0, from = 1.000, to = 1.000 }
 mission = [{ at_s = 30.0, radius_m = 2.0, return_h = 15.0, waypoints = [[30.0, 0.0, 10.0], [30.0, 30.0, 15.0], [0.0, 30.0, 10.0], [0.0, 0.0, 10.0]] }]
 station_hb = { from_s = 96.0, to_s = 5000.0 }
-radio_status = { from_s = 96.0, to_s = 5000.0, period_s = 1.0 }
 commands = [{ after_hold_s = 5.0, cmd = "start" }]
 resume = { after_start_s = 8.0 }
 

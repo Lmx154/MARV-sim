@@ -46,7 +46,7 @@ def motor_stops(r):
 
 def smoke():
     r, d = rows('ms-smoke'), ho('ms-smoke')
-    print('== ms-smoke (FS_HOLD_EN 1, receiver source, nominal card, calm air, seed 1)')
+    print('== ms-smoke (receiver source, nominal card, calm air, seed 1)')
     print('state sequence (t s, state, true h m): ' + ', '.join(f'{t:.3f} {NAMES[s]}({s}) h {h:.2f}' for t, s, h in states(r)))
     print(f"firmware fields: states {d.get('states')} | Start {d.get('msn_cmds')} | waypoints reached at {d.get('msn_wp_t_s')} "
           f"(legs {d.get('msn_legs')}) | arrival true distance {d.get('msn_wp_d_arr_m')} m | arrival height error {d.get('msn_wp_herr_m')} m")
@@ -101,8 +101,6 @@ def check(name, what):
 smoke()
 print()
 check('ms-smoke-a', 'arm ON 60-65 s with the mission switch ON; arm OFF 65 s; mission switch OFF 66 s; arm ON 67-70 s (control); arm OFF 70 s')
-print()
-check('ms-smoke-b', 'FS_HOLD_EN 0 (--ho): arm ON 60-65 s with the mission switch OFF')
 print()
 r, d = check('ms-smoke-c', 'as ms-smoke to AUTO; arm OFF + mission switch OFF in one report (phase from 122.472 s)')
 st = motor_stops(r)

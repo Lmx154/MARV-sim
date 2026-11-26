@@ -2,7 +2,6 @@
 [scenario]
 name = "ho-n-d4"
 duration_s = 60.0
-radio_status = { from_s = 20.5, to_s = 40.5, period_s = 1.0 }
 
 [initial]
 contact = "air_over_ground"

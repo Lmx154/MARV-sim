@@ -23,8 +23,8 @@ marv-run --card <marv.toml> --env <env.toml> [--seed <u64>] --spread <file> --ou
 | Inputs | `--card`, `--env`, `--home <env/home.local.toml>`, `--scenario`, `--seed`, `--point`, `--params` | [vehicle-model](vehicle-model.md), [scenarios](scenarios.md) |
 | Output | `--out`, `--out-dir`, `--only`, `--logs fail\|all`, `--window <from,to>` | [campaigns](campaigns.md) |
 | Spread | `--spread` | [campaigns](campaigns.md) |
-| Estimators | `--estimator`, `--shadow`, `--preroll`, `--noaid-sigma`, `--tuning-override`, `--notch` | [estimators](estimators.md) |
-| Hands-off and mission | `--fs-hold`, `--ho`, `--no-heartbeat`, `--x-inf`, `--pilot-speed`, `--ground-s`, `--gdn`, `--gdn-radius` | [campaigns](campaigns.md) |
+| Estimators | `--estimator`, `--shadow`, `--preroll`, `--noaid-sigma`, `--tuning-override` | [estimators](estimators.md) |
+| Hands-off and mission | `--no-heartbeat`, `--x-inf`, `--pilot-speed`, `--ground-s` | [campaigns](campaigns.md) |
 
 `--seed` is given exactly when the spread file has no `seeds` axis. Exit status: 0 every check passed, 3 a check failed, 1 a load,
 refusal or run error (message on stderr), 2 a usage error. A card whose sha256 differs from the compiled one is refused.

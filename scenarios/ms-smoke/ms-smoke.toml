@@ -9,7 +9,6 @@ rc_source = "receiver"            # N19: receiver reports (RC_CHANNELS_OVERRIDE 
 thrust_gain = { from_s = 0.0, to_s = 1.0, from = 1.000, to = 1.000 }
 mission = [{ at_s = 30.0, radius_m = 2.0, return_h = 15.0, waypoints = [[30.0, 0.0, 10.0], [30.0, 30.0, 15.0], [0.0, 30.0, 10.0], [0.0, 0.0, 10.0]] }]
 station_hb = { from_s = 0.0, to_s = 5000.0 }
-radio_status = { from_s = 0.0, to_s = 5000.0, period_s = 0.1 }
 commands = [{ after_hold_s = 5.0, cmd = "start" }]
 
 [initial]

@@ -65,22 +65,20 @@ gyro y +6.981e-3 (rad/s); the tilt errors add on x when b_ax and b_gy share a si
 | `ms-smoke/` | Mission-switch smoke scenarios, see its [README](../scenarios/ms-smoke/README.md) |
 
 A campaign run writes its per-cell figures (`summary.txt`, `results*.txt`) into its folder; they are not committed. A cell in these sets is a
-scenario at a plant point, air case and seed; typical flags are `--estimator eskf3 --fs-hold --pilot-speed 3.0 --preroll 60`.
+scenario at a plant point, air case and seed; typical flags are `--estimator eskf3 --pilot-speed 3.0 --preroll 60`.
 
 ## Hands-off and mission flags
 
 | Flag or field | Effect |
 |---|---|
-| `--fs-hold` | `FS_HOLD_EN` 1 before arming; radio HEARTBEAT time given fresh at every flight step unless `--no-heartbeat`; `heading_ok` after every step as the estimator's heading flag; prints a `hands_off` line |
-| `--ho` | The `hands_off` line without `--fs-hold` (`FS_HOLD_EN` 0, no HEARTBEAT) |
+| (always) | Radio HEARTBEAT time given fresh at every flight step (a `station_hb` window replaces it); one `hands_off` line per run |
 | `--no-heartbeat` | Do not feed the heartbeat |
 | `--x-inf` | Control: the track distance forgotten after every step (`Flight::sim_clear_track_error`) so the 5 m rule cannot trip |
 | `--pilot-speed <m/s>` | `PILOT_SPEED_XY` before arming |
 | `--ground-s <s>` | Replaces the `after_s` of a pilot scenario's first (ground, disarmed) phase |
-| `--gdn <n>,<e>` (repeat up to 4), `--gdn-radius <m>` | Run the firmware's shadow guidance with targets as offsets from the estimator origin; one `GDN` record every 8th step and one `gdn` line |
 | `mission = [{ at_s, radius_m, return_h, waypoints }]` | Mission list uploaded at `at_s` |
 | `commands = [{ after_hold_s, cmd }]`, `resume = { after_done_s }` | Commands (for example `"start"`) and the reports resuming after the mission |
-| `station_hb`, `radio_status` | Windows in which the station heartbeat and RADIO_STATUS are fed |
+| `station_hb` | Window in which the station heartbeat is fed |
 | `[scenario] thrust_gain = { from_s, to_s, from, to }` | Scale on all four rotors' thrust and reaction torque: `from` until `from_s`, linear to `to` at `to_s` |
 | `[scenario] push = { from_s, to_s, north_n, east_n }` | Horizontal world-frame force (N) added to the plant's wrench |
 | `MARV_MS_CSV=<dir>` | Environment: one CSV per run (every 8th flight step and every state change: state, mode, leg, armed, motors running, truth position and velocity) |

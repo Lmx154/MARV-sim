@@ -9,12 +9,11 @@ scenarios and tabulate their CSVs.
 
 All: one run each, seed 1, nominal card, calm air, `--estimator eskf3 --pilot-speed 3.0`.
 
-| Scenario | Flag | What it does |
-|---|---|---|
-| `ms-smoke` | `--fs-hold` | Arms with the mission switch OFF, hand take-off to 5 m, Position hover. Switch ON, Start 5 s after HOLD, then the square at 3 m/s. 45 s after the switch goes ON, in the last leg: switch OFF with arm ON, Position and sticks centred. 15 s later: arm OFF and switch ON |
-| `ms-smoke-a` | `--fs-hold` | Arm ON for 5 s with the switch ON, then arm OFF, switch OFF, arm ON (the control) |
-| `ms-smoke-b` | `--ho` | `FS_HOLD_EN` 0: arm ON for 5 s with the switch OFF |
-| `ms-smoke-c` | `--fs-hold` | As `ms-smoke` up to AUTO, then at AUTO + 20 s arm OFF and switch OFF in one report |
+| Scenario | What it does |
+|---|---|
+| `ms-smoke` | Arms with the mission switch OFF, hand take-off to 5 m, Position hover. Switch ON, Start 5 s after HOLD, then the square at 3 m/s. 45 s after the switch goes ON, in the last leg: switch OFF with arm ON, Position and sticks centred. 15 s later: arm OFF and switch ON |
+| `ms-smoke-a` | Arm ON for 5 s with the switch ON, then arm OFF, switch OFF, arm ON (the control) |
+| `ms-smoke-c` | As `ms-smoke` up to AUTO, then at AUTO + 20 s arm OFF and switch OFF in one report |
 
 ## Scenario keys these use
 

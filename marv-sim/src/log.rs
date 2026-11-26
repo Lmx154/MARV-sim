@@ -103,8 +103,6 @@ pub struct Counts {
     pub rcs: u64,
     pub gnd: u64,
     pub pil: u64,
-    /// Shadow guidance records (GDN), with `--gdn` only.
-    pub gdn: u64,
     /// Heading monitor records (NKI Src 13), eskf3 only (HM3b).
     pub nki: u64,
 }
@@ -212,15 +210,6 @@ impl Log {
         let n = dflog::encode_rcs(&mut buf, t_us, roll_pitch_throttle_yaw, arm);
         self.append(&buf, n);
         self.counts.rcs += 1;
-    }
-
-    /// One GDN record (the shadow guidance of one step), written by the firmware's `encode_gdn`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn gdn(&mut self, t_us: u64, index: u8, status: u8, target_ne: [f32; 2], position_ne: [f32; 2], velocity_ne: [f32; 2], dist_m: f32, bearing_rad: f32) {
-        let mut buf = [0u8; 64];
-        let n = dflog::encode_gdn(&mut buf, t_us, index, status, target_ne, position_ne, velocity_ne, dist_m, bearing_rad);
-        self.append(&buf, n);
-        self.counts.gdn += 1;
     }
 
     /// One NKI record (the firmware's type, already in the header), written by the firmware's `encode_nki`: the sim

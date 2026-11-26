@@ -9,8 +9,7 @@ use fw_flight::alloc::CardAllocator;
 use fw_core::esc::{LINES, line_of_element};
 use fw_flight::esc::hold;
 use fw_flight::gate::MotorCommand;
-use fw_flight::gnc::{Allocator, Controller, Estimator, GeoPoint, Sensors, Setpoint};
-use fw_flight::guidance::Guidance;
+use fw_flight::gnc::{Allocator, Controller, Estimator, Sensors, Setpoint};
 use fw_flight::gnc::NavState;
 use fw_flight::mahony::Mahony;
 use fw_flight::eskf::{Aiding, Eskf, EskfStats, RING, code};
@@ -43,14 +42,9 @@ const IMU_RATE_HZ: f32 = 1.0e6 / IMU_PERIOD_US as f32;
 /// The motors' pole count (poles, not pole pairs; the firmware's `MOT_POLES` default): the one place the sim takes it from,
 /// for the eRPM it hands the flight step and for `set_notch`.
 const MOTOR_POLES: i32 = 14;
-/// `--notch`: the flight step's RPM notch is switched on (before arming).
-static NOTCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// `--fs-hold`, `--no-heartbeat`, `--x-inf` (hands-off campaign).
-static FS_HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// `--no-heartbeat`, `--x-inf` (hands-off campaign).
 static NO_HEARTBEAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static X_INF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// `--ho` (hands-off campaign N): the `hands_off` line without --fs-hold (FS_HOLD_EN stays 0, no HEARTBEAT fed).
-static HO_LINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// The truth yaw (rad, f64 bits) of the plant at the flight step about to run, for the `yaw_hold` hook in `Mix3`.
 /// `--pilot-speed <m/s>`: PILOT_SPEED_XY through Flight::set_pilot_speed_xy before arming (hands-off campaign H13 item 5).
 static PILOT_SPEED: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -82,9 +76,9 @@ const STREAM_IMU1: u64 = 1;
 const STREAM_IMU2: u64 = 2;
 
 const USAGE: &str = "usage: marv-run --card <marv.toml> --env <env.toml> --seed <u64> --scenario <file> --out <file.BIN> \
-[--point <kf_scale>,<inertia_scale>,<lag_s or ->] [--home <env/home.local.toml>] [--notch] [--params <file>]
+[--point <kf_scale>,<inertia_scale>,<lag_s or ->] [--home <env/home.local.toml>] [--params <file>]
        marv-run --card <marv.toml> --env <env.toml> [--seed <u64>] --spread <file> --out-dir <dir> \
-[--only <cell>] [--logs fail|all] [--home <env/home.local.toml>] [--notch] [--params <file>]
+[--only <cell>] [--logs fail|all] [--home <env/home.local.toml>] [--params <file>]
 --params <file>: the ground station's parameter file (NAME,VALUE per line, # comments); the 14 ATC_* gains in it reach the flight
 step through Flight::set_gains before arming, as on the board; others are ignored, missing gains keep their defaults; a gain
 out of range or not a number stops the run; the summary lists the gains that differ from Tuning::DEFAULT.
@@ -94,14 +88,9 @@ reports it, and --preroll <seconds> (air-start scenarios only, not a ground star
 flight code is stepped that long with the plant pinned at the initial state, disarmed, before scenario time 0), and --estimator mahony|eskf1|eskf2|eskf3 (the flight step's estimator, eskf3 = SteerMix; one `steer` line reports it; --window <from_s>,<to_s>, repeatable, adds a `window` line per interval) with
 and --noaid-sigma <m> (replaces
 Tuning::nav_noaid_sigma_m, the armed no-aid position hold's sigma).
---gdn <north_m>,<east_m> (repeatable, at most 4; one run only) runs the firmware's shadow guidance as the board does, with targets
-at those offsets from the origin the estimator reports, and --gdn-radius <m> (default 2.0) the arrival radius: one GDN record
-every 8th step, and one `gdn` line. Without --gdn the guidance is not called and no GDN record is written.
---fs-hold (hands-off campaign): FS_HOLD_EN 1 before arming, the radio HEARTBEAT time given fresh at every flight step (the
-step's own time) unless --no-heartbeat, heading_ok given after every step as the estimator's own heading flag (H12: the firmware
-adds NOT track_fault), and one `hands_off` line; --x-inf: the H12 control, the track distance forgotten after every step
-(Flight::sim_clear_track_error) so the 5 m rule cannot trip; --ho: the `hands_off` line without --fs-hold (FS_HOLD_EN 0, no
-HEARTBEAT). heading_ok is no longer fed (the firmware reads the estimator's flag itself).";
+Every run gives the radio HEARTBEAT time fresh at every flight step (the step's own time) unless --no-heartbeat (a scenario's
+station_hb window replaces it) and prints one `hands_off` line; --x-inf: the H12 control, the track distance forgotten after
+every step (Flight::sim_clear_track_error) so the 5 m rule cannot trip.";
 
 /// `--noaid-sigma`: replaces `Tuning::nav_noaid_sigma_m` (the armed no-aid position hold's sigma) for every estimator.
 static NOAID_SIGMA: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -112,11 +101,7 @@ static NOAID_SIGMA: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
 /// lengthens `duration_s` by the difference; the scenario files are not changed.
 static GROUND_S: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
 
-/// `--gdn <north_m>,<east_m>` (repeatable): the shadow guidance's targets, as offsets from the estimator's origin.
-static GDN_TARGETS: std::sync::Mutex<Vec<[f64; 2]>> = std::sync::Mutex::new(Vec::new());
-/// `--gdn-radius <m>`: the shadow guidance's arrival radius.
-static GDN_RADIUS: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-/// The sim world's origin (the env's), set by `run_one` when targets are given, for the `gdn` line.
+/// The sim world's origin (the env's), set by `run_one` when the scenario has a mission.
 static GDN_SIM_ORIGIN: std::sync::OnceLock<Origin> = std::sync::OnceLock::new();
 
 /// `--params <file>`: the 14 gains the file gives (the defaults for those it lacks).
@@ -238,15 +223,9 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
         if flag == "--help" || flag == "-h" {
             return Ok(None);
         }
-        if flag == "--notch" {
-            NOTCH.store(true, std::sync::atomic::Ordering::Relaxed);
-            continue;
-        }
         let switch = match flag.as_str() {
-            "--fs-hold" => Some(&FS_HOLD),
             "--no-heartbeat" => Some(&NO_HEARTBEAT),
             "--x-inf" => Some(&X_INF),
-            "--ho" => Some(&HO_LINE),
             _ => None,
         };
         if let Some(sw) = switch {
@@ -294,23 +273,6 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
                     return Err(format!("--preroll: {value} is not in (0, 60] seconds"));
                 }
                 preroll = Some((s * 1e6 / TICK_US as f64).round() as u64);
-            }
-            "--gdn" => {
-                let bad = || format!("--gdn: {value} is not <north_m>,<east_m>");
-                let (a, b) = value.split_once(',').ok_or_else(bad)?;
-                let (a, b) = (a.parse::<f64>().map_err(|_| bad())?, b.parse::<f64>().map_err(|_| bad())?);
-                if !(a.is_finite() && b.is_finite()) {
-                    return Err(bad());
-                }
-                let mut t = GDN_TARGETS.lock().unwrap();
-                if t.len() >= GDN_SLOTS {
-                    return Err(format!("--gdn: at most {GDN_SLOTS} targets"));
-                }
-                t.push([a, b]);
-            }
-            "--gdn-radius" => {
-                let v = value.parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0).ok_or(format!("--gdn-radius: {value} is not a number >= 0"))?;
-                let _ = GDN_RADIUS.set(v);
             }
             "--pilot-speed" => {
                 let v = value.parse::<f32>().ok().filter(|v| v.is_finite()).ok_or(format!("--pilot-speed: {value} is not a number"))?;
@@ -361,12 +323,6 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
     };
     if matches!(job, Job::One { .. }) && seed.is_none() {
         return Err("--seed is required with --scenario".into());
-    }
-    if GDN_TARGETS.lock().unwrap().is_empty() && GDN_RADIUS.get().is_some() {
-        return Err("--gdn-radius needs --gdn".into());
-    }
-    if !GDN_TARGETS.lock().unwrap().is_empty() && !matches!(job, Job::One { .. }) {
-        return Err("--gdn is for --scenario runs only".into());
     }
     let steer = estimator.map(|est| SteerCfg { est });
     Ok(Some(Args {
@@ -1121,7 +1077,7 @@ fn sample(truth: &Truth, out: &StepOut, baro_drift_m: f64) -> Sample {
         _ => [f64::NAN; 2],
     };
     let position_covered = out.nav.valid.covers(
-        &Setpoint::Position { position_m: [0.0; 3], velocity_ms: [0.0; 3], heading_rad: 0.0, heading_rate_rads: 0.0 }.requires());
+        &Setpoint::Position { position_m: [0.0; 3], velocity_ms: [0.0; 3], heading_rad: 0.0, heading_rate_rads: 0.0, accel_d_mss: 0.0 }.requires());
     let mut logged: Vec<f32> = [out.nav.attitude.as_slice(), &out.nav.rates_rads, &out.nav.velocity_ms, &out.nav.position_m].concat();
     match out.setpoint {
         Setpoint::Attitude { attitude, heading_rate_rads, thrust_n } => {
@@ -1132,7 +1088,7 @@ fn sample(truth: &Truth, out: &StepOut, baro_drift_m: f64) -> Sample {
             logged.extend(attitude);
             logged.extend([heading_rate_rads, down_m, velocity_d_ms]);
         }
-        Setpoint::Position { position_m, velocity_ms, heading_rad, heading_rate_rads } => {
+        Setpoint::Position { position_m, velocity_ms, heading_rad, heading_rate_rads, .. } => {
             logged.extend(position_m);
             logged.extend(velocity_ms);
             logged.extend([heading_rad, heading_rate_rads]);
@@ -1235,85 +1191,6 @@ impl Faults {
     }
 }
 
-/// The shadow guidance's slots on the board (`fw_settings::flight::GDN_SLOTS`).
-const GDN_SLOTS: usize = 4;
-
-/// `--gdn`: the board's `Stepper::guide` (src/flight.rs) around `Guidance`, owned outside `Flight`. The targets are taken on
-/// the first disarmed step that has an origin (the board takes new targets on a disarmed step); arming resets; from then
-/// on, every 8th step, `anchor`, `step` and one GDN record. Nothing of it reaches the flight code.
-struct GdnShadow {
-    offsets: Vec<[f64; 2]>,
-    radius_m: f32,
-    guidance: Guidance<GDN_SLOTS>,
-    was_armed: bool,
-    /// The estimator's origin and the time (scenario) the targets were taken, with the targets' GeoPoints.
-    taken: Option<(GeoPoint, u64, Vec<GeoPoint>)>,
-}
-
-impl GdnShadow {
-    fn from_args() -> Option<GdnShadow> {
-        let offsets = GDN_TARGETS.lock().unwrap().clone();
-        (!offsets.is_empty()).then(|| GdnShadow {
-            offsets,
-            radius_m: GDN_RADIUS.get().copied().unwrap_or(2.0),
-            guidance: Guidance::new(),
-            was_armed: false,
-            taken: None,
-        })
-    }
-
-    fn guide<E: Estimator, C: Controller, A: Allocator>(&mut self, flight: &Flight<E, C, A>, out: &StepOut, step: u32, log: &mut Log) {
-        let origin = flight.estimator().origin();
-        if self.taken.is_none() && !out.armed {
-            if let Some(o) = origin {
-                let base = Origin { lat_e7: o.lat_e7, lon_e7: o.lon_e7, alt_mm: o.alt_mm };
-                let targets: Vec<GeoPoint> = self
-                    .offsets
-                    .iter()
-                    .map(|&[n, e]| {
-                        let (lat_e7, lon_e7, alt_mm) = geo_from_ned(&base, [n, e, 0.0]);
-                        GeoPoint { lat_e7, lon_e7, alt_mm }
-                    })
-                    .collect();
-                self.guidance.set_targets(&targets, self.radius_m);
-                self.taken = Some((o, out.t_us, targets));
-            }
-        }
-        if out.armed && !self.was_armed {
-            self.guidance.reset();
-        }
-        self.was_armed = out.armed;
-        if self.taken.is_none() || step % 8 != 0 {
-            return;
-        }
-        let nav = out.nav;
-        let speed = flight.speed_xy_in_force();
-        self.guidance.anchor(&nav);
-        let g = self.guidance.step(&nav, origin, speed, out.t_us);
-        let (position, velocity) = match g.setpoint {
-            Some(Setpoint::Position { position_m, velocity_ms, .. }) => ([position_m[0], position_m[1]], [velocity_ms[0], velocity_ms[1]]),
-            _ => ([0.0; 2], [0.0; 2]),
-        };
-        log.gdn(out.t_us, g.active, g.status, g.target_ne, position, velocity, g.dist_m, g.bearing_rad);
-    }
-
-    /// The `gdn` line: where the estimator's origin is in the sim world (north, east, m), and each target's NE in the sim
-    /// world, from its own geodetic point.
-    fn line(&self, log: &Log) -> String {
-        let Some((o, t_us, targets)) = &self.taken else {
-            return "gdn targets never taken (no estimator origin on a disarmed step), 0 records".to_string();
-        };
-        let Some(sim) = GDN_SIM_ORIGIN.get() else { return "gdn no sim origin".to_string() };
-        let at = |p: &GeoPoint| ned_from_geo(sim, p.lat_e7, p.lon_e7, p.alt_mm);
-        let eo = at(o);
-        let ts: Vec<String> = targets.iter().map(|p| { let v = at(p); format!("{:.3},{:.3}", v[0], v[1]) }).collect();
-        format!(
-            "gdn radius_m {} taken_t_s {:.3} est_origin_in_sim_ne_m {:.3},{:.3} targets_true_ne_m {} records {}",
-            self.radius_m, *t_us as f64 * 1e-6, eo[0], eo[1], ts.join(" "), log.counts.gdn
-        )
-    }
-}
-
 /// Runs at most `ticks` base ticks (with a pilot, until its phase table ends); returns how many ticks and flight steps
 /// it made and what the verdict needs.
 fn run<E: Estimator, C: Controller, A: Allocator>(
@@ -1339,7 +1216,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
     // N2 plumbing state.
     MSN.with(|m| *m.borrow_mut() = MsnRec::default());
     let mut msvc = fw_core::mission::MissionService::new();
-    let (mut up_next, mut plan_in, mut hb_last, mut cmd_next) = (0usize, None, None, 0usize);
+    let (mut up_next, mut hb_last, mut cmd_next) = (0usize, None, 0usize);
     let mut gdn_in: Option<fw_core::mission::GdnTargets> = None;
     // Campaign mission: the first HOLD step, the first accepted Start, AUTO's end at the last waypoint (for `resume` and
     // `after_hold_s`), the previous step's state and leg.
@@ -1358,7 +1235,6 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
         let (a, b) = (bvolts[i - 1], bvolts[i]);
         a.1 + (b.1 - a.1) * (t - a.0) as f64 / (b.0 - a.0) as f64
     };
-    let mut gdn = GdnShadow::from_args();
     let mut flight_steps: u64 = 0;
     let mut ran = 0;
     // The scenario's GNSS hold and compass faults (G4): the last GNSS sample outside a hold, the stuck compass field.
@@ -1373,8 +1249,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
     // initial state; the scenario then starts at board time `off`. The flight code, the shadow and the sensors' stamps
     // see board time = scenario time + off; the log, the verdict trace and the ESC rule see scenario time.
     let off = preroll_ticks * TICK_US;
-    flight.set_notch(NOTCH.load(std::sync::atomic::Ordering::Relaxed), MOTOR_POLES);
-    flight.set_fs_hold_en(flag(&FS_HOLD));
+    flight.set_notch(MOTOR_POLES);
     if let Some(&v) = PILOT_SPEED.get() {
         assert!(flight.set_pilot_speed_xy(v), "--pilot-speed {v} refused by Flight::set_pilot_speed_xy");
     }
@@ -1401,9 +1276,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
                 if baro.is_some() && drift0.is_none() {
                     drift0 = Some(world.slow.baro.drift_m());
                 }
-                if flag(&FS_HOLD) {
-                    flight.set_last_radio_heartbeat_us((!flag(&NO_HEARTBEAT)).then_some(sensors.imu1.t_us));
-                }
+                flight.set_last_radio_heartbeat_us((!flag(&NO_HEARTBEAT)).then_some(sensors.imu1.t_us));
                 TRUTH_YAW.store(yaw_of(pinned.attitude).to_bits(), std::sync::atomic::Ordering::Relaxed);
                 let out = flight.step(&FlightInputs { sensors, rc: pending.take(), erpm: erpm_lines(world.plant.rotor_speeds(), pinned.t_us) });
                 if flag(&X_INF) {
@@ -1547,27 +1420,19 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             if let Some(g) = sensors_f.gnss.as_mut() {
                 g.t_us += off;
             }
-            if flag(&FS_HOLD) {
-                flight.set_last_radio_heartbeat_us((!flag(&NO_HEARTBEAT)).then_some(sensors_f.imu1.t_us));
-            }
-            if let Some((a, b, p)) = scenario.radio_status.filter(|r| truth.t_us >= r.0) {
-                let newest = a + ((truth.t_us.min(b - 1) - a) / p) * p;
-                flight.set_last_radio_status_us(Some(newest + off));
-            }
+            flight.set_last_radio_heartbeat_us((!flag(&NO_HEARTBEAT)).then_some(sensors_f.imu1.t_us));
             TRUTH_YAW.store(yaw_of(truth.attitude).to_bits(), std::sync::atomic::Ordering::Relaxed);
             if let Some(m) = scenario.mission.get(up_next).filter(|m| truth.t_us >= m.at_us) {
                 up_next += 1;
                 let origin = GDN_SIM_ORIGIN.get().expect("sim origin for the mission");
                 // The board's service input `armed` is false since H2 (src/mission.rs): an upload is taken while armed.
                 let (ack, g) = upload(&mut msvc, m, sensors_f.imu1.t_us, false, origin);
-                plan_in = fw_flight::station::plan_id_of(if msvc.count() == 0 { 0 } else { msvc.plan_id() });
                 MSN.with(|r| r.borrow_mut().uploads.push((truth.t_us, ack, msvc.count(), msvc.plan_id(), g.count,
                     g.alts_m[..usize::from(g.count)].to_vec(), g.return_m, g.heights_ok, m.waypoints.clone())));
                 gdn_in = Some(g);
             }
             if !scenario.mission.is_empty() {
-                // The board: station::push_plan's plan id and the Stepper's FLIGHT_GDN set, given every step.
-                flight.set_plan_id(plan_in);
+                // The board: the Stepper's FLIGHT_GDN set (with the plan id), given every step.
                 if let Some(g) = gdn_in {
                     flight.set_mission(g);
                 }
@@ -1641,7 +1506,7 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
                 x_m: fw_flight::hands_off::track_fault_m(flight.speed_xy_in_force()), vne: out_f.nav.valid.velocity_ne,
                 pne: out_f.nav.valid.position_ne, nav_v: [out_f.nav.velocity_ms[0], out_f.nav.velocity_ms[1]],
                 gated: GATED_STEP.swap(0, std::sync::atomic::Ordering::Relaxed),
-                coll_n: out_f.demand.map_or(f32::NAN, |d| d.thrust_n), hover: flight.sim_hover(), m_bit: flight.radio_status_seen(),
+                coll_n: out_f.demand.map_or(f32::NAN, |d| d.thrust_n), hover: flight.sim_hover(),
                 crash: flight.crash_would_fire(), td: flight.sim_td(), leg: flight.leg_active() });
             let mut out = out_f;
             out.t_us -= off;
@@ -1681,16 +1546,10 @@ fn run<E: Estimator, C: Controller, A: Allocator>(
             if pilot.is_some() {
                 log.ground(&truth);
             }
-            if let Some(g) = gdn.as_mut() {
-                g.guide(&flight, &out, (flight_steps - 1) as u32, log);
-            }
             trace.steps.push(sample(&truth, &out, world.slow.baro.drift_m()));
         }
     }
     trace.baro_drift0_m = drift0.unwrap_or(0.0);
-    if let Some(g) = &gdn {
-        println!("{}", g.line(log));
-    }
     (ran, flight_steps, trace, ho)
 }
 
@@ -1711,10 +1570,9 @@ struct HoStep {
     nav_v: [f32; 2],
     gated: u32,
     /// N: the demand's collective (N; NaN without a demand), Flight::sim_hover (m g, H, H in use, BLIND's corrected
-    /// collective), N12's M after the step.
+    /// collective).
     coll_n: f32,
     hover: (f32, f32, bool, Option<f32>),
-    m_bit: bool,
     /// N2: crash rule K would fire after the step (shadow); Flight::sim_td (TD's held time us, the time needed, the low mark).
     crash: bool,
     td: (u64, u64, bool),
@@ -1723,10 +1581,10 @@ struct HoStep {
 }
 
 /// N2 plumbing, per run (one run per thread): the upload (time, the service's last answer, items committed, plan id, the
-/// GDN_SRC 1 target count, their heights, the return height) and every command (time, name, result).
+/// target count, their heights, the return height) and every command (time, name, result).
 #[derive(Default)]
 struct MsnRec {
-    /// Every upload: time, the service's last answer, items committed, plan id, GDN_SRC 1 count, heights, return height,
+    /// Every upload: time, the service's last answer, items committed, plan id, target count, heights, return height,
     /// heights_ok, and the list's TRUE waypoints.
     uploads: Vec<(u64, String, u8, u32, u8, Vec<f32>, f32, bool, Vec<[f64; 3]>)>,
     cmds: Vec<(u64, &'static str, String)>,
@@ -1742,7 +1600,7 @@ thread_local! {
 
 /// N2 plumbing: the list uploaded to fw_core's mission service on the radio link as the station does (MISSION_COUNT, then
 /// every MISSION_ITEM_INT in order: the waypoints, command 16, frame 3, at their geodetic points from the sim origin; the
-/// return item, command 20, x = y = 0), then the board's `push_gdn` choice with GDN_SRC 1 (`select_targets`).
+/// return item, command 20, x = y = 0), then the board's `push_gdn` set (`select_targets`).
 fn upload(svc: &mut fw_core::mission::MissionService, m: &marv_sim::scenario::Mission, now_us: u64, armed: bool, origin: &Origin)
     -> (String, fw_core::mission::GdnTargets) {
     svc.set_limits(m.upload_limits.0, m.upload_limits.1);
@@ -1757,7 +1615,7 @@ fn upload(svc: &mut fw_core::mission::MissionService, m: &marv_sim::scenario::Mi
         let item = RxItem { seq: seq as u16, frame: 3, command, x, y, z_bits: (w[2] as f32).to_bits(), mission_type: 0 };
         last = svc.handle(now_us, armed, &frame(Rx::ItemInt(item)));
     }
-    let g = select_targets(1, 0, m.radius_m as f32, &[], svc.items(), svc.plan_id(), m.limits);
+    let g = select_targets(m.radius_m as f32, svc.items(), svc.plan_id(), m.limits);
     (format!("{:?}", last.map(|t| t.msg)).replace(' ', ""), g)
 }
 
@@ -1937,7 +1795,7 @@ fn ho_line(scenario: &Scenario, trace: &Trace, ho: &[HoStep]) -> String {
         }
     }
     let hop = k_td.map(|kt| (kt..k_end).map(|k| -st[k].truth_pos[2]).fold(0.0, f64::max));
-    // N (FS_HOLD_EN 0 campaign): heights and vertical speeds are TRUE (vz down positive); collectives x the card's m g.
+    // N: heights and vertical speeds are TRUE (vz down positive); collectives x the card's m g.
     let mg = f64::from(ho[n - 1].hover.0);
     let coll = |k: usize| f64::from(ho[k].coll_n) / mg;
     let h_at = |k: usize| -st[k].truth_pos[2];
@@ -1971,7 +1829,6 @@ fn ho_line(scenario: &Scenario, trace: &Trace, ho: &[HoStep]) -> String {
     let t_from = lost.or(trace.liftoffs.first().copied()).unwrap_or(0);
     let mstop = trace.esc.iter().find(|e| e.0 >= t_from && e.1 == [0; 4]).map(|e| e.0);
     let mstop_after_contact = td.and_then(|t| trace.esc.iter().find(|e| e.0 >= t.t_us && e.1 == [0; 4]).map(|e| e.0 - t.t_us));
-    let m_seen = (0..n).any(|k| ho[k].m_bit);
     let base = format!(
         "hands_off hb {} xinf {} lost_s {} hold_s {} hp_off_m {} t_ref_s {} states {} tf_s {} land_s {} land_by {} blind_s {} td_s {} stop_s {} disarm_s {} \
 dt_tf_s {} dt_land_s {} d_tf_m {} d_land_m {} d_td_m {} d_stop_m {} d_max_m {} d_max_s {} d_hold_max_m {} trk_max_m {} hdg_drop_s {} ne_drop_s {} \
@@ -1979,8 +1836,8 @@ e_land_deg {} h_land_m {} h_stop_m {} vz_stop_ms {} td_vz_ms {} td_vh_ms {} td_t
 anchor_s {} b_m {} x_m {:.2} v_entry_ms {} trip_by {} dA_tf_m {} dAn_tf_m {} dA_land_m {} dAn_land_m {} dA_max_pre_land_m {} dAn_max_pre_land_m {} dA_max_m {} \
 dA_td_m {} stop_dist_m {} stopped_s {} ne_short_drops {} \
 law_brake_s {:.2} law_hold_s {:.2} law_level_s {:.2} law_td {} brake_vmax_ms {:.2} brake_tilt_deg {:.1} land_to_td_m {} air_stops {} air_stop_first {} \
-fs {} h_entry_m {} H_entry_mg {} H_valid {} blind_c0_mg {} blind_c1_mg {} a_net0_mss {} a_net1_mss {} vz_mean_ms {} vz_max_ms {} h_gain_max_m {} \
-dh5_m {} dh5_max_m {} dh5_min_m {} coll_min_1s_mg {} mstop_s {} h_mstop_m {} contact_to_mstop_s {} h_disarm_m {} m_seen {} h_lost_m {} vz_lost_ms {} vz_entry_ms {}",
+h_entry_m {} H_entry_mg {} H_valid {} blind_c0_mg {} blind_c1_mg {} a_net0_mss {} a_net1_mss {} vz_mean_ms {} vz_max_ms {} h_gain_max_m {} \
+dh5_m {} dh5_max_m {} dh5_min_m {} coll_min_1s_mg {} mstop_s {} h_mstop_m {} contact_to_mstop_s {} h_disarm_m {} h_lost_m {} vz_lost_ms {} vz_entry_ms {}",
         if flag(&NO_HEARTBEAT) { "absent" } else { "fed" }, u8::from(flag(&X_INF)), opt(lost), opt(k_hold.map(|k| st[k].t_us)), num(hp_off, 3),
         opt(t_ref), hist.join(","), opt(k_tf.map(|k| st[k].t_us)), opt(k_land.map(|k| st[k].t_us)), land_by.unwrap_or("none".to_string()),
         opt(k_blind.map(|k| st[k].t_us)), opt(td.map(|t| t.t_us)), opt(k_stop.map(|k| st[k].t_us)), opt(k_disarm.map(|k| st[k].t_us)),
@@ -1997,10 +1854,10 @@ dh5_m {} dh5_max_m {} dh5_min_m {} coll_min_1s_mg {} mstop_s {} h_mstop_m {} con
         opt(k_stopped.map(|k| st[k].t_us)), short_drops,
         law_s[0], law_s[1], law_s[2], law_name(law_td), brake_vmax, brake_tilt, num(land_to_td, 2), air_stops,
         air_stop_first.map_or("none".to_string(), |(t, h)| format!("{:.3}@{:.2}m", secs(t), h)),
-        u8::from(flag(&FS_HOLD)), num(h_entry, 2), num(h_entry_mg, 3), h_valid_entry.map_or("none", |v| if v { "yes" } else { "no" }),
+        num(h_entry, 2), num(h_entry_mg, 3), h_valid_entry.map_or("none", |v| if v { "yes" } else { "no" }),
         num(blind_c0, 3), num(blind_c1, 3), num(a0, 3), num(a1, 3), num(vz_mean, 2), num(vz_max, 2), num(h_gain, 2),
         num(dh5, 2), num(dh5_max, 2), num(dh5_min, 2), num(c1s_min, 3), opt(mstop), num(mstop.map(|t| h_at(k_of(t))), 2),
-        num(mstop_after_contact.map(secs), 2), num(k_disarm.map(h_at), 2), m_seen,
+        num(mstop_after_contact.map(secs), 2), num(k_disarm.map(h_at), 2),
         num(lost.map(|t| h_at(k_of(t))), 2), num(lost.map(|t| st[k_of(t)].truth_vel[2]), 2), num(k_land.map(|k| st[k].truth_vel[2]), 2)
     );
     format!("{base} {}", ho_extra(scenario, trace, ho, n, td.map(|t| t.t_us), k_stop, lost.or(k_land.map(|k| st[k].t_us))))
@@ -2232,7 +2089,7 @@ struct Outcome {
     shadow: Option<String>,
     /// The `steer` line, with `--estimator`.
     steer: Option<String>,
-    /// The `hands_off` line, with `--fs-hold`.
+    /// The `hands_off` line.
     hands_off: Option<String>,
 }
 
@@ -2311,7 +2168,7 @@ fn run_one(card: &Card, env: &Env, scenario: &Scenario, seed: u64, point: Option
         None => env.wind_mean_ned.v.ok_or("wind.mean_ned is \"ask\"")?,
     };
 
-    if !GDN_TARGETS.lock().unwrap().is_empty() || !scenario.mission.is_empty() {
+    if !scenario.mission.is_empty() {
         let _ = GDN_SIM_ORIGIN.set(Origin::from_env(env)?);
     }
     let mut log = Log::with_header();
@@ -2497,7 +2354,7 @@ vh_ms {:.4} vz_ms {:.4}",
             summary.push(format!("PHASE {i:>2} {:<8} start {:>7.3} s  {how}", ph.name, ph.start_us as f64 * 1e-6));
         }
     }
-    let hands_off = (flag(&FS_HOLD) || flag(&HO_LINE)).then(|| ho_line(scenario, &trace, &ho));
+    let hands_off = Some(ho_line(scenario, &trace, &ho));
     if let (Ok(dir), Some(_)) = (std::env::var("MARV_HO_DUMP2"), &hands_off) {
         let name = cell.map_or(format!("{}-seed{seed}", scenario.name), |r| r.cell.name.clone());
         DUMP2.with(|d| std::fs::write(Path::new(&dir).join(format!("{}-{name}.csv", scenario.name)), d.borrow().as_bytes())).map_err(|e| format!("MARV_HO_DUMP2: {e}"))?;

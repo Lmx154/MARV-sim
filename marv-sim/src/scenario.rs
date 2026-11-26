@@ -94,13 +94,10 @@ pub struct Scenario {
     /// `[scenario] thrust_gain = { from_s, to_s, from, to }` (hands-off campaign N): a scale on all four rotors' thrust (and
     /// reaction torque), `from` until `from_s`, linear to `to` at `to_s`, `to` after (a constant gain: from = to).
     pub thrust_gain: Option<(u64, u64, f64, f64)>,
-    /// `[scenario] radio_status = { from_s, to_s, period_s }` (hands-off campaign N, N12): RADIO_STATUS arrivals every
-    /// `period_s` from `from_s` while before `to_s`; the newest arrival time goes to Flight::set_last_radio_status_us.
-    pub radio_status: Option<(u64, u64, u64)>,
     /// `[scenario] mission = { at_s, radius_m, return_h, waypoints = [[north_m, east_m, h_m], ...] }` (campaign N2 plumbing): at
     /// `at_s` the list (the waypoints, TRUE north/east from the sim origin and height above home, then the return item at
     /// `return_h`) is uploaded to fw_core's mission service on the radio link as the board does; its committed set goes to the
-    /// flight step as the board's station feed (plan id) and to the shadow guidance with GDN_SRC 1.
+    /// flight step as the board's target set (with its plan id).
     /// Campaign mission: `mission` may also be an array of such tables (uploads in time order), each with optional
     /// `limits = [min, max]` (the GDN_ALT_MIN/MAX in force given to select_targets; default 5, 50) and `upload_limits` (the
     /// mission service's at upload; default 5, 50).
@@ -846,7 +843,7 @@ impl Scenario {
                 return Err(format!("{key}: unknown table"));
             }
         }
-        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz", "mag_expected", "gnss_velocity", "baro_motion", "baro_lost", "gnss_lost", "gnss_hold", "mag_fault", "gnss_latency_s", "wind_steps", "yaw_inject", "yaw_hold", "gnss_jump", "motor_thrust", "push", "thrust_gain", "radio_status", "mission", "commands", "station_hb", "resume", "battery", "rc_source"])?;
+        let s = table(&root, "scenario", &["name", "duration_s", "gnss_rate_hz", "mag_expected", "gnss_velocity", "baro_motion", "baro_lost", "gnss_lost", "gnss_hold", "mag_fault", "gnss_latency_s", "wind_steps", "yaw_inject", "yaw_hold", "gnss_jump", "motor_thrust", "push", "thrust_gain", "mission", "commands", "station_hb", "resume", "battery", "rc_source"])?;
         let ground = match root.get("initial").and_then(Value::as_table).and_then(|i| i.get("contact")) {
             None => false,
             Some(Value::String(c)) if c == "air" => false,
@@ -1066,19 +1063,6 @@ impl Scenario {
             Some(Value::String(v)) if v == "receiver" => true,
             Some(_) => return Err("scenario.rc_source: must be \"crsf\" or \"receiver\"".to_string()),
         };
-        let radio_status = match s.get("radio_status") {
-            None => None,
-            Some(Value::Table(t)) => {
-                known_keys(t, "scenario.radio_status", &["from_s", "to_s", "period_s"])?;
-                let (a, b) = (scalar(t, "scenario.radio_status", "from_s")?, scalar(t, "scenario.radio_status", "to_s")?);
-                let p = scalar(t, "scenario.radio_status", "period_s")?;
-                if !(a.is_finite() && b.is_finite() && a >= 0.0 && b > a && p >= 0.001 && p.is_finite()) {
-                    return Err("scenario.radio_status: 0 <= from_s < to_s, period_s >= 0.001".to_string());
-                }
-                Some(((a * 1e6).round() as u64, (b * 1e6).round() as u64, (p * 1e6).round() as u64))
-            }
-            Some(_) => return Err("scenario.radio_status: must be an inline table".to_string()),
-        };
         let secs = |v: f64| (v * 1e6).round() as u64;
         let one = |t: &Table| -> Result<Mission, String> {
             known_keys(t, "scenario.mission", &["at_s", "radius_m", "return_h", "waypoints", "limits", "upload_limits"])?;
@@ -1243,7 +1227,6 @@ impl Scenario {
             motor_thrust,
             push,
             thrust_gain,
-            radio_status,
             mission,
             commands,
             station_hb,

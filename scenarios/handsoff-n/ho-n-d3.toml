@@ -1,8 +1,7 @@
-# Campaign N D(iii): reports stop at 20 s; RADIO_STATUS from 20.5 s to 40.5 s (1 Hz); CRSF back at 45 s with arm OFF (held); arm ON + Position at 50 s; out of Position at 55 s (PILOT).
+# Campaign N D(iii): reports stop at 20 s; CRSF back at 45 s with arm OFF (STOP); arm ON + Position at 50 s; out of Position at 55 s.
 [scenario]
 name = "ho-n-d3"
 duration_s = 70.0
-radio_status = { from_s = 20.5, to_s = 40.5, period_s = 1.0 }
 
 [initial]
 contact = "air_over_ground"

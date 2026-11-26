@@ -47,7 +47,7 @@ A script row may add `mode = "low"` (Angle, default) | `"middle"` (Altitude) | `
 | `mission = true\|false` in `[rc]` rows | Channel 8 (`RcSample.mission`), carries over like `arm` and `mode`, OFF at the start |
 | `throttle = <0..1>` in a phase | A fixed stick (0.5 centre), reached at the stick rate limit |
 | `lost = [...]`, `lost = true` | Transmitter off; applies to receiver reports judged at each 10 ms report time |
-| `thrust_gain`, `station_hb`, `radio_status`, `mission`, `commands`, `resume` | Hands-off and mission scenario fields, see [campaigns](campaigns.md) |
+| `thrust_gain`, `station_hb`, `mission`, `commands`, `resume` | Hands-off and mission scenario fields, see [campaigns](campaigns.md) |
 
 ## Basic scenarios
 

@@ -62,7 +62,6 @@ arming or a ground alignment; the take-off matrix covers alignment and the take-
 | `--noaid-sigma <m>` | Replaces `Tuning::nav_noaid_sigma_m` (armed no-aid position hold) for every estimator |
 | `--params <file>` | The ground station's parameter file (`NAME,VALUE` per line, `#` comments); its 14 `ATC_*` gains reach the flight step, the rest are defaults |
 | `--tuning-override <name>=<value>` | Replaces one tuning value (negative controls, for example `psc_velz_i=0`) |
-| `--notch` | Switches on the flight step's RPM notch before arming (motor poles 14) |
 
 ## Tests
 
