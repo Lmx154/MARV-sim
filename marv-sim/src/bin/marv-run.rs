@@ -1077,7 +1077,7 @@ fn sample(truth: &Truth, out: &StepOut, baro_drift_m: f64) -> Sample {
         _ => [f64::NAN; 2],
     };
     let position_covered = out.nav.valid.covers(
-        &Setpoint::Position { position_m: [0.0; 3], velocity_ms: [0.0; 3], heading_rad: 0.0, heading_rate_rads: 0.0, accel_d_mss: 0.0 }.requires());
+        &Setpoint::Position { position_m: [0.0; 3], velocity_ms: [0.0; 3], heading_rad: 0.0, heading_rate_rads: 0.0, accel_d_mss: 0.0, accel_ne_mss: [0.0; 2] }.requires());
     let mut logged: Vec<f32> = [out.nav.attitude.as_slice(), &out.nav.rates_rads, &out.nav.velocity_ms, &out.nav.position_m].concat();
     match out.setpoint {
         Setpoint::Attitude { attitude, heading_rate_rads, thrust_n } => {
