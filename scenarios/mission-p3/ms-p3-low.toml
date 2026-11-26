@@ -1,12 +1,13 @@
-# P3: pack to 14.2 V (3.55 V/cell) at 100-101 s: LOW only, the mission and hand-back go on.
+# P3 (receiver, mission switch): pack to 14.2 V (3.55 V/cell) at 100-101 s: LOW (~111 s) in AUTO gives RETURN batt-low,
+# then LAND at home (reason home) and STOP at touchdown.
 [scenario]
 name = "ms-p3-low"
+rc_source = "receiver"
 duration_s = 266.5
 thrust_gain = { from_s = 0.0, to_s = 1.0, from = 1.000, to = 1.000 }
 mission = [{ at_s = 30.0, radius_m = 2.0, return_h = 15.0, waypoints = [[30.0, 0.0, 10.0], [30.0, 30.0, 15.0], [0.0, 30.0, 10.0], [0.0, 0.0, 10.0]] }]
 station_hb = { from_s = 96.0, to_s = 5000.0 }
 commands = [{ after_hold_s = 5.0, cmd = "start" }]
-resume = { after_done_s = 10.0 }
 battery = { volts = [[0.0, 16.0], [100.0, 16.0], [101.0, 14.2]] }
 
 [initial]
@@ -34,12 +35,12 @@ stick_thrust_max_g = 2.0          # the documented stick map's top point (flight
 
 [rc]
 phase = [
-  { name = "ground", after_s = 60.0, arm = false, throttle = "zero", mode = "high" },
+  { name = "ground", after_s = 60.0, arm = false, throttle = "zero", mode = "high", mission = false },
   { name = "idle", after_s = 2.0, arm = true, throttle = "zero" },
   { name = "liftoff", event = "airborne", timeout_s = 10.0, throttle = "ramp" },
   { name = "climb", after_s = 8.5, height_m = 5.0 },
   { name = "hover", after_s = 20.0, height_m = 5.0, xy = "hold" },
-  { name = "lost", after_s = 900.0, height_m = 10.0, xy = "hold", lost = true },
+  { name = "msw_on", after_s = 900.0, throttle = 0.5, mission = true },
   { name = "back", after_s = 5.0, height_m = 10.0, xy = "hold", mode = "high", arm = true },
   { name = "out", after_s = 3.0, height_m = 10.0, xy = "hold", mode = "middle" },
   { name = "descend", event = "below", below_m = 1.0, timeout_s = 60.0, descend_ms = 0.8 },
